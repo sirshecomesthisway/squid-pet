@@ -1,5 +1,13 @@
-## ADDED Requirements
+# autonomous-motion Specification
 
+## Purpose
+Define how Squid moves on her own without user input. Covers the wanderer
+thread that periodically picks new screen positions, stroll modes (anywhere
+vs edges-only), sprint-perimeter animation, the busy-gate that suppresses
+motion when the user is actively driving Code Puppy, and the drowsy entry
+trigger after prolonged CP idleness.
+
+## Requirements
 ### Requirement: Wanderer thread moves the window without user input
 
 A background `WanderController` thread SHALL periodically move Squid to new
@@ -85,9 +93,9 @@ SHALL:
 
 ### Requirement: Drowsy entry after prolonged Code Puppy idle
 
-When Squid has been in the `idle` state continuously and Code Puppy idle
-time exceeds 120 seconds, the frontend SHALL transition Squid to the
-`drowsy` state via a slump animation. The drowsy state SHALL persist until
+The frontend SHALL transition Squid to the `drowsy` state via a slump
+animation when Squid has been in the `idle` state continuously and Code
+Puppy idle time exceeds 120 seconds. The drowsy state SHALL persist until
 either a wake event fires (user gesture) or Code Puppy resumes activity.
 
 #### Scenario: Drowsy entry after CP idle threshold
@@ -95,3 +103,4 @@ either a wake event fires (user gesture) or Code Puppy resumes activity.
 - **AND** cp_idle_seconds exceeds 120
 - **AND** no user_wake_override is active
 - **THEN** the frontend swaps to the drowsy sprite via the slump animation
+
