@@ -104,11 +104,21 @@ def macos_idle_seconds() -> float:
 # Code Puppy process detection
 # ────────────────────────────────────────────────────────────────────────
 def find_code_puppy_processes() -> list[psutil.Process]:
-    """Return all running code-puppy processes."""
+    """Return all running code-puppy processes.
+
+    NOTE: We deliberately DO NOT prefetch cmdline via process_iter([...])
+    because psutil on macOS can raise an uncaught SystemError from
+    KERN_PROCARGS2 during the bulk prefetch (per-process try/except cannot
+    catch errors that fire inside process_iter's prefetch path). Fetching
+    cmdline lazily inside the per-process try block isolates the failure.
+    """
     matches = []
-    for p in psutil.process_iter(["pid", "name", "cmdline"]):
+    for p in psutil.process_iter(["pid", "name"]):
         try:
-            cmdline = " ".join(p.info["cmdline"] or [])
+            cmdline = " ".join(p.cmdline() or [])
+        except (psutil.NoSuchProcess, psutil.AccessDenied, SystemError):
+            continue
+        try:
             if "code-puppy" in cmdline or "code_puppy" in cmdline:
                 # Filter to actual python processes, not bash wrappers
                 if "python" in cmdline or "code-puppy" in cmdline.split("/")[-1]:
