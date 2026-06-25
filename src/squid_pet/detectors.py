@@ -540,7 +540,7 @@ class IDEDetector:
 DEFAULT_TRIGGERS = {
     "code_puppy": True,
     "git": True,
-    "terminal": True,
+    "terminal": False,  # off by default: misfires on any dev machine
     "ide": True,
     "project_dirs": [str(Path.home() / "Projects")],
     "ide_processes": list(DEFAULT_IDE_PROCESSES),
@@ -560,7 +560,7 @@ def build_detectors(settings: dict | None = None) -> list:
     detectors = [
         CodePuppyDetector(enabled=s.get("code_puppy", True)),
         GitDetector(project_dirs=project_dirs, enabled=s.get("git", True)),
-        TerminalDetector(enabled=s.get("terminal", True)),
+        TerminalDetector(enabled=s.get("terminal", False)),
         IDEDetector(
             project_dirs=project_dirs,
             ide_processes=ide_processes,
