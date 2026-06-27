@@ -3,7 +3,10 @@ Squid Pet Watcher — observes Code Puppy + macOS activity and emits state.
 
 State model:
   - idle         : nothing happening
-  - thinking     : code-puppy CPU >= cpu_busy_threshold (default 20%) for 4+ consecutive ticks, no recent tool activity
+  - thinking     : (PRIMARY) CPs sitecustomize patch wrote ~/.code_puppy/llm_active.flag
+                  while mid-LLM-stream. Authoritative signal that the model is generating.
+                  (FALLBACK) code-puppy CPU >= cpu_busy_threshold (default 20%) for 4+ consecutive ticks,
+                  no recent tool activity. Only fires when CP install lacks the heartbeat patch.
   - working      : code-puppy has shell child process, OR sustained CPU (>= cpu_busy_threshold for 4+ ticks) with recent autosave/subagent/command_history write
   - grooving     : subagent file in subagent_sessions/ modified < 30s ago
   - celebrating  : task just completed (heuristic: CPU was high then dropped to 0)
@@ -553,6 +556,8 @@ class StateMachine:
             tool_activity_age = cp.tool_activity_age
             subagent_age = cp.subagent_age
             sustained_busy = cp.sustained_busy
+            llm_streaming = cp.llm_streaming
+            llm_flag_age = cp.llm_flag_age
             cp_celebrating = cp.is_celebrating(now)
             cp_grooving = cp.is_grooving(now)
         else:
@@ -562,6 +567,8 @@ class StateMachine:
             tool_activity_age = float("inf")
             subagent_age = float("inf")
             sustained_busy = False
+            llm_streaming = False
+            llm_flag_age = float("inf")
             cp_celebrating = False
             cp_grooving = False
 
@@ -683,7 +690,18 @@ class StateMachine:
                 st.state = "working"
                 st.message = "✨ working"
                 return st
-            # 4c. THINKING -- CPU busy but no recent work signals
+            # 4c-prime. REAL THINKING (Fix 10b 2026-06-27) -- CP's sitecustomize
+            # has written ~/.code_puppy/llm_active.flag while mid-stream. This is
+            # the authoritative "LLM is thinking" signal, replacing the CPU
+            # heuristic. Runs AFTER 'working' checks because if a tool is actively
+            # executing, that's a more useful state than 'thinking'.
+            if llm_streaming:
+                st.state = "thinking"
+                st.message = "🤔 thinking"
+                return st
+            # 4c. THINKING (FALLBACK) -- CPU busy heuristic for CP installs
+            # without the sitecustomize patch. Less reliable; prone to TUI-render
+            # false positives even with the 20% threshold from Fix 10.
             if sustained_busy:
                 st.state = "thinking"
                 st.message = "🤔 thinking"
