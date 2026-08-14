@@ -10,9 +10,9 @@
 # What this does (in order):
 #   1.  preflight              macOS 12+, git, brew
 #   2.  ensure_uv              brew install uv if missing
-#   3.  clone_or_update        ~/Projects/squid-pet up to date (HTTPS, not SSH)
+#   3.  clone_or_update        ~/Projects/squid-pet up to date (HTTPS)
 #   4.  setup_venv             uv venv in project
-#   5.  install_package        uv pip install -e . (Walmart artifactory)
+#   5.  install_package        uv pip install -e . (public PyPI)
 #   6.  migrate_legacy         copy ~/.indigo-pet -> ~/.squid-pet if needed
 #   7.  render_plist           substitute __PROJECT__ in template
 #   8.  install_launcher       bin/squid -> ~/.local/bin/squid
@@ -42,7 +42,7 @@ die()  { echo "${C_RED}[XX]${C_RST} $*" >&2; exit 1; }
 # ─── configuration ────────────────────────────────────────────────────
 LABEL="com.pink.squid-pet"
 PROJECT="${SQUID_PROJECT:-$HOME/Projects/squid-pet}"
-REPO_URL="${SQUID_REPO:-git@gecgithub01.walmart.com:p0t03el/squid-pet.git}"
+REPO_URL="${SQUID_REPO:-https://github.com/sirshecomesthisway/squid-pet.git}"
 
 # post-e2e-polish 2026-06-27 Fix 3: detect cold vs warm install at script start
 # so verify_alive can use the right polling timeout. Cold = first ever install
@@ -106,9 +106,7 @@ ensure_uv() {
         die "uv missing AND brew missing. Install uv via: curl -LsSf https://astral.sh/uv/install.sh | sh, then re-run"
     fi                                                                
     warn "uv not found -- installing via brew (this can take ~30s)"
-    HTTP_PROXY=http://sysproxy.wal-mart.com:8080 \
-    HTTPS_PROXY=http://sysproxy.wal-mart.com:8080 \
-        brew install uv || die "brew install uv failed"
+    brew install uv || die "brew install uv failed"
     ok "uv installed"
 }
 
@@ -177,32 +175,23 @@ setup_venv() {
 # ─── 5. install_package ───────────────────────────────────────────────
 install_package() {
     # Phase 2: prefer `uv sync --frozen` when uv.lock exists. Lockfile-driven
-    # installs skip dependency resolution entirely (the slow part -- ~3 min on
-    # cold cache against Walmart artifactory). Fall back to pip install -e
-    # only if the lockfile is missing or out of sync (which would be a
-    # maintainer bug, not a user problem -- they should regenerate uv.lock).
+    # installs skip dependency resolution entirely (the slow part on cold
+    # cache). Fall back to pip install -e only if the lockfile is missing or
+    # out of sync (which would be a maintainer bug, not a user problem --
+    # they should regenerate uv.lock).
     if [ -f "$PROJECT/uv.lock" ]; then
         step "install_package (uv sync --frozen, lockfile-driven)"
-        (cd "$PROJECT" && uv sync --frozen \
-            --index-url https://pypi.ci.artifacts.walmart.com/artifactory/api/pypi/external-pypi/simple \
-            --allow-insecure-host pypi.ci.artifacts.walmart.com \
-        ) || {
+        (cd "$PROJECT" && uv sync --frozen) || {
             warn "uv sync --frozen failed -- lockfile may be out of date"
-            warn "Falling back to uv pip install -e . (this resolves + downloads, can take 3-5 min)"
-            (cd "$PROJECT" && uv pip install -e . \
-                --index-url https://pypi.ci.artifacts.walmart.com/artifactory/api/pypi/external-pypi/simple \
-                --allow-insecure-host pypi.ci.artifacts.walmart.com \
-            ) || die "uv pip install also failed. Are you on Walmart VPN?"
+            warn "Falling back to uv pip install -e . (this resolves + downloads, can take a few min)"
+            (cd "$PROJECT" && uv pip install -e .) || die "uv pip install also failed."
             warn "Maintainer: regenerate uv.lock with 'uv lock' and commit it"
         }
         ok "squid_pet installed (from lockfile) in $PROJECT/.venv"
     else
         step "install_package (uv pip install -e ., no lockfile)"
-        warn "uv.lock missing -- using slow resolver path (3-5 min). Run 'uv lock' to fix."
-        (cd "$PROJECT" && uv pip install -e . \
-            --index-url https://pypi.ci.artifacts.walmart.com/artifactory/api/pypi/external-pypi/simple \
-            --allow-insecure-host pypi.ci.artifacts.walmart.com \
-        ) || die "uv pip install failed. Are you on Walmart VPN?"
+        warn "uv.lock missing -- using slow resolver path. Run 'uv lock' to fix."
+        (cd "$PROJECT" && uv pip install -e .) || die "uv pip install failed."
         ok "squid_pet installed in $PROJECT/.venv"
     fi
 }
@@ -261,6 +250,12 @@ first_run_wizard() {
         ok "code-puppy process not detected -- defaulting triggers.code_puppy=false (re-enable in settings.json if you install Code Puppy later)"
     fi
 
+    # claude-code-detector: claude_code has no observed misfire risk (see
+    # detectors.py ClaudeCodeDetector), so it defaults on unconditionally --
+    # unlike code_puppy above, there's no CPU-churn cost to leaving it on
+    # when `claude` isn't running.
+    local claude_default="true"
+
     # trigger-broadening 7.3: default project_dirs to ~/Projects (matches the
     # canonical clone location from distribution-installer Phase 5).
     local proj_default="$HOME/Projects"
@@ -268,6 +263,12 @@ first_run_wizard() {
     # Default to silent + sensible. Power users can opt into interactive
     # configuration with --wizard, or edit ~/.squid-pet/settings.json
     # later (changes are picked up live -- no restart needed).
+    #
+    # NOTE: terminal defaults to false here to match detectors.py's
+    # DEFAULT_TRIGGERS (documented there as "off by default: misfires on
+    # any dev machine" -- any long-lived shell child, e.g. an editor or a
+    # long-running REPL, makes the naive terminal detector permanently
+    # report busy).
     cat > "$SETTINGS_FILE" <<EOF
 {
   "stroll_mode": "edges",
@@ -275,8 +276,9 @@ first_run_wizard() {
   "show_on_all_spaces": true,
   "triggers": {
     "code_puppy": ${cp_default},
+    "claude_code": ${claude_default},
     "git": true,
-    "terminal": true,
+    "terminal": false,
     "ide": true,
     "project_dirs": ["${proj_default}"]
   }
@@ -290,17 +292,18 @@ EOF
         read -r -p "  stroll mode [edges] (edges|free|still): " stroll
         read -r -p "  show on all spaces [y]: " spaces
         # trigger-broadening 7.2: trigger prompts (default Y for all)
-        local trig_cp trig_git trig_ide trig_term trig_proj
+        local trig_cp trig_claude trig_git trig_ide trig_term trig_proj
         read -r -p "  trigger: react to code-puppy CPU [$cp_default]: " trig_cp
+        read -r -p "  trigger: react to Claude Code activity [$claude_default]: " trig_claude
         read -r -p "  trigger: react to git activity (commits, refs) [y]: " trig_git
         read -r -p "  trigger: react to IDE focus (VSCode, IntelliJ) [y]: " trig_ide
-        read -r -p "  trigger: react to terminal activity [y]: " trig_term
+        read -r -p "  trigger: react to terminal activity [n]: " trig_term
         # trigger-broadening 7.3: project_dirs prompt
         read -r -p "  project dirs to watch for git activity [$proj_default]: " trig_proj
-        python3 - "$SETTINGS_FILE" "${corner:-}" "${stroll:-}" "${spaces:-}" "${trig_cp:-}" "${trig_git:-}" "${trig_ide:-}" "${trig_term:-}" "${trig_proj:-}" <<PYEOF2
+        python3 - "$SETTINGS_FILE" "${corner:-}" "${stroll:-}" "${spaces:-}" "${trig_cp:-}" "${trig_claude:-}" "${trig_git:-}" "${trig_ide:-}" "${trig_term:-}" "${trig_proj:-}" <<PYEOF2
 import json, sys
 fp = sys.argv[1]
-corner, stroll, spaces, trig_cp, trig_git, trig_ide, trig_term, trig_proj = sys.argv[2:10]
+corner, stroll, spaces, trig_cp, trig_claude, trig_git, trig_ide, trig_term, trig_proj = sys.argv[2:11]
 with open(fp) as f: d = json.load(f)
 if corner: d["starting_corner"] = corner
 if stroll: d["stroll_mode"] = stroll
@@ -312,6 +315,8 @@ def _bool(s, default):
 # Trigger overrides (only if user typed something)
 if trig_cp.strip():
     d["triggers"]["code_puppy"] = _bool(trig_cp, d["triggers"]["code_puppy"])
+if trig_claude.strip():
+    d["triggers"]["claude_code"] = _bool(trig_claude, d["triggers"]["claude_code"])
 if trig_git.strip():
     d["triggers"]["git"] = _bool(trig_git, d["triggers"]["git"])
 if trig_ide.strip():
