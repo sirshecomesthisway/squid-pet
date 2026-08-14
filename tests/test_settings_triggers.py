@@ -6,15 +6,18 @@ from squid_pet.detectors import (
 )
 
 
-def test_empty_settings_yields_three_enabled_one_off():
-    """Default config: code_puppy + git + ide are on, terminal is off
-    (2026-06-25: terminal misfires on any dev machine -- see
-    test_explicit_opt_out_disables_one_detector for context)."""
+def test_empty_settings_yields_four_enabled_one_off():
+    """Default config: code_puppy + claude_code + git + ide are on,
+    terminal is off (2026-06-25: terminal misfires on any dev machine --
+    see test_explicit_opt_out_disables_one_detector for context)."""
     ds = build_detectors(settings=None)
-    assert len(ds) == 4
-    assert {d.name for d in ds} == {"code_puppy", "git", "terminal", "ide"}
+    assert len(ds) == 5
+    assert {d.name for d in ds} == {
+        "code_puppy", "claude_code", "git", "terminal", "ide",
+    }
     by_name = {d.name: d for d in ds}
     assert by_name["code_puppy"].enabled is True
+    assert by_name["claude_code"].enabled is True
     assert by_name["git"].enabled is True
     assert by_name["terminal"].enabled is False
     assert by_name["ide"].enabled is True
@@ -42,7 +45,7 @@ def test_explicit_opt_out_disables_one_detector():
 
 def test_all_off_yields_all_disabled():
     s = {"triggers": {
-        "code_puppy": False, "git": False,
+        "code_puppy": False, "claude_code": False, "git": False,
         "terminal": False, "ide": False,
     }}
     ds = build_detectors(settings=s)
@@ -71,7 +74,7 @@ def test_custom_ide_processes_propagate():
 
 
 def test_default_triggers_contains_expected_keys():
-    for k in ("code_puppy", "git", "terminal", "ide",
+    for k in ("code_puppy", "claude_code", "git", "terminal", "ide",
               "project_dirs", "ide_processes"):
         assert k in DEFAULT_TRIGGERS
 
