@@ -102,6 +102,22 @@ def test_finds_iterm_variant(monkeypatch):
     assert watcher.find_terminal_app_bundle_for_claude_code() == "com.googlecode.iterm2"
 
 
+def test_finds_cursor(monkeypatch):
+    """Claude Code run in Cursor's integrated terminal (2026-09-06: Pink
+    double-clicked celebrating Squid and no window came forward -- the
+    real ancestry is claude -> zsh -> Cursor Helper -> Cursor, and neither
+    name was recognized, so focus.py got a None bundle and raised nothing
+    despite having a valid tty)."""
+    cursor = _FakeAncestor("Cursor")
+    helper = _FakeAncestor("Cursor Helper", parent=cursor)
+    zsh = _FakeAncestor("zsh", parent=helper)
+    claude_proc = _FakeAncestor("2.1.263", parent=zsh)
+    monkeypatch.setattr(watcher, "find_claude_code_processes", lambda: [claude_proc])
+
+    assert (watcher.find_terminal_app_bundle_for_claude_code()
+            == "com.todesktop.230313mzl4w4u92")
+
+
 def test_returns_none_when_no_recognized_ancestor(monkeypatch):
     top = _FakeAncestor("launchd", parent=None)
     unknown = _FakeAncestor("some_wrapper", parent=top)

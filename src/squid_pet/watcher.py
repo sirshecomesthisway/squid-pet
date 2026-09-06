@@ -381,6 +381,11 @@ _TERMINAL_APP_BUNDLE_IDS = {
     "Warp": "dev.warp.Warp-Stable",
     "Code": "com.microsoft.VSCode",
     "Code Helper": "com.microsoft.VSCode",
+    # Cursor (VS Code fork). Like VS Code it has no AppleScript-addressable
+    # terminal tab, so focus.py can only app-activate it ("app-only") -- but
+    # that still brings the work window forward, which returning None did not.
+    "Cursor": "com.todesktop.230313mzl4w4u92",
+    "Cursor Helper": "com.todesktop.230313mzl4w4u92",
 }
 
 
