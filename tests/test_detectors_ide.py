@@ -134,6 +134,23 @@ def test_default_recent_files_skips_junk_dirs(tmp_path):
     assert len(ages) == 1  # node_modules skipped
 
 
+def test_default_recent_files_skips_dot_remember(tmp_path):
+    """The Remember plugin churns .remember/tmp/ and .remember/logs/ every
+    few seconds; counting those as "project activity" made the IDE detector
+    read busy whenever any IDE was open, even with the user idle (observed
+    2026-09-06: opening Cursor flipped Squid to 'working' with no typing)."""
+    (tmp_path / "src" / "a.py").parent.mkdir()
+    (tmp_path / "src" / "a.py").write_text("x = 1")
+    (tmp_path / ".remember" / "tmp" / "last-save.json").parent.mkdir(parents=True)
+    (tmp_path / ".remember" / "tmp" / "last-save.json").write_text("{}")
+    d = IDEDetector(
+        project_dirs=[str(tmp_path)],
+        process_iter_fn=lambda: iter([]),
+    )
+    ages = d._default_recent_files(window_sec=10.0)
+    assert len(ages) == 1  # .remember churn skipped, only src/a.py counts
+
+
 def test_scan_runs_once_per_watcher_tick():
     """One tick == one scan.
 

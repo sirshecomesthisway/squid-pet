@@ -670,6 +670,10 @@ class TerminalDetector:
 _FILE_SCAN_SKIP_DIRS = frozenset({
     "node_modules", ".venv", "venv", "__pycache__",
     ".git", ".pytest_cache", "dist", "build",
+    # Tooling that writes under the project tree on its own schedule, not
+    # in response to the user editing -- counting it as "project activity"
+    # made the IDE detector read busy whenever an IDE was merely open.
+    ".remember",
 })
 
 
