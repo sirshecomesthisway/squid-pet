@@ -402,6 +402,7 @@ def _native_drag_loop(start_cursor, start_origin, passthrough, on_end, on_swing=
     gesture is detected (4+ y-direction reversals within ~500ms = 2+ swings).
     """
     try:
+        import objc
         from AppKit import NSEvent
     except Exception as e:
         print(f"[squid-pet] drag loop import failed: {e}", flush=True)
@@ -430,66 +431,67 @@ def _native_drag_loop(start_cursor, start_origin, passthrough, on_end, on_swing=
     swing_fired = False           # only fire once per drag
 
     while not _drag_stop.is_set():
-        try:
-            # Bit 0 = primary (left) button. If 0, user released.
-            buttons = NSEvent.pressedMouseButtons()
-            if (buttons & 1) == 0:
-                print("[squid-pet] drag: OS reports button released → auto-end", flush=True)
+        with objc.autorelease_pool():
+            try:
+                # Bit 0 = primary (left) button. If 0, user released.
+                buttons = NSEvent.pressedMouseButtons()
+                if (buttons & 1) == 0:
+                    print("[squid-pet] drag: OS reports button released → auto-end", flush=True)
+                    break
+
+                loc = NSEvent.mouseLocation()
+                cx, cy = loc.x, loc.y
+                dx = cx - sx0
+                dy = cy - sy0  # Cocoa: positive y = up
+
+                # ─── Swing detection: track y-direction reversals ───
+                if on_swing is not None and not swing_fired:
+                    if last_cy is not None:
+                        cy_delta = cy - last_cy
+                        if abs(cy_delta) >= swing_min_delta_px:
+                            new_direction = 1 if cy_delta > 0 else -1
+                            if last_direction != 0 and new_direction != last_direction:
+                                # Direction reversal!
+                                now = _time.time()
+                                swing_history.append(now)
+                                # Drop old entries outside the window
+                                swing_history = [t for t in swing_history if now - t < swing_window]
+                                if len(swing_history) >= swing_threshold:
+                                    print(f"[squid-pet] SWING detected ({len(swing_history)} "
+                                          f"reversals in {swing_window}s) → wake!", flush=True)
+                                    try: on_swing()
+                                    except Exception as e:
+                                        print(f"[squid-pet] swing callback err: {e}", flush=True)
+                                    swing_fired = True
+                            last_direction = new_direction
+                    last_cy = cy
+                new_x = ox0 + dx
+                new_y = oy0 + dy
+
+                # Restrict drag: clamp window origin so visible character bbox
+                # stays inside visibleFrame. (Pink 2026-06-11: she dragged Squid
+                # off-screen accidentally; clamp + snap-back is the fix.)
+                new_x, new_y = clamp_origin_to_screen(new_x, new_y)
+
+                from Foundation import NSPoint
+                from PyObjCTools import AppHelper
+                AppHelper.callAfter(nw.setFrameOrigin_, NSPoint(new_x, new_y))
+
+                # Throttled debug print
+                now = _time.time()
+                if now - last_print > 0.5:
+                    print(f"[squid-pet] drag tick: cursor=({cx:.0f},{cy:.0f}) "
+                          f"origin=({new_x:.0f},{new_y:.0f})", flush=True)
+                    last_print = now
+
+                if _time.time() > deadline:
+                    print("[squid-pet] drag: 30s watchdog hit → auto-end", flush=True)
+                    break
+
+                _time.sleep(1.0 / 60.0)
+            except Exception as e:
+                print(f"[squid-pet] drag loop error: {e}", flush=True)
                 break
-
-            loc = NSEvent.mouseLocation()
-            cx, cy = loc.x, loc.y
-            dx = cx - sx0
-            dy = cy - sy0  # Cocoa: positive y = up
-
-            # ─── Swing detection: track y-direction reversals ───
-            if on_swing is not None and not swing_fired:
-                if last_cy is not None:
-                    cy_delta = cy - last_cy
-                    if abs(cy_delta) >= swing_min_delta_px:
-                        new_direction = 1 if cy_delta > 0 else -1
-                        if last_direction != 0 and new_direction != last_direction:
-                            # Direction reversal!
-                            now = _time.time()
-                            swing_history.append(now)
-                            # Drop old entries outside the window
-                            swing_history = [t for t in swing_history if now - t < swing_window]
-                            if len(swing_history) >= swing_threshold:
-                                print(f"[squid-pet] SWING detected ({len(swing_history)} "
-                                      f"reversals in {swing_window}s) → wake!", flush=True)
-                                try: on_swing()
-                                except Exception as e:
-                                    print(f"[squid-pet] swing callback err: {e}", flush=True)
-                                swing_fired = True
-                        last_direction = new_direction
-                last_cy = cy
-            new_x = ox0 + dx
-            new_y = oy0 + dy
-
-            # Restrict drag: clamp window origin so visible character bbox
-            # stays inside visibleFrame. (Pink 2026-06-11: she dragged Squid
-            # off-screen accidentally; clamp + snap-back is the fix.)
-            new_x, new_y = clamp_origin_to_screen(new_x, new_y)
-
-            from Foundation import NSPoint
-            from PyObjCTools import AppHelper
-            AppHelper.callAfter(nw.setFrameOrigin_, NSPoint(new_x, new_y))
-
-            # Throttled debug print
-            now = _time.time()
-            if now - last_print > 0.5:
-                print(f"[squid-pet] drag tick: cursor=({cx:.0f},{cy:.0f}) "
-                      f"origin=({new_x:.0f},{new_y:.0f})", flush=True)
-                last_print = now
-
-            if _time.time() > deadline:
-                print("[squid-pet] drag: 30s watchdog hit → auto-end", flush=True)
-                break
-
-            _time.sleep(1.0 / 60.0)
-        except Exception as e:
-            print(f"[squid-pet] drag loop error: {e}", flush=True)
-            break
 
     # Post-drag snap-back guard (in case cursor raced off-screen
     # between drag ticks or visibleFrame changed mid-drag).

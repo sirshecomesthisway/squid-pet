@@ -590,6 +590,7 @@ class PassthroughController:
 
     def _loop(self) -> None:
         try:
+            import objc
             from AppKit import NSEvent, NSScreen
         except ImportError:
             print("[squid-pet] AppKit unavailable; passthrough disabled", flush=True)
@@ -599,174 +600,175 @@ class PassthroughController:
         tick = 0
 
         while not self._stop.is_set():
-            try:
-                with self._lock:
-                    paused = self._paused
-                    hidden = self._hidden
-                    state = self._current_state
+            with objc.autorelease_pool():
+                try:
+                    with self._lock:
+                        paused = self._paused
+                        hidden = self._hidden
+                        state = self._current_state
 
-                if hidden:
-                    # Hidden: keep the invisible window fully
-                    # click-through, skip all hit-testing.
-                    self._apply_ignore(True)
-                    time.sleep(POLL_INTERVAL)
-                    continue
+                    if hidden:
+                        # Hidden: keep the invisible window fully
+                        # click-through, skip all hit-testing.
+                        self._apply_ignore(True)
+                        time.sleep(POLL_INTERVAL)
+                        continue
 
-                if paused:
-                    time.sleep(POLL_INTERVAL)
-                    continue
+                    if paused:
+                        time.sleep(POLL_INTERVAL)
+                        continue
 
-                nw = self._get_ns_window()
-                if nw is None:
-                    time.sleep(POLL_INTERVAL)
-                    continue
+                    nw = self._get_ns_window()
+                    if nw is None:
+                        time.sleep(POLL_INTERVAL)
+                        continue
 
-                # Get cursor position (Cocoa coords: origin bottom-left of main screen)
-                loc = NSEvent.mouseLocation()
-                cx, cy = loc.x, loc.y
+                    # Get cursor position (Cocoa coords: origin bottom-left of main screen)
+                    loc = NSEvent.mouseLocation()
+                    cx, cy = loc.x, loc.y
 
-                frame = nw.frame()
-                win_x = frame.origin.x
-                win_y = frame.origin.y
-                win_w = frame.size.width
-                win_h = frame.size.height
+                    frame = nw.frame()
+                    win_x = frame.origin.x
+                    win_y = frame.origin.y
+                    win_w = frame.size.width
+                    win_h = frame.size.height
 
-                # Is cursor inside the window's bounding box?
-                inside = (win_x <= cx <= win_x + win_w and
-                          win_y <= cy <= win_y + win_h)
+                    # Is cursor inside the window's bounding box?
+                    inside = (win_x <= cx <= win_x + win_w and
+                              win_y <= cy <= win_y + win_h)
 
-                # The menu bar always renders on top of Squid's window --
-                # a cursor up there is never actually over her, no matter
-                # what the raw rectangle math above says. Matters when
-                # she's docked at a top corner, where that rectangle
-                # extends up under the menu bar's icon strip. See
-                # _occluded_by_menu_bar's docstring.
-                if inside:
-                    screen = NSScreen.mainScreen()
-                    if screen is not None:
-                        vf = screen.visibleFrame()
-                        visible_frame_top = vf.origin.y + vf.size.height
-                        if _occluded_by_menu_bar(cy, visible_frame_top):
-                            inside = False
+                    # The menu bar always renders on top of Squid's window --
+                    # a cursor up there is never actually over her, no matter
+                    # what the raw rectangle math above says. Matters when
+                    # she's docked at a top corner, where that rectangle
+                    # extends up under the menu bar's icon strip. See
+                    # _occluded_by_menu_bar's docstring.
+                    if inside:
+                        screen = NSScreen.mainScreen()
+                        if screen is not None:
+                            vf = screen.visibleFrame()
+                            visible_frame_top = vf.origin.y + vf.size.height
+                            if _occluded_by_menu_bar(cy, visible_frame_top):
+                                inside = False
 
-                if not inside:
-                    # Cursor outside: keep window in passthrough so it never blocks anything
-                    self._apply_ignore(True)
-                    self._hover_tracker.reset()
-                    self._apply_fade(False)
-                    self._track_nudge(False, cx, cy)
+                    if not inside:
+                        # Cursor outside: keep window in passthrough so it never blocks anything
+                        self._apply_ignore(True)
+                        self._hover_tracker.reset()
+                        self._apply_fade(False)
+                        self._track_nudge(False, cx, cy)
+                        tick += 1
+                        if tick % 100 == 0:
+                            with self._lock:
+                                _ignore_for_log = self._last_ignore
+                            print(f"[squid-pet] tick {tick}: cursor=({cx:.0f},{cy:.0f}) "
+                                  f"win=({win_x:.0f},{win_y:.0f},{win_w:.0f}x{win_h:.0f}) "
+                                  f"OUTSIDE state={state} ignore={_ignore_for_log}",
+                                  flush=True)
+                        time.sleep(POLL_INTERVAL)
+                        continue
+
+                    # Cursor inside window — figure out which pixel of the sprite
+                    # Window-local coords (top-left origin to match image)
+                    local_x = cx - win_x
+                    local_y = win_h - (cy - win_y)   # flip Y (Cocoa→image)
+
+                    # Map to sprite-local coords
+                    # When edge=="top", CSS applies translateY(-80px) which
+                    # shifts the visual sprite up 80px. Adjust hit-test to match.
+                    with self._lock:
+                        edge = self._current_edge
+                    top_offset = 80 if edge == "top" else 0
+                    sprite_x = int(local_x - SPRITE_LEFT)
+                    sprite_y = int(local_y - (SPRITE_TOP - top_offset))
+
+                    # Hit test: simple BOUNDING BOX around the character (with generous
+                    # halo). Was: dilated alpha mask, but irregular silhouette left
+                    # gaps where Pink's clicks fell through (2026-06-11). Bbox is
+                    # predictable and matches user intent ("anywhere ON the character").
+                    #
+                    # Character art bbox in sprite coords: (38,35)-(138,138).
+                    # With CLICK_HALO_PX padding on all sides:
+                    # Worst-case sprite envelope (was idle-only, missed wider states).
+                    CLICK_HALO_PX = 15
+                    CHAR_BBOX_MIN_X = 21 - CLICK_HALO_PX     # 6   [celebrating]
+                    CHAR_BBOX_MAX_X = 160 + CLICK_HALO_PX    # 175 [thinking]
+                    CHAR_BBOX_MIN_Y = 15 - CLICK_HALO_PX     # 0   [thinking]
+                    CHAR_BBOX_MAX_Y = 172 + CLICK_HALO_PX    # 187 [DROWSY — was missed in prior analysis]
+                    in_char_bbox = (CHAR_BBOX_MIN_X <= sprite_x <= CHAR_BBOX_MAX_X and
+                                    CHAR_BBOX_MIN_Y <= sprite_y <= CHAR_BBOX_MAX_Y)
+                    # Use alpha_val to keep the rest of the logic compatible.
+                    alpha_val = 255 if in_char_bbox else 0
+
+                    # Hysteresis to prevent flip-flop near body edges:
+                    #   was passthrough? → need alpha > 30 to become interactive
+                    #   was interactive? → need alpha <  5 to become passthrough
+                    # Snapshot _last_ignore under the lock (2026-08-17 fix --
+                    # this was previously read unlocked here, racing against
+                    # _apply_ignore's write from pause()/set_hidden() on
+                    # another thread). A tiny window remains between this
+                    # snapshot and the _apply_ignore() call below where
+                    # another thread could change the real value first, but
+                    # that's benign: _apply_ignore's own check-and-set is
+                    # itself locked and always leaves _last_ignore consistent
+                    # with whichever write actually won.
+                    with self._lock:
+                        _last_ignore_snapshot = self._last_ignore
+                    if _last_ignore_snapshot is None:
+                        want_ignore = alpha_val <= ALPHA_THRESHOLD
+                    elif _last_ignore_snapshot:  # currently passthrough
+                        want_ignore = alpha_val <= ALPHA_THRESHOLD
+                    else:  # currently interactive
+                        want_ignore = alpha_val < 5
+                    opaque = not want_ignore  # for diagnostics below
+
+                    # Hover-fade-through (2026-08-27n): sustained presence over
+                    # the bbox past HOVER_DWELL_SEC fades her and forces
+                    # click-through, so whatever she's covering becomes
+                    # reachable without a deliberate nudge/drag first. Overrides
+                    # want_ignore (computed above) rather than replacing the
+                    # alpha-hit-test entirely -- leaving the dwell state
+                    # (cursor moves off her, still inside the window) falls
+                    # straight back to the normal hysteresis result with no
+                    # extra bookkeeping.
+                    # Shift is the deliberate escape hatch: "I want YOU, not
+                    # what's behind you." Overrides every inference below --
+                    # no dwell, no fade, no fleeing -- because holding a
+                    # modifier is an explicit statement of intent, which is
+                    # exactly what cursor position alone can never be.
+                    try:
+                        shift = shift_held(NSEvent.modifierFlags())
+                    except Exception:
+                        shift = False
+
+                    faded, click_through = self._hover_tracker.update(
+                        opaque, time.time(), cx, cy
+                    )
+                    if click_through:
+                        want_ignore = True
+                    if shift:
+                        want_ignore = False
+                        faded = False
+                        self._hover_tracker.reset()
+                    self._apply_fade(faded)
+                    self._apply_ignore(want_ignore)
+                    # suppress: while Shift is down the cursor sitting on her
+                    # is a grab, never "move, you're in the way".
+                    self._track_nudge(opaque, cx, cy, suppress=shift)
+
                     tick += 1
-                    if tick % 100 == 0:
+                    if tick % 100 == 0:  # ~3 seconds
                         with self._lock:
                             _ignore_for_log = self._last_ignore
-                        print(f"[squid-pet] tick {tick}: cursor=({cx:.0f},{cy:.0f}) "
-                              f"win=({win_x:.0f},{win_y:.0f},{win_w:.0f}x{win_h:.0f}) "
-                              f"OUTSIDE state={state} ignore={_ignore_for_log}",
-                              flush=True)
-                    time.sleep(POLL_INTERVAL)
-                    continue
+                        print(_heartbeat_line(
+                            tick=tick, cursor=(cx, cy),
+                            win=(win_x, win_y, win_w, win_h), inside=inside,
+                            sprite=(sprite_x, sprite_y), state=state,
+                            opaque=opaque, faded=faded,
+                            click_through=click_through, ignore=_ignore_for_log,
+                        ), flush=True)
 
-                # Cursor inside window — figure out which pixel of the sprite
-                # Window-local coords (top-left origin to match image)
-                local_x = cx - win_x
-                local_y = win_h - (cy - win_y)   # flip Y (Cocoa→image)
+                except Exception as e:
+                    print(f"[squid-pet] passthrough error: {e}", flush=True)
 
-                # Map to sprite-local coords
-                # When edge=="top", CSS applies translateY(-80px) which
-                # shifts the visual sprite up 80px. Adjust hit-test to match.
-                with self._lock:
-                    edge = self._current_edge
-                top_offset = 80 if edge == "top" else 0
-                sprite_x = int(local_x - SPRITE_LEFT)
-                sprite_y = int(local_y - (SPRITE_TOP - top_offset))
-
-                # Hit test: simple BOUNDING BOX around the character (with generous
-                # halo). Was: dilated alpha mask, but irregular silhouette left
-                # gaps where Pink's clicks fell through (2026-06-11). Bbox is
-                # predictable and matches user intent ("anywhere ON the character").
-                #
-                # Character art bbox in sprite coords: (38,35)-(138,138).
-                # With CLICK_HALO_PX padding on all sides:
-                # Worst-case sprite envelope (was idle-only, missed wider states).
-                CLICK_HALO_PX = 15
-                CHAR_BBOX_MIN_X = 21 - CLICK_HALO_PX     # 6   [celebrating]
-                CHAR_BBOX_MAX_X = 160 + CLICK_HALO_PX    # 175 [thinking]
-                CHAR_BBOX_MIN_Y = 15 - CLICK_HALO_PX     # 0   [thinking]
-                CHAR_BBOX_MAX_Y = 172 + CLICK_HALO_PX    # 187 [DROWSY — was missed in prior analysis]
-                in_char_bbox = (CHAR_BBOX_MIN_X <= sprite_x <= CHAR_BBOX_MAX_X and
-                                CHAR_BBOX_MIN_Y <= sprite_y <= CHAR_BBOX_MAX_Y)
-                # Use alpha_val to keep the rest of the logic compatible.
-                alpha_val = 255 if in_char_bbox else 0
-
-                # Hysteresis to prevent flip-flop near body edges:
-                #   was passthrough? → need alpha > 30 to become interactive
-                #   was interactive? → need alpha <  5 to become passthrough
-                # Snapshot _last_ignore under the lock (2026-08-17 fix --
-                # this was previously read unlocked here, racing against
-                # _apply_ignore's write from pause()/set_hidden() on
-                # another thread). A tiny window remains between this
-                # snapshot and the _apply_ignore() call below where
-                # another thread could change the real value first, but
-                # that's benign: _apply_ignore's own check-and-set is
-                # itself locked and always leaves _last_ignore consistent
-                # with whichever write actually won.
-                with self._lock:
-                    _last_ignore_snapshot = self._last_ignore
-                if _last_ignore_snapshot is None:
-                    want_ignore = alpha_val <= ALPHA_THRESHOLD
-                elif _last_ignore_snapshot:  # currently passthrough
-                    want_ignore = alpha_val <= ALPHA_THRESHOLD
-                else:  # currently interactive
-                    want_ignore = alpha_val < 5
-                opaque = not want_ignore  # for diagnostics below
-
-                # Hover-fade-through (2026-08-27n): sustained presence over
-                # the bbox past HOVER_DWELL_SEC fades her and forces
-                # click-through, so whatever she's covering becomes
-                # reachable without a deliberate nudge/drag first. Overrides
-                # want_ignore (computed above) rather than replacing the
-                # alpha-hit-test entirely -- leaving the dwell state
-                # (cursor moves off her, still inside the window) falls
-                # straight back to the normal hysteresis result with no
-                # extra bookkeeping.
-                # Shift is the deliberate escape hatch: "I want YOU, not
-                # what's behind you." Overrides every inference below --
-                # no dwell, no fade, no fleeing -- because holding a
-                # modifier is an explicit statement of intent, which is
-                # exactly what cursor position alone can never be.
-                try:
-                    shift = shift_held(NSEvent.modifierFlags())
-                except Exception:
-                    shift = False
-
-                faded, click_through = self._hover_tracker.update(
-                    opaque, time.time(), cx, cy
-                )
-                if click_through:
-                    want_ignore = True
-                if shift:
-                    want_ignore = False
-                    faded = False
-                    self._hover_tracker.reset()
-                self._apply_fade(faded)
-                self._apply_ignore(want_ignore)
-                # suppress: while Shift is down the cursor sitting on her
-                # is a grab, never "move, you're in the way".
-                self._track_nudge(opaque, cx, cy, suppress=shift)
-
-                tick += 1
-                if tick % 100 == 0:  # ~3 seconds
-                    with self._lock:
-                        _ignore_for_log = self._last_ignore
-                    print(_heartbeat_line(
-                        tick=tick, cursor=(cx, cy),
-                        win=(win_x, win_y, win_w, win_h), inside=inside,
-                        sprite=(sprite_x, sprite_y), state=state,
-                        opaque=opaque, faded=faded,
-                        click_through=click_through, ignore=_ignore_for_log,
-                    ), flush=True)
-
-            except Exception as e:
-                print(f"[squid-pet] passthrough error: {e}", flush=True)
-
-            time.sleep(POLL_INTERVAL)
+                time.sleep(POLL_INTERVAL)
