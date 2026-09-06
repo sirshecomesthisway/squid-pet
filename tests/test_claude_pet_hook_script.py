@@ -107,6 +107,56 @@ def test_user_prompt_submit_removes_flag(home):
     assert not _flag_path(home, "sess-4").exists()
 
 
+# ── PreToolUse: capture "blocked on the user" moments that emit no
+#    Notification (2026-09-06). AskUserQuestion and ExitPlanMode block for
+#    a human answer/approval but fire no permission_prompt -- only an
+#    idle_prompt after ~60s, which is ignored. They ARE tools, so
+#    PreToolUse fires right before they block, carrying tool_name.
+def test_pretooluse_askuserquestion_writes_flag(home):
+    r = _run({
+        "session_id": "sess-q", "hook_event_name": "PreToolUse",
+        "tool_name": "AskUserQuestion",
+    }, home)
+    assert r.returncode == 0, r.stderr
+    assert _flag_path(home, "sess-q").exists()
+
+
+def test_pretooluse_exitplanmode_writes_flag(home):
+    r = _run({
+        "session_id": "sess-p", "hook_event_name": "PreToolUse",
+        "tool_name": "ExitPlanMode",
+    }, home)
+    assert r.returncode == 0, r.stderr
+    assert _flag_path(home, "sess-p").exists()
+
+
+def test_pretooluse_ordinary_tool_does_not_write_flag(home):
+    """PreToolUse fires before EVERY tool. Only the ones that block on a
+    human answer should raise the attention flag -- a Bash/Read/Edit call
+    is Claude working, not waiting."""
+    r = _run({
+        "session_id": "sess-b", "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+    }, home)
+    assert r.returncode == 0, r.stderr
+    assert not _flag_path(home, "sess-b").exists()
+
+
+def test_pretooluse_question_then_answer_brackets_the_flag(home):
+    """The whole point: flag is up only while she's actually waiting.
+    PreToolUse(AskUserQuestion) raises it; answering fires
+    PostToolUse(AskUserQuestion), which clears it (PostToolUse is already
+    a remove-event)."""
+    _run({"session_id": "sess-br", "hook_event_name": "PreToolUse",
+          "tool_name": "AskUserQuestion"}, home)
+    assert _flag_path(home, "sess-br").exists()
+
+    r = _run({"session_id": "sess-br", "hook_event_name": "PostToolUse",
+              "tool_name": "AskUserQuestion"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _flag_path(home, "sess-br").exists()
+
+
 def test_session_end_removes_flag(home):
     _run({"session_id": "sess-5", "hook_event_name": "Notification",
           "notification_type": "permission_prompt"}, home)

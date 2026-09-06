@@ -4,8 +4,9 @@ claude_pet_hook.py -- squid-pet's Claude Code hook receiver.
 
 Wired into ~/.claude/settings.json under hooks.Notification,
 hooks.UserPromptSubmit, hooks.SessionEnd, hooks.Stop, hooks.PreCompact,
-and hooks.PostCompact. Maintains three per-session flag-file signals
-that watcher.py reads:
+hooks.PostCompact, hooks.PostToolUse, and hooks.PreToolUse (the last
+matched to AskUserQuestion|ExitPlanMode). Maintains three per-session
+flag-file signals that watcher.py reads:
   - "awaiting input" (claude_sessions_awaiting_input()) -- mirrors what
     the legacy agent's own sitecustomize.py patch did via a PID-keyed
     flag directory, except keyed by session_id, since Claude Code hook
@@ -31,6 +32,10 @@ Protocol:
   - Notification with notification_type == permission_prompt
     -> write <awaiting_input_dir>/<session_id>  (Claude is BLOCKED on you)
     idle_prompt is deliberately ignored -- see _HANDLED_NOTIFICATION_TYPES
+  - PreToolUse with tool_name in {AskUserQuestion, ExitPlanMode}
+    -> write <awaiting_input_dir>/<session_id>  (blocked on a human
+    answer/approval that fires NO permission_prompt -- see
+    _AWAITING_INPUT_TOOLS). The PostToolUse when you answer clears it.
   - UserPromptSubmit -> remove <awaiting_input_dir>/<session_id>  (you replied)
   - SessionEnd -> remove <awaiting_input_dir>/<session_id> and
     <recap_dir>/<session_id>  (session is gone)
@@ -111,6 +116,17 @@ _LOG_KEEP_LINES = 1000
 # alert worth walking back for. What is gone is the one that fires when
 # nothing is waiting on you at all.
 _HANDLED_NOTIFICATION_TYPES = frozenset({"permission_prompt"})
+
+# Pink-2026-09-06: some "blocked on you" moments emit NO Notification at
+# all -- AskUserQuestion (Claude is asking you to choose) and ExitPlanMode
+# (Claude is waiting for you to approve a plan). The only thing they
+# eventually fire is idle_prompt after ~60s, which we ignore. But they are
+# TOOLS, so PreToolUse fires right before they block, carrying tool_name.
+# Treat those exactly like a permission_prompt: raise the awaiting-input
+# flag. Every OTHER tool's PreToolUse is Claude working, not waiting, and
+# must be a no-op. The flag clears on its own: answering the question fires
+# PostToolUse (already a remove-event), and DENIAL/exit is covered by Stop.
+_AWAITING_INPUT_TOOLS = frozenset({"AskUserQuestion", "ExitPlanMode"})
 
 # Pink-2026-08-31: PostToolUse and Stop added after a confirmed stuck-wave
 # bug. ANSWERING a permission prompt -- yes OR no -- fires no hook of any
@@ -212,6 +228,20 @@ def main() -> int:
                 _log(f"Notification {session_id} WRITE_FAILED {e!r}")
         else:
             _log(f"Notification {session_id} IGNORED {ntype!r}")
+    elif event == "PreToolUse":
+        tool = payload.get("tool_name", "")
+        if tool in _AWAITING_INPUT_TOOLS:
+            if not _ensure_dir(FLAG_DIR, event):
+                return 0
+            flag_path = os.path.join(FLAG_DIR, session_id)
+            try:
+                with open(flag_path, "w") as f:
+                    f.write(tool)
+                _log(f"PreToolUse {session_id} WRITE {tool}")
+            except Exception as e:
+                _log(f"PreToolUse {session_id} WRITE_FAILED {e!r}")
+        else:
+            _log(f"PreToolUse {session_id} NOOP {tool!r}")
     elif event in _REMOVE_ON_EVENTS:
         if not _ensure_dir(FLAG_DIR, event):
             return 0
@@ -280,7 +310,7 @@ def main() -> int:
         except (FileNotFoundError, OSError):
             pass
 
-    if event not in _REMOVE_ON_EVENTS and event != "Notification":
+    if event not in _REMOVE_ON_EVENTS and event not in ("Notification", "PreToolUse"):
         # Guarded against the first dispatch chain above: an event handled
         # there (PostToolUse, UserPromptSubmit, ...) reaches here too, and
         # without this check it would be logged as UNKNOWN alongside its own
