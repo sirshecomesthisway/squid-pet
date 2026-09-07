@@ -32,7 +32,7 @@ squid observes it and reflects it in state. "Partial" = it can infer
 | **Claude Code CLI** — Terminal.app | Can | Can | Can | Can (exact tab) |
 | **Claude Code CLI** — in Cursor/VS Code/other integrated terminal | Can (hooks are global) | Can | Can | Partial (app-activate only; no tab/window precision) |
 | **Codex CLI** | Can | Can (via CodexDetector) | Cannot (approval hook is Claude-only today) | Partial (app-activate) |
-| **Claude Code IDE extension** (VS Code/Cursor) | **Phase 2 (B): verify** | Phase 2 (B) | Phase 2 (B) | Partial |
+| **Claude Code IDE extension** (VS Code/Cursor/JetBrains) | Can (hooks fire in the extension — see Phase 2 note) | Can | Can | Partial (activates the IDE) |
 | **Cursor Composer / native agent** | Partial (file writes only) | Cannot | Cannot | Partial (activate Cursor) |
 | **VS Code Copilot / Cline / Continue / other agents** | Partial (file writes only) | Cannot | Cannot | Partial (activate app) |
 | **Manual coding, no agent** | Partial (file writes only) | Cannot (only generic "busy") | n/a | Partial |
@@ -130,23 +130,33 @@ experience; each item independently shippable and tested.
   coherent non-agent "busy/creative" state and never `approval_needed` or
   agent-specific celebrate; with nothing happening it idles/sleeps as today.
 
-## Phase 2 — Claude Code IDE-extension parity (approach B; researched direction)
+## Phase 2 — Claude Code IDE-extension parity (approach B) — RESOLVED 2026-09-06
 
-Not built in this plan; recorded so Phase 1 does not paint us into a corner.
-
-- **Goal:** when a user runs the **Claude Code IDE extension** (VS Code /
-  Cursor) rather than the terminal CLI, drive the same rich states +
-  approval that the CLI hooks provide.
-- **Approach B:** determine whether the Claude Code IDE extension already
-  fires the `~/.claude/settings.json` hooks (Notification / PreToolUse /
-  Stop / UserPromptSubmit …). If it does, Phase 2 is mostly *verification +
-  documentation + focus-gap coverage*. If it does not, define the smallest
-  bridge that lets the extension write the existing `~/.squid-pet` flag
-  protocol — reusing the entire watcher/state/focus pipeline unchanged.
-- **Explicitly out of scope here:** third-party IDE agents (Cursor
+- **Finding (the spike's answer):** the Claude Code IDE extension fires the
+  **same hook events** as the terminal CLI. Per the official docs, "Claude
+  Code fires the same hook events wherever it runs: sessions in the
+  terminal, IDE extensions, the Desktop app, and Claude Code on the web."
+  The VS Code / JetBrains extension runs a local MCP server that the **CLI
+  connects to**, so a `claude` process still exists (found by
+  `find_claude_code_processes`) and `PreToolUse` fires even for the
+  extension's MCP tools.
+- **Consequence:** **no bridge is needed.** squid's existing hook pipeline
+  (status, approval via permission_prompt + our PreToolUse capture,
+  celebrate) already drives the rich states when Claude runs as an IDE
+  extension. Focus already resolves the host IDE via §1.1's dynamic bundle
+  lookup (app-activate; no tty → graceful app-only). So the extension row
+  in the capability matrix is Can/Can/Can/Partial with no new code.
+- **Residual (not blocking):** live confirmation with the extension
+  actually installed — the docs are authoritative but we have not watched
+  `claude_hook.log` from an extension session here (all local sessions are
+  the CLI). Worth a one-time live check when the extension is available.
+- **Still out of scope (future):** third-party IDE agents (Cursor
   Composer, Copilot, Cline) — no readable approval/agent signal exists
-  (would be a future approach A: a squid IDE extension, or C: OS-level
-  heuristics). Phase 2 gets its own brainstorm + spec.
+  (future approach A: a squid IDE extension, or C: OS-level heuristics).
+
+Sources: [Hooks reference](https://docs.claude.com/en/docs/claude-code/hooks),
+[Use Claude Code in VS Code](https://docs.claude.com/en/docs/claude-code/ide-integrations),
+[JetBrains IDEs](https://docs.claude.com/en/docs/claude-code/jetbrains).
 
 ## Non-goals
 - Tab/window-level focus precision for non-Terminal hosts.
