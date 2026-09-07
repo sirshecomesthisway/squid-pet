@@ -654,6 +654,10 @@
     //   - look-around: already handled inline in applySubState
     // _mood tracks sticky overrides. Empty string = no override.
     let _mood = "";            // "" | "drowsy" | "sleeping" | "stretch"
+    // Epoch ms until which a guaranteed drowsy beat holds before sleeping.
+    // 0 in the natural path (drowsy->sleep is immediate at 315s); set only
+    // when we blew past the drowsy window and forced a beat. See DROWSY_BEAT_MS.
+    let _drowsyBeatUntil = 0;
 
     // Notify Python backend of mood transitions so RoutineController
     // can gate idle-rhythm ticks. Fire-and-forget; ignore errors.
@@ -686,6 +690,16 @@
                                      // her on drowsy.png while state.json says
                                      // sleeping. Pinned by
                                      // tests/test_window_constants_agree.py.
+    // Guaranteed drowsy beat (Pink-2026-09-07). The natural path shows
+    // drowsy for the whole [300,315) window, but that window is skippable: a
+    // wander lap covering it (sub_state set -> !trulyIdle) or idle resuming
+    // already past 315s after a wake-hold both land her on the
+    // >= SLEEPING_IDLE_SEC branch first, straight into sleeping with no yawn.
+    // When that happens we hold her on drowsy.png for a full beat before
+    // sleeping, so a recovered drowsy looks identical to a natural one --
+    // hence derived from the window itself (SLEEPING - DROWSY = 15s), not a
+    // separate magic number that could drift from it. See checkDrowsyState.
+    const DROWSY_BEAT_MS    = (SLEEPING_IDLE_SEC - DROWSY_IDLE_SEC) * 1000;  // 15s
     const BLINK_MIN_SEC     = 6;
     const BLINK_MAX_SEC     = 9;
     const BLINK_DURATION_MS = 120;
@@ -772,6 +786,9 @@
     function wakeUpWithStretch() {
       // Wake from EITHER drowsy or sleeping mood. Always play stretch.
       if (_mood !== "drowsy" && _mood !== "sleeping") return;
+      // Clear any forced-drowsy-beat deadline so it can't leak into the
+      // next sleep cycle (Pink-2026-09-07).
+      _drowsyBeatUntil = 0;
       const from = _mood;
       _mood = "stretch";
       notifyMoodToBackend("stretch");
@@ -843,8 +860,22 @@
       }
 
       if (trulyIdle && idleSeconds >= SLEEPING_IDLE_SEC) {
-        // 3 min mark: deep sleep
-        enterSleeping();
+        // Past the sleep threshold. She must ALWAYS pass through drowsy
+        // first (Pink-2026-09-07) -- never straight to sleeping.
+        if (_mood === "sleeping") {
+          // already asleep -- nothing to do
+        } else if (_mood === "drowsy") {
+          // Natural path (_drowsyBeatUntil === 0): sleep immediately at
+          // 315s, so the 300->315 drowsy stretch is unchanged. Skip path:
+          // hold on drowsy until the forced beat below has elapsed.
+          if (Date.now() >= _drowsyBeatUntil) enterSleeping();
+        } else {
+          // Blew past the [300,315) drowsy window without ever going
+          // drowsy -- a wander lap covered it, or idle resumed already
+          // past 315 after a wake-hold. Force a visible drowsy beat first.
+          enterDrowsy();
+          _drowsyBeatUntil = Date.now() + DROWSY_BEAT_MS;
+        }
       } else if (trulyIdle && idleSeconds >= DROWSY_IDLE_SEC && _mood !== "sleeping") {
         // 1-3 min: drowsy
         enterDrowsy();

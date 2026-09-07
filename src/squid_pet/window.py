@@ -63,6 +63,18 @@ ACKNOWLEDGE_DISMISS_DELAY_SEC = 1.0
 PERIODIC_WAKE_CADENCE_SEC = 900.0   # 15 min
 PERIODIC_WAKE_AWAKE_SEC = 180.0     # 3 min stay-awake window
 
+# Bubble priority (Pink-2026-09-07). _pending_bubble is a single slot shared
+# by the watcher thread (state transitions) and the JS-RPC mood thread
+# (drowsy/waking). On wake-from-sleep both fire within ~1-2s, and a plain
+# last-writer-wins slot let the generic mood emote clobber the state "why"
+# bubble before the ~800ms frontend poll saw it. Writes now carry a priority
+# so the meaningful line wins regardless of which thread wrote last. Higher
+# wins; an equal write still replaces (last-writer-wins within a level, so
+# same-level behavior is unchanged from before).
+BUBBLE_PRIO_MOOD = 0      # drowsy / waking emotes (on_mood_change)
+BUBBLE_PRIO_AMBIENT = 1   # idle chatter, "still working" reannounce
+BUBBLE_PRIO_STATE = 2     # state-transition "why" + user interactions
+
 POSITION_FILE = Path.home() / ".squid-pet" / "position.json"
 SETTINGS_FILE = Path.home() / ".squid-pet" / "settings.json"
 # Presence == intentionally hidden via the menu bar toggle. Written by
@@ -677,6 +689,9 @@ class PetApi:
         # every watcher tick. _last_mood_for_bubble does the same for the
         # frontend mood layer (drowsy/sleeping/stretch).
         self._pending_bubble: str | None = None
+        # Priority of whatever currently sits in _pending_bubble (see the
+        # BUBBLE_PRIO_* constants). Meaningless while _pending_bubble is None.
+        self._pending_bubble_priority: int = BUBBLE_PRIO_MOOD
         self._last_state_for_bubble: str = "idle"
         self._last_mood_for_bubble: str = ""
         # "Still working on X" periodic refresh (see _maybe_reannounce_working).
@@ -731,8 +746,7 @@ class PetApi:
                     getattr(state, "state_reason", "") or ""),
             )
             if bubble is not None:
-                with self._lock:
-                    self._pending_bubble = bubble
+                self._set_pending_bubble(bubble, BUBBLE_PRIO_STATE)
             if state.state == "working":
                 # Reset the reannounce clock on entry -- the first periodic
                 # refresh should land WORKING_REANNOUNCE_SEC after she
@@ -773,8 +787,7 @@ class PetApi:
         if bubble is None or bubble == self._last_working_bubble_text:
             return
         self._last_working_bubble_text = bubble
-        with self._lock:
-            self._pending_bubble = bubble
+        self._set_pending_bubble(bubble, BUBBLE_PRIO_AMBIENT)
 
     def _wake(self, duration_sec: float) -> None:
         """Force a wake-from-drowsy/sleeping stretch transition (frontend
@@ -847,12 +860,28 @@ class PetApi:
             d["pending_bubble"] = self._pending_bubble
         return d
 
+    def _set_pending_bubble(self, text: str | None, priority: int) -> None:
+        """Write text into the single _pending_bubble slot, but only if it
+        outranks (or ties) whatever is already queued. Prevents a generic
+        mood emote from clobbering a higher-priority state 'why' bubble
+        during the wake-from-sleep burst -- see the BUBBLE_PRIO_* constants.
+        An empty slot accepts any write, so a lone low-priority bubble still
+        shows when nothing outranks it."""
+        if not text:
+            return
+        with self._lock:
+            current = getattr(self, "_pending_bubble_priority", BUBBLE_PRIO_MOOD)
+            if self._pending_bubble is None or priority >= current:
+                self._pending_bubble = text
+                self._pending_bubble_priority = priority
+
     def clear_bubble(self) -> None:
         """JS-exposed: frontend calls this after a bubble has finished
         fading out. Acknowledges receipt so the next get_state() poll
         sees pending_bubble=None instead of replaying the same line."""
         with self._lock:
             self._pending_bubble = None
+            self._pending_bubble_priority = BUBBLE_PRIO_MOOD
 
     def _fire_idle_chatter(self) -> None:
         """RoutineController's chatter_cb -- fires on a ~26-34s timer
@@ -884,8 +913,7 @@ class PetApi:
             return
         bubble = self._observer.on_idle_chatter()
         if bubble is not None:
-            with self._lock:
-                self._pending_bubble = bubble
+            self._set_pending_bubble(bubble, BUBBLE_PRIO_AMBIENT)
 
     def set_wander_edge(self, edge: str) -> None:
         """Called by WanderController when she crosses an edge boundary.
@@ -920,8 +948,7 @@ class PetApi:
             # Observer: fire mood-change bubble (drowsy/waking; sleeping is silent)
             bubble = self._observer.on_mood_change(prev, self._frontend_mood)
             if bubble is not None:
-                with self._lock:
-                    self._pending_bubble = bubble
+                self._set_pending_bubble(bubble, BUBBLE_PRIO_MOOD)
         return {"ok": True}
 
     def get_frontend_mood(self) -> str:
@@ -973,8 +1000,7 @@ class PetApi:
             # Observer bubble (was: "wheee!" hint pill; deduped 2026-06-13)
             bubble = self._observer.on_interaction("shake")
             if bubble is not None:
-                with self._lock:
-                    self._pending_bubble = bubble
+                self._set_pending_bubble(bubble, BUBBLE_PRIO_STATE)
             print("[squid-pet] swing-to-wake -> 60s awake override + observer bubble", flush=True)
         started = start_native_drag(self._passthrough, _on_end, on_swing=_on_swing)
         return {"ok": started}
@@ -1061,8 +1087,7 @@ class PetApi:
         # Observer bubble owns the poke reaction now (no more "boop!" hint pill)
         bubble = self._observer.on_interaction("poke")
         if bubble is not None:
-            with self._lock:
-                self._pending_bubble = bubble
+            self._set_pending_bubble(bubble, BUBBLE_PRIO_STATE)
         msg = "poke -> 60s awake override + observer bubble"
         if cleared:
             msg += " + cleared forced state"
@@ -1292,8 +1317,7 @@ class PetApi:
             return {"status": "not-waving", "bubble": None}
         bubble = self._observer.on_interaction("like")
         if bubble is not None:
-            with self._lock:
-                self._pending_bubble = bubble
+            self._set_pending_bubble(bubble, BUBBLE_PRIO_STATE)
         # Focusing lives in take_me_there(), which the same dblclick calls
         # for EVERY active state -- not just this one. Keeping it out of
         # here leaves acknowledge_approval to do one thing (calm the wave)
@@ -1351,8 +1375,7 @@ class PetApi:
             # Observer bubble: sprint start
             bubble = self._observer.on_interaction("sprint")
             if bubble is not None:
-                with self._lock:
-                    self._pending_bubble = bubble
+                self._set_pending_bubble(bubble, BUBBLE_PRIO_STATE)
             self._wanderer.sprint_perimeter()
             self._emit_hint("🏃‍♀️ sprinting!")
         except Exception as e:
