@@ -267,13 +267,20 @@ is hot-reloaded, no restart needed:
 }
 ```
 
+**`project_dirs`** is the list of roots Squid watches for file activity
+(and where the `git` and `ide` detectors look). It defaults to `~/Projects`
+only — **if your code lives elsewhere** (`~/dev`, `~/code`, a work folder),
+add those roots here so Squid sees your IDE activity there. It's a list, so
+add as many as you like; each extra root is one more directory walk per
+tick, so list only roots you actively work in. Paths may use `~`.
+
 | Detector | Signal | Feeds |
 |---|---|---|
 | `claude_code` | `claude` process presence, live tool subprocess, recent writes under `project_dirs`, `~/.claude/projects/*/*.jsonl` write recency | working / thinking / celebrating |
 | `codex` | `codex`/`codex-tui` process presence, live tool subprocess, recent writes under `project_dirs`, `~/.codex/sessions/**/*.jsonl` write recency | working / thinking |
 | `git` | `.git/{HEAD,index,refs/heads/}` mtimes under `project_dirs` | busy / celebrating |
 | `terminal` | any shell with a long-lived non-shell child | busy (off by default — misfires on any dev machine with a long-running foreground process, e.g. an editor or a REPL) |
-| `ide` | VS Code / Cursor / JetBrains CPU + recent file mtimes under `project_dirs` | busy / grooving |
+| `ide` | recent file mtimes under `project_dirs` — any editor (VS Code, Cursor, JetBrains, Zed, vim…), no per-IDE support needed. Editor-process CPU% is surfaced by `squid why` but does **not** gate the state | busy / grooving |
 
 `claude_code` and `codex` get the full working/thinking distinction (same
 cascade, OR-merged across both); the rest feed a flatter busy/idle signal.

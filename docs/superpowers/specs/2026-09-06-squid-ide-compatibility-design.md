@@ -165,18 +165,19 @@ Sources: [Hooks reference](https://docs.claude.com/en/docs/claude-code/hooks),
 [Use Claude Code in VS Code](https://docs.claude.com/en/docs/claude-code/ide-integrations),
 [JetBrains IDEs](https://docs.claude.com/en/docs/claude-code/jetbrains).
 
-## Open decisions (surfaced 2026-09-06; both touch the idle-CPU metric)
+## Open decisions — RESOLVED 2026-09-06
 
-1. **Broaden the default `project_dirs`?** Single `~/Projects` today.
-   Broadening to conventional roots that exist captures more IDE users
-   out-of-the-box but adds a per-tick tree walk per root. *Recommendation:*
-   keep single-root default + document the setting; opt-in only.
-2. **Agent-watcher vs work-watcher sleep?** Squid deliberately sleeps on
-   *agent* quiet, so she dozes during manual IDE coding. Keeping her awake
-   on IDE activity reverses a deliberate 2026-09-04 decision and adds an IDE
-   scan to every quiet tick. *Recommendation:* keep agent-watcher sleep, or
-   gate a "work-watcher" mode behind a setting (default off) so the idle-CPU
-   metric is protected.
+1. **Broaden the default `project_dirs`?** → **No.** Keep the single
+   `~/Projects` default to protect the idle-CPU metric; the setting is
+   multi-root and now documented in the README (users add their own roots).
+2. **Agent-watcher vs work-watcher sleep?** → **Keep agent-watcher (no
+   change).** Squid continues to doze on agent quiet, honoring the
+   deliberate 2026-09-04 design; she is an agent-watcher by intent.
+
+With these, **Phase 1 is complete**: 1.1 (dynamic host resolution) ✓,
+1.2 (honest IDE detection) ✓, 1.3 (multi-root confirmed + documented) ✓,
+1.4 (already honest; sleep unchanged by decision) ✓. Phase 2 (B) is
+verified working (extension fires hooks) with no code needed.
 
 ## Non-goals
 - Tab/window-level focus precision for non-Terminal hosts.
