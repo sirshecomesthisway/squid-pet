@@ -764,14 +764,25 @@ DEFAULT_IDE_PROCESSES = (
 
 
 class IDEDetector:
-    """Detect IDE activity by aggregating CPU% of matching processes and
-    cross-referencing recent file modifications in project_dirs.
+    """Detect IDE activity from recent file modifications in project_dirs.
 
-    Per design D3:
-      CPU >=3% AND project file <5s ago  -> is_busy
-      CPU >=3% AND no recent file        -> nothing (likely background indexing)
-      CPU <3%  AND project file <5s ago  -> is_busy (autosave during reflection)
-      >5 distinct project files modified in last 30s -> is_grooving
+    is_busy is decided SOLELY by a recent project-file write:
+      project file modified < RECENT_FILE_WINDOW_SEC ago  -> is_busy
+      no recent file                                       -> not busy
+        (regardless of how much CPU an IDE burns -- CPU alone is background
+         indexing, a known false positive)
+      > GROOVING_FILE_COUNT files in GROOVING_WINDOW_SEC    -> is_grooving
+
+    This is IDE-AGNOSTIC: any editor that writes files (VS Code, Cursor,
+    JetBrains, Zed, vim...) is captured; it needs no per-IDE support.
+
+    cpu_percent (aggregated over processes whose name is in ide_processes)
+    and ide_processes are DIAGNOSTIC ONLY -- surfaced in diagnostic() for
+    `squid doctor`; they do NOT gate any state. Historically is_busy folded
+    cpu into its return expression, but it reduced to a tautology (the CPU
+    term never changed the answer), so the decision is stated plainly now.
+    Dropping the per-tick aggregation entirely is a perf item tracked with
+    the detector-CPU work, not here.
     """
     name = "ide"
 
@@ -880,11 +891,13 @@ class IDEDetector:
         if not self.enabled:
             return False
         self._scan(now)
-        has_recent_file = self.recent_file_count_busy >= 1
-        cpu_busy = self.cpu_percent >= self.BUSY_CPU_THRESHOLD
-        # busy if (cpu_busy AND recent_file) or (no cpu but recent_file -- autosave)
-        # We do NOT fire on cpu_busy alone (background indexing false-positive).
-        return has_recent_file and (cpu_busy or self.cpu_percent < self.BUSY_CPU_THRESHOLD)
+        # Busy == a project file was written within RECENT_FILE_WINDOW_SEC.
+        # CPU is deliberately NOT a factor: high CPU with no recent write is
+        # background indexing (a false positive), and once there IS a recent
+        # write the state fires no matter the CPU -- so CPU never changes the
+        # answer. Kept out of the decision for honesty; cpu_percent remains a
+        # diagnostic only (see class docstring).
+        return self.recent_file_count_busy >= 1
 
     def is_celebrating(self, now: float) -> bool:
         return False

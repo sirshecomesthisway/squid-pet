@@ -104,31 +104,38 @@ experience; each item independently shippable and tested.
   code does not have; removing them prevents wrong expectations and dead
   code. Behavior is unchanged (the decision already equals recent-file).
 
-### 1.3 Configurable, multi-root project dirs
-- **Change:** `project_dirs` defaults to a single `~/Projects`
-  (`detectors.py:789`). Support multiple roots via `settings.json`
-  (`build_detectors` already threads `project_dirs`; confirm list handling
-  end-to-end and document it).
-- **Stretch:** auto-include the workspace/project root of a detected IDE so
-  capture isn't blind to projects outside `~/Projects`. Kept as a stretch
-  because reliably reading an IDE's open-workspace path is per-IDE and may
-  slip to Phase 2.
+### 1.3 Configurable, multi-root project dirs — DONE 2026-09-06 (core)
+- **Finding:** multi-root is **already supported end-to-end** —
+  `project_dirs` is a list threaded through `build_detectors` →
+  `IDEDetector` → `_scan_recent_file_ages` (which walks every root). Pinned
+  with a test (a recent write in the SECOND configured root fires busy).
+- **DECISION PENDING — broaden the default?** Default stays single
+  `~/Projects` (`detectors.py`). Broadening it (e.g. also `~/dev`, `~/code`,
+  `~/src` when they exist) would capture more IDE users out-of-the-box, but
+  each extra root is another per-tick tree walk — a real risk to the idle
+  CPU metric (1.7%) just landed. Recommendation: keep single-root default,
+  document the setting, and let users opt in. See the "Open decisions"
+  section.
+- **Deferred:** auto-detecting an IDE's open-workspace path (per-IDE, and
+  reading it cheaply is hard) → Phase 2/future.
 
-### 1.4 Honest IDE-only degradation
-- **Change:** when an IDE is active but no CLI agent is running, status and
-  messaging must be truthful — adjust the wording/`state_reason` of the
-  **existing** generic busy/grooving/idle states (e.g. the
-  `watcher.py:1643` fallback currently reads "🤔 working") so they don't
-  imply agent thinking/approval squid cannot observe. **No new sprite or
-  cascade state** is introduced in Phase 1 (that would be a larger change);
-  this is messaging + the sleeping fix below only.
-- **Sleeping fix:** `sleeping` is driven by *agent* quiet
-  (`_agent_idle_since`, `watcher.py:1447`); ensure genuine manual IDE
-  activity (recent file writes) prevents dozing so squid doesn't sleep
-  through active work. Reuse existing signals; no new detector.
-- **Acceptance:** with only an IDE running and files changing, squid shows a
-  coherent non-agent "busy/creative" state and never `approval_needed` or
-  agent-specific celebrate; with nothing happening it idles/sleeps as today.
+### 1.4 Honest IDE-only degradation — findings 2026-09-06
+- **Messaging is already honest (no change needed).** The generic non-agent
+  busy fallback (`watcher.py`) sets `state_reason="non-agent detector busy"`,
+  which `observer.py` maps to the chatter **"something's busy"** — honest,
+  agent-neutral. And agent-specific states (`approval_needed`, `celebrating`
+  from a task-complete marker) require agent signals, so they never fire for
+  an IDE-only user. That string is also a load-bearing key in the observer
+  map + a test, so it is deliberately left unchanged.
+- **DECISION PENDING — the sleep model.** `sleeping` is driven by *agent*
+  quiet, **by explicit prior design** (code comments, 2026-09-04: "she now
+  dozes on the agents' own quiet", after deciding user-presence was the
+  wrong signal). So squid **does** doze during manual IDE coding when no
+  agent is running. Making her stay awake on IDE activity turns her from an
+  *agent-watcher* into a *work-watcher* — a real product shift, AND it costs
+  idle CPU (the sleep gate would have to run the IDE file scan every quiet
+  tick). This reverses a deliberate decision, so it is NOT changed
+  unilaterally. See "Open decisions".
 
 ## Phase 2 — Claude Code IDE-extension parity (approach B) — RESOLVED 2026-09-06
 
@@ -157,6 +164,19 @@ experience; each item independently shippable and tested.
 Sources: [Hooks reference](https://docs.claude.com/en/docs/claude-code/hooks),
 [Use Claude Code in VS Code](https://docs.claude.com/en/docs/claude-code/ide-integrations),
 [JetBrains IDEs](https://docs.claude.com/en/docs/claude-code/jetbrains).
+
+## Open decisions (surfaced 2026-09-06; both touch the idle-CPU metric)
+
+1. **Broaden the default `project_dirs`?** Single `~/Projects` today.
+   Broadening to conventional roots that exist captures more IDE users
+   out-of-the-box but adds a per-tick tree walk per root. *Recommendation:*
+   keep single-root default + document the setting; opt-in only.
+2. **Agent-watcher vs work-watcher sleep?** Squid deliberately sleeps on
+   *agent* quiet, so she dozes during manual IDE coding. Keeping her awake
+   on IDE activity reverses a deliberate 2026-09-04 decision and adds an IDE
+   scan to every quiet tick. *Recommendation:* keep agent-watcher sleep, or
+   gate a "work-watcher" mode behind a setting (default off) so the idle-CPU
+   metric is protected.
 
 ## Non-goals
 - Tab/window-level focus precision for non-Terminal hosts.

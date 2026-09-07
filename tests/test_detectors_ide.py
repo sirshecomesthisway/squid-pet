@@ -151,6 +151,24 @@ def test_default_recent_files_skips_dot_remember(tmp_path):
     assert len(ages) == 1  # .remember churn skipped, only src/a.py counts
 
 
+def test_multiple_project_dirs_are_all_watched(tmp_path):
+    """project_dirs is a list; a recent write in ANY configured root fires
+    busy. This is what lets an IDE user whose code lives outside the default
+    ~/Projects be seen -- they add their roots via triggers.project_dirs
+    (2026-09-06: IDE-agnostic capture depends on watching the right dirs)."""
+    import time
+    root_a = tmp_path / "projects"
+    root_a.mkdir()
+    root_b = tmp_path / "dev"
+    root_b.mkdir()
+    (root_b / "app.py").write_text("x = 1")  # recent write only in the SECOND root
+    d = IDEDetector(
+        project_dirs=[str(root_a), str(root_b)],
+        process_iter_fn=lambda: iter([]),
+    )
+    assert d.is_busy(now=time.time()) is True
+
+
 def test_scan_runs_once_per_watcher_tick():
     """One tick == one scan.
 
