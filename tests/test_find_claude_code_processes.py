@@ -73,15 +73,22 @@ def test_process_iter_errors_are_skipped(monkeypatch):
 # _fire_approval_notification's docstring for the bug this fixes).
 
 class _FakeAncestor:
-    def __init__(self, name_value, parent=None):
+    def __init__(self, name_value, parent=None, exe_value=None):
         self._name = name_value
         self._parent = parent
+        self._exe = exe_value
 
     def name(self):
         return self._name
 
     def parent(self):
         return self._parent
+
+    def exe(self):
+        # Real psutil.Process.exe() -- absolute path of the executable.
+        # None here models a process we can't resolve (kernel threads,
+        # AccessDenied); the dynamic resolver must treat it as "unknown".
+        return self._exe
 
 
 def test_finds_terminal_app_up_the_chain(monkeypatch):
@@ -116,6 +123,53 @@ def test_finds_cursor(monkeypatch):
 
     assert (watcher.find_terminal_app_bundle_for_claude_code()
             == "com.todesktop.230313mzl4w4u92")
+
+
+def test_resolves_unlisted_host_app_via_bundle_plist(tmp_path, monkeypatch):
+    """Any host app Claude runs under should be resolvable, not just the
+    hardcoded names -- 'wherever Claude is running' (2026-09-06). A host
+    whose process name is NOT in _TERMINAL_APP_BUNDLE_IDS (here a JetBrains
+    IDE) is resolved by reading the real CFBundleIdentifier from the
+    enclosing .app's Info.plist, so no bundle id is ever guessed."""
+    import plistlib
+    app = tmp_path / "IntelliJ IDEA.app"
+    (app / "Contents").mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleIdentifier": "com.jetbrains.intellij"})
+    )
+    ide_exe = str(app / "Contents" / "MacOS" / "idea")
+
+    ide = _FakeAncestor("idea", exe_value=ide_exe)          # name NOT in the map
+    zsh = _FakeAncestor("zsh", parent=ide, exe_value="/bin/zsh")
+    claude_proc = _FakeAncestor("2.1.263", parent=zsh, exe_value="/opt/node")
+    monkeypatch.setattr(watcher, "find_claude_code_processes", lambda: [claude_proc])
+
+    assert (watcher.find_terminal_app_bundle_for_claude_code()
+            == "com.jetbrains.intellij")
+
+
+def test_bundle_id_from_exe_path_picks_outermost_app(tmp_path):
+    """A helper process's exe lives inside a nested Helper.app under the
+    real app; resolution must return the OUTER app's id (e.g. Cursor's),
+    not the helper's."""
+    import plistlib
+    outer = tmp_path / "Cursor.app"
+    (outer / "Contents").mkdir(parents=True)
+    (outer / "Contents" / "Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleIdentifier": "com.todesktop.230313mzl4w4u92"})
+    )
+    helper_exe = str(
+        outer / "Contents" / "Frameworks" / "Cursor Helper.app"
+        / "Contents" / "MacOS" / "Cursor Helper"
+    )
+    assert (watcher._bundle_id_from_exe_path(helper_exe)
+            == "com.todesktop.230313mzl4w4u92")
+
+
+def test_bundle_id_from_exe_path_none_when_not_in_app(tmp_path):
+    assert watcher._bundle_id_from_exe_path("/bin/zsh") is None
+    assert watcher._bundle_id_from_exe_path("") is None
+    assert watcher._bundle_id_from_exe_path(None) is None
 
 
 def test_returns_none_when_no_recognized_ancestor(monkeypatch):

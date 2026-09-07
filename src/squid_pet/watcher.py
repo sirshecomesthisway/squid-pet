@@ -389,18 +389,56 @@ _TERMINAL_APP_BUNDLE_IDS = {
 }
 
 
+def _bundle_id_from_exe_path(exe: str | None) -> str | None:
+    """CFBundleIdentifier of the OUTERMOST ``.app`` enclosing ``exe``, or
+    None if ``exe`` is not inside an app bundle (a bare CLI, a shell) or the
+    Info.plist can't be read.
+
+    A helper process's executable lives in a nested ``*.app`` under the real
+    app (e.g. ``Cursor.app/Contents/Frameworks/Cursor Helper.app/...``), so
+    the FIRST ``.app`` scanning left-to-right is the outer, user-facing app
+    -- which is what "activate the app hosting Claude" wants.
+    """
+    if not exe:
+        return None
+    acc: list[str] = []
+    app_path: str | None = None
+    for part in exe.split("/"):
+        acc.append(part)
+        if part.endswith(".app"):
+            app_path = "/".join(acc)
+            break
+    if not app_path:
+        return None
+    import plistlib
+    try:
+        with open(os.path.join(app_path, "Contents", "Info.plist"), "rb") as f:
+            data = plistlib.load(f)
+    except Exception:
+        return None
+    bid = data.get("CFBundleIdentifier")
+    return bid if isinstance(bid, str) and bid else None
+
+
 def find_terminal_app_bundle_for_claude_code() -> str | None:
     """Walk the parent-process chain of any running `claude` process to
     find which terminal emulator (or IDE-integrated terminal) is hosting
-    it, so a notification click can activate THAT specific app.
+    it, so a notification click / "take me there" can activate THAT app --
+    wherever Claude is running (Terminal, iTerm, Cursor, VS Code, JetBrains,
+    Zed, ...).
 
-    Best-effort and coarse: if multiple Claude Code sessions are running
-    in different terminal apps, this just returns whichever is found
-    first -- there's no way to know from the hook payload (no PID) which
-    session actually fired the notification. Returns None if no claude
-    process is found or its ancestry doesn't hit a recognized terminal
-    app within a few hops (caller falls back to a plain notification
-    with no working click action).
+    Two-tier per ancestor: a name in _TERMINAL_APP_BUNDLE_IDS is a fast,
+    exact answer (and the only way to recognize Terminal.app for its exact-
+    tab focus path); otherwise the ancestor's real CFBundleIdentifier is
+    read from its enclosing .app, so ANY host app is focusable without a
+    hardcoded entry and without ever guessing a bundle id. The shell/login
+    ancestors have no .app and resolve to None; the first ancestor that
+    does resolve is the hosting app.
+
+    Best-effort and coarse: if multiple Claude Code sessions are running in
+    different apps, this returns whichever is found first -- the hook
+    payload carries no PID to disambiguate. Returns None if no claude
+    process is found or its ancestry hits no app within a few hops.
     """
     for proc in find_claude_code_processes():
         try:
@@ -410,6 +448,13 @@ def find_terminal_app_bundle_for_claude_code() -> str | None:
                 name = cur.name()
                 if name in _TERMINAL_APP_BUNDLE_IDS:
                     return _TERMINAL_APP_BUNDLE_IDS[name]
+                try:
+                    exe = cur.exe()
+                except Exception:
+                    exe = None
+                bid = _bundle_id_from_exe_path(exe)
+                if bid:
+                    return bid
                 cur = cur.parent()
                 depth += 1
         except (psutil.NoSuchProcess, psutil.AccessDenied):

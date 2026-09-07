@@ -73,20 +73,25 @@ extension. Broadening to third-party IDE agents is explicitly future work
 Scope: no new integration surface; no behavior regression to the CLI
 experience; each item independently shippable and tested.
 
-### 1.1 Focus-map ↔ detection-map parity
-- **Change:** extend `_TERMINAL_APP_BUNDLE_IDS` (`watcher.py:374`) so every
-  IDE/terminal squid can *detect* (`DEFAULT_IDE_PROCESSES`) or *host* a CLI
-  in is app-activatable: add JetBrains family
-  (IntelliJ IDEA/PyCharm/WebStorm/GoLand/CLion/RubyMine — process name +
-  bundle id per app), Zed, Windsurf, and any terminal forks in scope
-  (iTerm already present; add Ghostty if desired). Cursor already added
-  (commit `5f73bba`).
-- **Guardrail test:** assert that **every** name in `DEFAULT_IDE_PROCESSES`
-  resolves to a bundle in `_TERMINAL_APP_BUNDLE_IDS` (or an explicit
-  "detect-only, no focus" allowlist), so detection/focus can never drift
-  apart again silently.
-- **Note on precision:** these remain app-activate only ("app-only");
-  tab/window precision is out of scope (Terminal.app-only by design).
+### 1.1 Host-app resolution for *any* app Claude runs under  — DONE 2026-09-06
+- **Approach (refined from the original "grow the hardcoded list"):**
+  resolve the host app's bundle id **dynamically**. `find_terminal_app_
+  bundle_for_claude_code` (`watcher.py`) walks Claude's parent chain and,
+  for each ancestor not in the `_TERMINAL_APP_BUNDLE_IDS` fast-path, reads
+  the real `CFBundleIdentifier` from the enclosing `.app`'s Info.plist via
+  the new `_bundle_id_from_exe_path()`. Any host (Terminal, iTerm, Cursor,
+  VS Code, JetBrains, Zed, Windsurf, …) is now focusable with **no guessed
+  bundle ids and no per-app list growth**.
+- **Why dynamic beats the list:** the original plan required hardcoding
+  bundle ids for apps not installed here (unverifiable, drift-prone).
+  Reading the app's own Info.plist is always correct. The hardcoded map is
+  kept only as a fast-path and as the Terminal.app exact-tab anchor.
+- **Tests:** unlisted host (JetBrains) resolved via a real tmp `.app`
+  Info.plist; outermost-`.app` selection for nested Helper.app exes;
+  None for non-app exes. The old "detection↔map parity" guardrail is moot —
+  resolution no longer depends on the map.
+- **Note on precision:** non-Terminal hosts remain app-activate only
+  ("app-only"); tab/window precision stays Terminal.app-only by design.
 
 ### 1.2 Make IDE detection honest (kill the dead CPU gate)
 - **Change:** `IDEDetector.is_busy` (`detectors.py:886`) is
