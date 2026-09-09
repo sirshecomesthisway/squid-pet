@@ -54,13 +54,17 @@ def test_no_matching_child_is_inactive_and_silent():
     assert shell_child_activity([proc]) == (False, None)
 
 
-def test_wrapper_shell_alone_is_active_but_unreportable():
-    """The wrapper being alive is real evidence a tool is running (so
-    active stays True -- this is has_active_shell_children's contract),
-    but its cmdline is the useless snapshot-sourcing preamble, so there
-    is nothing to report."""
-    wrapper = _FakeChild("bash", ["/bin/bash", "-c", "source snapshot.sh && ..."])
-    assert shell_child_activity([_FakeProc(children=[wrapper])]) == (True, None)
+def test_wrapper_shell_alone_reports_its_cmdline_for_unwrapping():
+    """When only the wrapper is alive (the common case -- the real tool
+    grandchild is short-lived and usually gone by scan time), we now
+    return the WRAPPER's cmdline rather than None. The wrapper is a direct
+    child of the agent, lives for the whole command, and carries the real
+    command inside its `eval '<cmd>'` -- observer._unwrap_eval_payload
+    recovers it. (Previously this returned (True, None) and the bubble fell
+    to the generic 'ran a command' line.)"""
+    args = ["/bin/bash", "-c", "source snapshot.sh && eval 'pytest -v' < /dev/null"]
+    wrapper = _FakeChild("bash", args)
+    assert shell_child_activity([_FakeProc(children=[wrapper])]) == (True, args)
 
 
 def test_walks_past_the_wrapper_to_the_real_command():
@@ -99,8 +103,11 @@ def test_a_confirmed_match_survives_a_later_unwalkable_process():
     class _Bare:
         pid = 1234
 
-    good = _FakeProc(children=[_FakeChild("bash", ["/bin/bash", "-c", "..."])])
-    assert shell_child_activity([good, _Bare()]) == (True, None)
+    args = ["/bin/bash", "-c", "..."]
+    good = _FakeProc(children=[_FakeChild("bash", args)])
+    # active latched on the wrapper, and its cmdline is now the reportable
+    # fallback -- a broken process later in the list can't undo either.
+    assert shell_child_activity([good, _Bare()]) == (True, args)
 
 
 def test_walks_each_process_tree_once():

@@ -949,11 +949,16 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
     * ``active`` latches on ANY SHELL_CHILD_NAMES match, wrappers
       included -- a live bash/zsh under the agent IS evidence a tool is
       running underneath (often the tool has not spawned yet).
-    * ``cmdline`` latches only on a NON-wrapper match with a non-empty
-      cmdline -- see SHELL_WRAPPER_NAMES: Claude Code's real Bash-tool
-      invocation is ``zsh -c 'source <snapshot> ... && eval "<cmd>"'``,
-      so the wrapper is almost always the first match and its own
-      cmdline is a long, useless housekeeping string.
+    * ``cmdline`` prefers a NON-wrapper match with a non-empty cmdline (the
+      real tool caught alive as a grandchild). When only wrappers match, it
+      falls back to the WRAPPER's own cmdline rather than None -- see
+      SHELL_WRAPPER_NAMES: Claude Code's real Bash-tool invocation is
+      ``zsh -c 'source <snapshot> ... && eval '<cmd>' < /dev/null ...'``, and
+      that wrapper is a direct child of ``claude`` that lives for the whole
+      command, so its cmdline is the reliable place to recover ``<cmd>`` from
+      (observer._unwrap_eval_payload does the extraction). The grandchild is
+      short-lived and usually raced away by scan time, so the wrapper is what
+      we can actually report most of the time.
 
     recursive=True walks grandchildren too -- needed because bash is the
     immediate child and the tool is a grandchild. Best-effort throughout:
@@ -962,6 +967,7 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
     if not procs:
         return False, None
     active = False
+    wrapper_cmdline = None  # fallback when no real tool grandchild is caught
     try:
         import psutil
         for p in procs:
@@ -975,6 +981,12 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
                         # end up being able to report about it.
                         active = True
                         if name in SHELL_WRAPPER_NAMES:
+                            # Remember the wrapper's cmdline as a fallback,
+                            # but keep walking in case the real tool child
+                            # is also alive (a cleaner, bare cmdline).
+                            cmd = ch.cmdline()
+                            if cmd:
+                                wrapper_cmdline = cmd
                             continue
                         cmdline = ch.cmdline()
                         if cmdline:
@@ -991,8 +1003,8 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
         # Keep what we already proved -- the old bool function returned
         # True the instant it matched, so a broken process object later
         # in the list could never undo it.
-        return active, None
-    return active, None
+        return active, wrapper_cmdline
+    return active, wrapper_cmdline
 
 
 def has_active_shell_children(procs) -> bool:

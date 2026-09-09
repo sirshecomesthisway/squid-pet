@@ -15,6 +15,7 @@ Reference: openspec/specs/observer-mode/spec.md
 """
 from __future__ import annotations
 
+import re
 import random
 import logging
 from typing import Callable, Optional, Union
@@ -387,74 +388,182 @@ def _explain_reason(state_reason: str,
 
 
 # ----------------------------------------------------------------------
-# Shell-child detection -- "running pytest" / "running git push"
+# Shell-child detection -- "runs pytest in tests/" / "runs git push"
 # ----------------------------------------------------------------------
-# When the watcher reports state="working" because has_active_shell_children
-# is True, we can read the shell child's cmdline directly from psutil for a
-# concrete "what's it doing" bubble. Pink-2026-08-22: window.py currently
-# always passes shell_cmdline=None -- the only wiring that ever populated it
-# (the legacy agent's process scan + latest_shell_child_cmdline) was
-# specific to it and was removed. Kept for a future Claude Code / Codex
-# equivalent.
+# When the watcher reports state="working" on the strength of a live shell
+# child, window.py passes that child's cmdline here (via
+# _current_shell_cmdline -> watcher.shell_child_activity) so we can name
+# what's actually running instead of the generic "claude ran a command".
 #
-# We trim flags + paths to get a short verb-noun bubble. Examples:
-#   pytest tests/test_observer.py -v  ->  "running pytest"
-#   git push origin main              ->  "running git push"
-#   brew install ripgrep              ->  "running brew install"
-#   /bin/sh -c 'cd foo && ls'         ->  "in a shell"
+# The cmdline arrives in one of two shapes:
+#
+#   * a bare tool invocation, e.g. ["pytest", "tests/", "-v"] -- caught when
+#     the real tool process is alive at scan time (the grandchild case).
+#   * Claude Code's Bash-tool WRAPPER, e.g.
+#       ["/bin/zsh", "-c",
+#        "source <snapshot> ... || true && setopt ... || true && "
+#        "eval 'pytest tests/ -v' < /dev/null && pwd -P >| /tmp/..."]
+#     The wrapper is a direct child of `claude` and lives for the whole
+#     command, so watcher.shell_child_activity now returns IT when the
+#     grandchild isn't caught (which is most of the time -- Bash calls are
+#     short). The real command is inside `eval '<CMD>' < /dev/null`.
+#
+# _unwrap_eval_payload normalizes both shapes to a command string;
+# _parse_command turns that into (verb[, path-like target]); _shell_cmd_bubble
+# renders "runs {what}[ in {where}]" under the 32-char cap. The agent name is
+# deliberately dropped (it is almost always "claude" and the sprite implies
+# it) -- that is what buys the budget for a target. Examples:
+#   pytest tests/test_observer.py -v  ->  "runs pytest in test_observer.py"
+#   git push origin main              ->  "runs git push"
+#   cd src && ruff check foo/bar.py   ->  "runs ruff in bar.py"
+#   brew install ripgrep              ->  "runs brew install"  (pkg is not a path)
 # ----------------------------------------------------------------------
 
 # Two-word commands where the subcommand matters for the bubble
 _TWO_WORD_TOOLS = {"git", "brew", "uv", "pip", "npm", "yarn", "pnpm", "docker",
                    "kubectl", "gcloud", "aws", "az", "gh", "go", "cargo"}
 
-def _shell_cmd_bubble(cmdline: list[str]) -> Optional[str]:
-    """Format a shell child's cmdline into a 'running X' bubble.
+# Leading tokens that set up the environment rather than being the command
+# worth reporting -- skipped so `cd src && ruff ...` reports `ruff`, not `cd`.
+_NOISE_LEADERS = frozenset({"cd", "pushd", "export", "source", ".", "set",
+                            "setopt", "unset", "unalias", "builtin", "eval"})
 
-    Strategy: skip wrapper shells (sh -c), find the first non-flag word.
-    For known multi-word tools (git, brew, etc.) include the subcommand.
+# Flags whose VALUE is free text (a message), never a location -- so
+# `git commit -m "fix bar/baz"` never puts the message in the target slot.
+_MSG_FLAGS = frozenset({"-m", "--message", "-c", "-C"})
+
+_WRAPPER_SHELLS = ("sh", "bash", "zsh", "fish")
+# Claude Code wraps the real command in `eval '<CMD>' < /dev/null`.
+_EVAL_RE = re.compile(r"eval '(.*)' < /dev/null", re.DOTALL)
+_EVAL_RE_LOOSE = re.compile(r"eval '(.*)'", re.DOTALL)
+# Shell separators we split a payload on to find the first real command.
+_SEG_SEP = re.compile(r"&&|\|\||\||;|\n")
+# A token that names a location: has a path separator or a file extension.
+_EXT_RE = re.compile(r"\.\w{1,5}$")
+# A shell redirect token (`>`, `>>`, `<`, `2>`, `>/dev/null`, `2>&1`, ...).
+# Its target is NOT a command location -- `>/dev/null` must never become a
+# "where" just because it contains a slash.
+_REDIR_RE = re.compile(r"^\d*[<>]")
+# A redirect that is ONLY the operator, so its target is the NEXT token
+# (`git log > out.txt`), as opposed to a glued/self-contained form
+# (`>/dev/null`, `2>&1`).
+_REDIR_OP_ONLY_RE = re.compile(r"^\d*(>>|>|<)$")
+
+
+def _unwrap_eval_payload(cmdline: list[str]) -> Optional[str]:
+    """Normalize a shell cmdline to the command string to report.
+
+    For a `*sh -c` wrapper, return the `eval '<CMD>'` payload if present
+    (Claude Code's Bash-tool shape), else the raw `-c` script (a plain
+    `sh -c "cmd"` call). Decodes `\\012` -> newline and `'\\''` -> `'`.
+    For a non-wrapper cmdline, the args ARE the command; join them.
+    Returns None for an empty cmdline or a wrapper with an empty script.
     """
     if not cmdline:
         return None
-    args = list(cmdline)
-    # Skip sh -c / bash -c wrapper, parse the embedded command instead
-    if args and args[0].endswith(("sh", "bash", "zsh")) and len(args) >= 3 and args[1] == "-c":
-        # Extract first word of the embedded script
-        embedded = args[2].lstrip().split()
-        if not embedded:
-            return "in a shell"
-        args = embedded
+    head = cmdline[0].rsplit("/", 1)[-1]
+    if head in _WRAPPER_SHELLS and len(cmdline) >= 3 and cmdline[1] == "-c":
+        script = cmdline[2]
+        if not script:
+            return None
+        m = _EVAL_RE.search(script) or _EVAL_RE_LOOSE.search(script)
+        payload = m.group(1) if m else script
+        return payload.replace("\\012", "\n").replace("'\\''", "'")
+    return " ".join(cmdline)
 
-    # Find first non-flag arg
-    cmd = None
-    for arg in args:
-        if not arg.startswith("-"):
-            # Strip path: /usr/bin/pytest -> pytest
-            cmd = arg.rsplit("/", 1)[-1]
-            break
-    if not cmd:
+
+def _looks_like_path(tok: str) -> bool:
+    """A cheap, tool-agnostic proxy for 'this token names a location':
+    it has a path separator or ends in a file extension. Keeps commit
+    messages, grep patterns and package names out of the target slot."""
+    return "/" in tok or bool(_EXT_RE.search(tok))
+
+
+def _parse_command(payload: str) -> tuple[Optional[str], Optional[str]]:
+    """Turn a command string into (what, where).
+
+    `what` is the verb (basename), plus the subcommand for a two-word tool.
+    `where` is the first path-like argument, or None. Leading noise-leader
+    segments (`cd`, `export`, ...) are skipped so the first REAL command is
+    reported. Flags and message-flag values are never taken as `where`.
+    """
+    for seg in _SEG_SEP.split(payload):
+        toks = seg.strip().split()
+        if not toks:
+            continue
+        # command = first non-flag token in this segment
+        ci = next((i for i, t in enumerate(toks) if not t.startswith("-")), None)
+        if ci is None:
+            continue  # all flags -- not a command segment
+        if toks[ci].startswith("#"):
+            continue  # a comment line, not a command
+        cmd = toks[ci].rsplit("/", 1)[-1]
+        if cmd in _NOISE_LEADERS:
+            continue  # skip `cd src`, `export X=y`, ... keep looking
+        rest = toks[ci + 1:]
+        what = cmd
+        if cmd in _TWO_WORD_TOOLS:
+            sub = next((a for a in rest if not a.startswith("-")), None)
+            if sub:
+                what = f"{cmd} {sub}"
+                rest = rest[rest.index(sub) + 1:]
+        where = None
+        skip_next = False
+        for a in rest:
+            if skip_next:
+                skip_next = False
+                continue
+            if a in _MSG_FLAGS:
+                skip_next = True  # its value is a message, not a location
+                continue
+            if _REDIR_RE.match(a):
+                # a redirect (and its target, if separated) -- not a location
+                if _REDIR_OP_ONLY_RE.match(a):
+                    skip_next = True
+                continue
+            if a.startswith("-"):
+                continue
+            if _looks_like_path(a):
+                where = a
+                break
+        return what, where
+    return None, None
+
+
+def _shell_cmd_bubble(cmdline: list[str]) -> Optional[str]:
+    """Format a shell child's cmdline into a 'runs {what}[ in {where}]'
+    bubble (agent name dropped), within the 32-char cap.
+
+    Returns None -- so the caller falls back to the generic reason line --
+    for an empty cmdline, a wrapper with no recoverable command, or a
+    payload whose only command is a noise leader. This keeps a future
+    change to Claude Code's wrapper preamble from ever leaking `source`,
+    `eval`, or a snapshot path into a bubble.
+    """
+    payload = _unwrap_eval_payload(cmdline)
+    if not payload:
         return None
-
-    # For known multi-word tools, append the subcommand if present
-    if cmd in _TWO_WORD_TOOLS:
-        # Find the position of cmd in args, then look at the next non-flag
-        try:
-            idx = next(i for i, a in enumerate(args)
-                       if a.rsplit("/", 1)[-1] == cmd)
-            for sub in args[idx + 1:]:
-                if not sub.startswith("-"):
-                    bubble = f"running {cmd} {sub}"
-                    if len(bubble) <= MAX_BUBBLE_CHARS:
-                        return bubble
-                    return f"running {cmd}"
-        except StopIteration:
-            pass
-
-    bubble = f"running {cmd}"
-    if len(bubble) > MAX_BUBBLE_CHARS:
-        # Crude truncate
-        bubble = bubble[:MAX_BUBBLE_CHARS - 1] + "..."
-    return bubble
+    what, where = _parse_command(payload)
+    if not what:
+        return None
+    base = f"runs {what}"
+    if len(base) > MAX_BUBBLE_CHARS:
+        return None  # pathological; let the generic line handle it
+    if not where:
+        return base
+    # Fit the target under the cap: full path -> basename -> parent dir -> drop.
+    candidates = [where]
+    basename = where.rstrip("/").rsplit("/", 1)[-1]
+    if basename and basename != where:
+        candidates.append(basename)
+    parent = where.rstrip("/").rsplit("/", 1)
+    if len(parent) == 2 and parent[0]:
+        candidates.append(parent[0] + "/")
+    for w in candidates:
+        s = f"{base} in {w}"
+        if len(s) <= MAX_BUBBLE_CHARS:
+            return s
+    return base
 
 
 # ----------------------------------------------------------------------

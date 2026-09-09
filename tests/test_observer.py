@@ -278,7 +278,7 @@ def test_working_with_pytest_cmdline(obs):
         "idle", "working",
         shell_cmdline=["pytest", "tests/", "-v"],
     )
-    assert result == "running pytest"
+    assert result == "runs pytest in tests/"
 
 
 def test_working_with_git_push_includes_subcommand(obs):
@@ -286,17 +286,19 @@ def test_working_with_git_push_includes_subcommand(obs):
         "idle", "working",
         shell_cmdline=["git", "push", "origin", "main"],
     )
-    assert result == "running git push"
+    # origin/main are not path-like, so no target is appended.
+    assert result == "runs git push"
 
 
 def test_working_with_sh_dash_c_extracts_embedded():
     result = _shell_cmd_bubble(["/bin/sh", "-c", "brew install ripgrep && echo done"])
-    assert result == "running brew install"
+    # ripgrep is a package name, not a path -> no target slot.
+    assert result == "runs brew install"
 
 
 def test_working_with_absolute_path_strips_dir():
     result = _shell_cmd_bubble(["/usr/local/bin/pytest", "-x"])
-    assert result == "running pytest"
+    assert result == "runs pytest"
 
 
 def test_working_without_cmdline_falls_back_to_generic(obs):
@@ -308,7 +310,7 @@ def test_working_without_cmdline_falls_back_to_generic(obs):
 
 def test_shell_cmd_skips_flag_args():
     """Don't pick '-v' as the command -- find first non-flag word."""
-    assert _shell_cmd_bubble(["-v", "pytest"]) == "running pytest"
+    assert _shell_cmd_bubble(["-v", "pytest"]) == "runs pytest"
 
 
 def test_shell_cmd_empty_returns_none():
@@ -425,7 +427,8 @@ def test_unknown_state_transition_returns_none(obs):
 
 def test_still_working_with_shell_cmd_returns_shell_bubble(obs):
     result = obs.on_still_working(["pytest", "tests/test_observer.py", "-v"])
-    assert result == "running pytest"
+    # Full path too long for the cap -> falls back to the basename.
+    assert result == "runs pytest in test_observer.py"
 
 
 def test_still_working_with_no_shell_cmd_falls_back_to_generic_pool(obs):

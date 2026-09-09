@@ -77,13 +77,16 @@ def test_skips_wrapper_shell_and_finds_real_command_beneath_it():
     assert latest_shell_child_cmdline([proc]) == ["git", "push", "origin", "main"]
 
 
-def test_wrapper_shell_alone_with_no_real_command_beneath_returns_none():
-    """If the only match is the wrapper itself (real command still
-    embedded in an eval string, not yet spawned as a separate process),
-    correctly report nothing rather than the ugly wrapper cmdline."""
-    wrapper = _FakeChild("bash", ["/bin/bash", "-c", "source snapshot.sh && ..."])
-    proc = _FakeProc(children=[wrapper])
-    assert latest_shell_child_cmdline([proc]) is None
+def test_wrapper_shell_alone_returns_the_wrapper_cmdline():
+    """If the only match is the wrapper itself (the real command is still
+    embedded in its `eval '<cmd>'` string, not yet spawned as a separate
+    process -- the common case), return the WRAPPER cmdline so the observer
+    can recover the command from it via _unwrap_eval_payload. This replaced
+    the old behavior of reporting None here, which starved the bubble and
+    left it on the generic 'ran a command' line."""
+    args = ["/bin/bash", "-c", "source snapshot.sh && eval 'pytest -v' < /dev/null"]
+    proc = _FakeProc(children=[_FakeChild("bash", args)])
+    assert latest_shell_child_cmdline([proc]) == args
 
 
 def test_fake_process_without_children_method_does_not_crash():

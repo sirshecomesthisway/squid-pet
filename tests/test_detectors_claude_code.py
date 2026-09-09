@@ -313,14 +313,17 @@ def test_uninjected_shell_signals_walk_the_child_tree_once_per_tick():
     assert d.shell_cmdline == ["pytest", "-v"]
 
 
-def test_uninjected_wrapper_only_child_is_active_with_no_cmdline():
-    """The wrapper shell still counts as tool activity (unchanged
-    contract) even though there is nothing reportable to say."""
-    proc = _WalkCountingProc([_WalkChild("zsh", ["/bin/zsh", "-c", "source snap.sh"])])
+def test_uninjected_wrapper_only_child_reports_the_wrapper_cmdline():
+    """The wrapper shell counts as tool activity (unchanged), and its
+    cmdline is now the reportable fallback: when no real tool grandchild is
+    caught, the wrapper carries the command inside its `eval '<cmd>'`, which
+    the observer recovers. (Previously shell_cmdline was None here.)"""
+    args = ["/bin/zsh", "-c", "source snap.sh && eval 'pytest -v' < /dev/null"]
+    proc = _WalkCountingProc([_WalkChild("zsh", args)])
     d = _walk_counting_detector(proc)
 
     d.is_busy(now=1000.0)
 
     assert proc.walks == 1
     assert d.shell_active is True
-    assert d.shell_cmdline is None
+    assert d.shell_cmdline == args
