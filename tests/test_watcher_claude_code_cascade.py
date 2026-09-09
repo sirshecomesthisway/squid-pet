@@ -85,7 +85,7 @@ def test_claude_only_file_write_yields_working(monkeypatch):
     sm = _claude_machine(monkeypatch, shell_active=False, file_ages=[2.0])
     st = sm.compute()
     assert st.state == "working"
-    assert st.state_reason == "file write detected (claude_code)"
+    assert st.state_reason == "project file write detected"
 
 
 def test_claude_only_fresh_transcript_no_shell_yields_thinking(monkeypatch):

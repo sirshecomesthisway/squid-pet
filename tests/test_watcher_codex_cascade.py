@@ -78,7 +78,7 @@ def test_codex_only_file_write_yields_working(monkeypatch):
     sm = _codex_machine(monkeypatch, shell_active=False, file_ages=[2.0])
     st = sm.compute()
     assert st.state == "working"
-    assert st.state_reason == "file write detected (codex)"
+    assert st.state_reason == "project file write detected"
 
 
 def test_codex_only_fresh_transcript_no_shell_yields_thinking(monkeypatch):
@@ -158,3 +158,21 @@ def test_claude_and_codex_both_running_shell_evidence_merges(monkeypatch):
     assert st.state_reason == "shell child active (codex)"
     assert st.claude_code_running is False
     assert st.codex_running is True
+
+
+def test_shared_project_write_does_not_credit_claude(monkeypatch):
+    from squid_pet.detectors import ClaudeCodeDetector
+    from squid_pet.observer import Observer
+    install_world(monkeypatch)
+    common = dict(aggregate_cpu_fn=lambda p: 0.0,
+                  has_active_shell_children_fn=lambda p: False,
+                  glob_fn=lambda root: iter([]),
+                  recent_file_ages_fn=lambda: [1.0])
+    claude = ClaudeCodeDetector(find_processes_fn=lambda: ['claude'], **common)
+    codex = CodexDetector(find_processes_fn=lambda: ['codex'], **common)
+    st = StateMachine(detectors=[claude, codex]).compute()
+    assert st.state == 'working'
+    assert st.state_reason == 'project file write detected'
+    line = Observer(get_muted=lambda: False).on_state_change(
+        'idle', st.state, state_reason=st.state_reason)
+    assert line == 'project files changed'

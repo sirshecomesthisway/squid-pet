@@ -1447,10 +1447,10 @@ class StateMachine:
                 return "shell child active (claude_code)"
             if codex_shell_active:
                 return "shell child active (codex)"
-            if claude_file_active:
-                return "file write detected (claude_code)"
-            if codex_file_active:
-                return "file write detected (codex)"
+            # Both detectors observe project mtimes, not the writer's identity.
+            # Even with just one agent open, an editor could cause this signal.
+            if claude_file_active or codex_file_active:
+                return "project file write detected"
             return "shell child active"  # unreachable; keeps mypy/readers happy
 
         def _streaming_reason() -> str:
