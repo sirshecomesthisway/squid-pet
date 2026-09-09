@@ -21,6 +21,7 @@ def test_install_preserves_other_hooks_and_is_idempotent(tmp_path):
     first = json.loads(path.read_text())
     assert first['hooks']['Stop'][0] == original['hooks']['Stop'][0]
     assert 'PermissionRequest' in first['hooks']
+    assert 'UserPromptSubmit' in first['hooks']
     install(path)
     assert json.loads(path.read_text()) == first
     install(path, '--remove')

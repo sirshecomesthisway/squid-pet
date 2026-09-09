@@ -82,3 +82,23 @@ def test_accepted_async_question_signals_from_post_tool_hook(tmp_path):
     assert len(send(tmp_path, 'PostToolUse', session='s', turn='t')) == 1
     assert len(send(tmp_path, 'Stop', session='s', turn='t')) == 1
     assert send(tmp_path, 'SessionEnd', session='s', turn='t') == []
+
+
+@pytest.mark.parametrize('reply_turn', [None, 'new-turn'])
+def test_user_reply_clears_only_own_async_questions(tmp_path, reply_turn):
+    from importlib.util import spec_from_file_location, module_from_spec
+    spec = spec_from_file_location('codex_hook', SCRIPT)
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for session in ('session-a', 'session-b'):
+        for call in ('question-one', 'question-two'):
+            module.handle(dict(hook_event_name='PostToolUse', session_id=session,
+                               turn_id='old-turn', tool_name='request_user_input_async',
+                               tool_use_id=call, tool_response={'accepted': True}), tmp_path)
+    before = set(send(tmp_path, 'PermissionRequest'))
+    assert len(before) == 5
+    remaining = set(send(tmp_path, 'UserPromptSubmit', turn=reply_turn))
+    expected_removed = {p for p in before
+                        if p.name.startswith(module.digest('session-a') + '.async.')}
+    assert len(expected_removed) == 2
+    assert remaining == before - expected_removed

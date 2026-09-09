@@ -28,11 +28,11 @@ def handle(payload: dict, root: Path) -> None:
     if not isinstance(session, str) or not session:
         return
     if event not in {'PermissionRequest', 'PreToolUse', 'PostToolUse',
-                     'Stop', 'Interrupt', 'SessionEnd'}:
+                     'Stop', 'Interrupt', 'SessionEnd', 'UserPromptSubmit'}:
         return
     if event == 'PreToolUse' and tool != 'request_user_input':
         return
-    if event != 'SessionEnd' and (not isinstance(turn, str) or not turn):
+    if event not in {'SessionEnd', 'UserPromptSubmit'} and (not isinstance(turn, str) or not turn):
         return
     flags = root / 'codex_awaiting_input'
     flags.mkdir(parents=True, exist_ok=True)
@@ -40,6 +40,12 @@ def handle(payload: dict, root: Path) -> None:
     with (flags / '.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         prefix = digest(session) + '.'
+        if event == 'UserPromptSubmit':
+            # CLI async questions are answered through normal chat input.
+            # A reply may start a new turn; leave separate tool approvals alone.
+            for path in flags.glob(prefix + 'async.*'):
+                path.unlink(missing_ok=True)
+            return
         if event == 'PostToolUse' and tool == 'request_user_input_async':
             response = payload.get('tool_response')
             if isinstance(response, str):

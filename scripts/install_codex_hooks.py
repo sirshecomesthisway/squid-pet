@@ -10,7 +10,7 @@ import tempfile
 
 STATUS = 'Squid: update approval indicator'
 EVENTS = ('PermissionRequest', 'PreToolUse', 'PostToolUse', 'Stop',
-          'Interrupt', 'SessionEnd')
+          'Interrupt', 'SessionEnd', 'UserPromptSubmit')
 
 
 def is_ours(handler):

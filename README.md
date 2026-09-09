@@ -214,9 +214,11 @@ approval-resolved hook. Accepted asynchronous questions raise a marker via
 `PostToolUse`, but an accepted event does not confirm the client displayed
 options. In the tested Codex CLI, async questions appear as inline text
 with bullet choices; reply in chat rather than expecting an interactive picker.
-Their answer-resolution event is not verified: normal tool completion,
-turn completion, and unrelated messages do not mark them answered. Session end
-and stale-marker expiry provide cleanup. Questions embedded in prose are not
+The next `UserPromptSubmit` clears that session's async-question markers, using
+the same reply lifecycle as the Claude integration. This treats the next chat
+submission as a response; it does not inspect or classify your answer. Tool
+completion and turn completion leave async questions pending. Session end and
+stale-marker expiry also provide cleanup. Questions embedded in prose are not
 automatically detected.
 Permission requests are paired with results by session, turn, tool name, and
 input because PermissionRequest exposes no call ID; identical concurrent calls
