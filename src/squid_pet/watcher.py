@@ -570,6 +570,20 @@ def claude_sessions_awaiting_input() -> list[str]:
     return _scan_session_flag_dir(CLAUDE_AWAITING_INPUT_DIR, CLAUDE_AWAITING_INPUT_STALE_SEC)
 
 
+CODEX_AWAITING_INPUT_DIR = os.path.expanduser("~/.squid-pet/codex_awaiting_input")
+_CODEX_SESSION_FLAG_FIRST_SEEN: dict[str, float] = {}
+
+
+def codex_requests_awaiting_input() -> list[str]:
+    """Opaque per-request markers from Codex's advisory lifecycle hooks."""
+    return _scan_session_flag_dir(
+        CODEX_AWAITING_INPUT_DIR, CLAUDE_AWAITING_INPUT_STALE_SEC)
+
+
+def filter_eligible_codex_requests(request_ids: list[str]) -> list[str]:
+    return _filter_eligible_direct_signals(request_ids, _CODEX_SESSION_FLAG_FIRST_SEEN)
+
+
 # ── "just finished" flag (Pink-2026-08-27f: real Stop-hook signal) ─────
 # Replaces the old busy->idle heuristic edge (ClaudeCodeDetector watching
 # shell/file/transcript-mtime activity drop) as the celebrate trigger for
@@ -864,16 +878,20 @@ def filter_eligible_claude_sessions(session_ids: list[str]) -> list[str]:
     Also maintains _CLAUDE_SESSION_FLAG_FIRST_SEEN: records birth time for
     any new flag, evicts entries whose flag has gone away.
     """
+    return _filter_eligible_direct_signals(session_ids, _CLAUDE_SESSION_FLAG_FIRST_SEEN)
+
+
+def _filter_eligible_direct_signals(session_ids, first_seen_times) -> list[str]:
     now = time.time()
     live = set(session_ids)
 
-    for sid in [s for s in _CLAUDE_SESSION_FLAG_FIRST_SEEN.keys()
+    for sid in [s for s in first_seen_times.keys()
                 if s not in live]:
-        del _CLAUDE_SESSION_FLAG_FIRST_SEEN[sid]
+        del first_seen_times[sid]
 
     eligible: list[str] = []
     for sid in session_ids:
-        first_seen = _CLAUDE_SESSION_FLAG_FIRST_SEEN.setdefault(sid, now)
+        first_seen = first_seen_times.setdefault(sid, now)
         if now - first_seen > _CLAUDE_SESSION_SNOOZE_SEC:
             continue
         eligible.append(sid)
@@ -911,18 +929,22 @@ def snooze_all_awaiting_now() -> int:
     for sid in list(_CLAUDE_SESSION_FLAG_FIRST_SEEN.keys()):
         _CLAUDE_SESSION_FLAG_FIRST_SEEN[sid] = claude_stale
         count += 1
+    for request in codex_requests_awaiting_input():
+        _CODEX_SESSION_FLAG_FIRST_SEEN[request] = claude_stale
+        count += 1
     return count
 
 
 def count_currently_waving_sessions() -> int:
-    """Menu helper: how many Claude Code sessions are actively waving
+    """Menu helper: how many Claude sessions and Codex requests are waving
     right now (i.e. have a flag AND would pass the eligibility filter)?
     Used to enable/disable the 'Calm Squid' menu item."""
     try:
         raw_sessions = claude_sessions_awaiting_input()
     except Exception:
         raw_sessions = []
-    return len(filter_eligible_claude_sessions(raw_sessions))
+    return (len(filter_eligible_claude_sessions(raw_sessions))
+            + len(filter_eligible_codex_requests(codex_requests_awaiting_input())))
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -1260,7 +1282,8 @@ class StateMachine:
         # DIRECT signal: Claude Code's own Notification hook (scripts/
         # claude_pet_hook.py) writes ~/.squid-pet/claude_awaiting_input/
         # <session_id> when a session is asking for input RIGHT NOW.
-        # No CPU guessing, no fallback -- this is the only path.
+        # Codex lifecycle hooks contribute independent request markers below.
+        # No CPU guessing; other sessions working cannot clear these waits.
         try:
             from . import config as _cfg
             _enabled = bool(_cfg.get("approval_alert_enabled", True))
@@ -1274,10 +1297,16 @@ class StateMachine:
         awaiting_sessions = filter_eligible_claude_sessions(
             awaiting_sessions_raw if _enabled else []
         )
+        codex_waits = filter_eligible_codex_requests(
+            codex_requests_awaiting_input() if _enabled else [])
         fired_reason: str | None = None
         if awaiting_sessions:
             fired_reason = ("awaiting_input flag from Claude Code session(s) "
                             + ",".join(awaiting_sessions))
+
+        if codex_waits:
+            codex_reason = f"Codex awaiting input ({len(codex_waits)} request(s))"
+            fired_reason = ((fired_reason + "; ") if fired_reason else "") + codex_reason
 
         if fired_reason is not None:
             # OVERRIDE whatever the cascade picked. approval_needed is
@@ -1296,7 +1325,11 @@ class StateMachine:
                     flush=True,
                 )
                 if notify:
-                    _fire_approval_notification(_text, _sound)
+                    if codex_waits:
+                        source = "Claude Code and Codex" if awaiting_sessions else "Codex"
+                        _fire_approval_notification(_text, _sound, source_label=source)
+                    else:
+                        _fire_approval_notification(_text, _sound)
         else:
             # No alert is fired this tick. Reset the OS-notification latch
             # so the next genuine alert (after Pink replies + new response)
@@ -1732,8 +1765,7 @@ def _fire_approval_notification(text: str, sound: str, source_label: str = "Clau
     Runs in ~50ms so we do not block the watcher loop. Silent on failure
     (notification is supplementary; the bubble is the primary signal).
 
-    source_label names which agent is actually waiting. Only Claude Code
-    calls this today (see StateMachine.compute()'s approval block); kept
+    source_label names which agent is actually waiting (Claude Code or Codex); kept
     as a parameter rather than a hardcoded string so a future agent-
     specific direct signal (e.g. Codex) can reuse this function without
     lying about the source -- Pink-2026-08-26 found a real bug where this
@@ -1761,7 +1793,8 @@ def _fire_approval_notification(text: str, sound: str, source_label: str = "Clau
         notifier = shutil.which("terminal-notifier")
         if notifier:
             try:
-                bundle_id = find_terminal_app_bundle_for_claude_code()
+                bundle_id = (find_terminal_app_bundle_for_claude_code()
+                             if source_label == "Claude Code" else None)
             except Exception:
                 bundle_id = None
             cmd = [notifier, "-title", title, "-message", body]

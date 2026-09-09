@@ -8,7 +8,11 @@ and how to turn any of it off.
 
 * Squid scans **filesystem metadata** (mtimes), **running process
   names**, and **CPU percentages**.
-* Squid never reads file contents, never sends data anywhere, and
+* Claude detection also reads a bounded transcript tail (up to 64 KiB)
+  for record types and timestamps, to ignore background artifact ledger writes.
+  This buffer can contain message text, but that text is not used, retained,
+  or logged; only the resulting activity timestamp is cached.
+* Squid never sends data anywhere, and
   never writes anything outside `~/.squid-pet/`.
 * All scanning is **local-only**. No network calls. No telemetry.
 * Every detector is **individually toggleable** via
@@ -47,8 +51,8 @@ config, outside this repo).
 Does NOT read: the `message` field's human-readable text, `transcript_path`,
 `cwd`, `prompt_id`, or any other field Claude Code's hook payload
 includes beyond the three above; does not read transcript file contents,
-prompt/response text, or tool call arguments/results (same guarantee as
-ClaudeCodeDetector below). Never imports the `squid_pet` package and has
+prompt/response text, or tool call arguments/results. Never imports the
+`squid_pet` package and has
 zero dependencies beyond the Python stdlib, so a bug in squid-pet proper
 can't affect it (or vice versa) -- it's wired up and torn down entirely
 through `~/.claude/settings.json`.
@@ -73,20 +77,47 @@ the right app to the front on click instead of a generic/unhelpful target.
 | CPU% of that process | diagnostic only (`squid why`) — not used to decide state |
 | Non-shell descendant processes of `claude` (shared tool-name allowlist, also used by CodexDetector) | detects a live tool call (e.g. a Bash-tool command) → "working" |
 | File mtimes under `project_dirs` (default `~/Projects`), same scan as IDEDetector | detects a very recent write (in-process tools like Edit/Write don't spawn a subprocess, so this catches what shell-child detection misses) → "working" |
-| `~/.claude/projects/*/*.jsonl` mtime (youngest across all sessions) | detects a recent transcript write → "thinking" (proxy for the LLM generating or a tool call resolving) |
+| `~/.claude/projects/*/*.jsonl` mtime plus up to 64 KiB of tail record types/timestamps | detects a recent transcript write → "thinking" (proxy for the LLM generating or a tool call resolving) |
 
-Does NOT read: transcript file contents, prompt/response text, tool call
-arguments or results, session IDs beyond their mtime, `~/.claude/`
-settings or credentials, or the contents of any file under `project_dirs`.
+Transcript tails are read only when recently modified, and cached until
+mtime/size changes. Background `artifact-autoreact-ledger` records do not
+refresh activity; a preceding timestamp determines recency instead. Message
+text in the temporary buffer is not used, retained, or logged. Unknown or
+oversized records that cannot be decoded fall back to file mtime. A bounded
+tail consisting entirely of ledger records contributes no activity.
+
+Does NOT read: `~/.claude/` settings or credentials, or the contents of
+any file under `project_dirs`.
 
 Caching: the list of transcript files is cached for 60 seconds (same
 pattern as GitDetector's repo-discovery cache); files untouched for
 15+ minutes are dropped from the cache to keep it small over time.
 
+### Codex approval hooks — `scripts/codex_pet_hook.py`
+
+Codex invokes this advisory script with a JSON payload on stdin. It uses
+`hook_event_name`, `session_id`, `turn_id`, `tool_name`, and `tool_input` to
+match requests with their results. Shell/patch inputs are reduced to the
+command before hashing; other tool inputs are hashed as JSON. Inputs can
+contain command or question text, but none is logged or retained. The script
+never reads the transcript, credentials, or files named by tool arguments.
+
+Only SHA-256 request identifiers and reference counts are persisted in
+`~/.squid-pet/codex_awaiting_input/`, plus a lock for concurrent hook processes.
+Squid scans marker names/mtimes to show approval_needed; terminal/turn events
+remove them and stale markers expire. The script emits no approval decision
+or model instructions and sends nothing over the network.
+
+The explicit setup command `scripts/install_codex_hooks.py` merges hook
+configuration into `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) and
+backs up the original as `hooks.json.squid-backup`. This setup operation is an
+exception to the runtime's Squid-directory-only writes. Codex's `/hooks`
+review/trust step is required; the installer never grants hook trust.
+
 ### CodexDetector — observes the Codex CLI
 
-Same signals and rationale as ClaudeCodeDetector, adapted to Codex's
-on-disk layout:
+Same process/file signals as ClaudeCodeDetector, adapted to Codex's
+on-disk layout. Codex transcripts remain mtime-only; no tail is read:
 
 | Reads | What for |
 |-------|----------|

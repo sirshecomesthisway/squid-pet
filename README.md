@@ -69,8 +69,8 @@ A cold install typically takes about 3 minutes; subsequent updates are around 30
   [Approval-needed flag wave](#approval-needed-flag-wave)
 - **Cross-tool**: also picks up git commits, terminal activity, and IDE
   (VS Code/Cursor/JetBrains) activity
-- **Private by design**: every detector reads metadata only — never file
-  contents, never network ([disclosure](docs/PRIVACY.md))
+- **Private by design**: detectors use process/file metadata and limited Claude
+  transcript record metadata; never network ([disclosure](docs/PRIVACY.md))
 - **Fully configurable**: toggle any detector or behavior live via
   `~/.squid-pet/settings.json` — no restart needed
 - Drag her around, right-click for a corner/pause/sprint menu,
@@ -149,7 +149,7 @@ squid uninstall --yes --all  # nukes everything, no prompts
 | `sleeping` | <img src="src/squid_pet/frontend/sprites/sleeping.png" width="56" alt="sleeping"> | macOS HID idle > 5 min | You've stepped away from your Mac for 5+ minutes |
 | `drowsy` | <img src="src/squid_pet/frontend/sprites/drowsy.png" width="56" alt="drowsy"> | State-machine idle 300–359 s (frontend-driven) | Nothing's happened in 5+ minutes, she's about to doze off |
 | `stretch` | <img src="src/squid_pet/frontend/sprites/stretch.png" width="56" alt="stretch"> | Wake transition (~1.6 s, frontend-driven) | You just came back and woke her up |
-| `attention_needed` | <img src="src/squid_pet/frontend/sprites/attention_needed.png" width="56" alt="attention needed"> | Claude Code session waiting on you — see [Approval-needed flag wave](#approval-needed-flag-wave) | Claude Code hit a permission prompt and is waiting on your reply |
+| `attention_needed` | <img src="src/squid_pet/frontend/sprites/attention_needed.png" width="56" alt="attention needed"> | Claude Code or Codex waiting on you — see [Approval-needed flag wave](#approval-needed-flag-wave) | Claude Code hit a permission prompt and is waiting on your reply |
 
 A few more sprites in `frontend/sprites/` (`blink`, `heart`, `look-left`/`look-right`, the `*_menubar` variants) are animation frames or interaction reactions rather than separate states — see [Project layout](#project-layout).
 
@@ -177,8 +177,8 @@ and `tests/test_watcher_codex_cascade.py` for the contract.
 ## Approval-needed flag wave
 
 A separate, higher-priority alert layered on top of the state cascade
-above: Squid waves and fires a macOS notification when a Claude Code
-session is sitting there waiting on you.
+above: Squid waves and fires a macOS notification when Claude Code or
+Codex has a pending approval or explicit question.
 
 **Signal**: `~/.squid-pet/claude_awaiting_input/<session_id>`, written by
 `scripts/claude_pet_hook.py` on a `Notification` event with
@@ -189,6 +189,50 @@ Removed on `UserPromptSubmit` (you replied) or `SessionEnd`.
 Run `squid why` / `--why-json` to see exactly what's waving and why —
 it reports `claude_sessions_awaiting` / `claude_sessions_eligible`
 independently.
+
+### Codex setup
+
+From this repository, run:
+
+```sh
+.venv/bin/python scripts/install_codex_hooks.py
+```
+
+This merges Squid's advisory hooks into `~/.codex/hooks.json` (or
+`$CODEX_HOME/hooks.json`), preserving existing hooks and backing up the original.
+Open **`/hooks` in Codex and review/trust the Squid entries**. New or changed
+hooks are skipped until trusted; if they aren't listed, resume the session.
+This uses Codex's [official lifecycle hooks](https://learn.chatgpt.com/docs/hooks),
+verified against CLI 0.153.4. It does not change approval policies or grant
+permission to execute anything.
+
+`PermissionRequest` raises a wait; `PreToolUse` does the same for
+`request_user_input`. Matching `PostToolUse` clears it, and `Stop`, `Interrupt`,
+and `SessionEnd` clean up ended turns/sessions. A command approval can remain
+visible until the command returns its tool result because there is no separate
+approval-resolved hook. Accepted asynchronous questions raise a marker via
+`PostToolUse`, but an accepted event does not confirm the client displayed
+options. In the tested Codex CLI, async questions appear as inline text
+with bullet choices; reply in chat rather than expecting an interactive picker.
+Their answer-resolution event is not verified: normal tool completion,
+turn completion, and unrelated messages do not mark them answered. Session end
+and stale-marker expiry provide cleanup. Questions embedded in prose are not
+automatically detected.
+Permission requests are paired with results by session, turn, tool name, and
+input because PermissionRequest exposes no call ID; identical concurrent calls
+within the same turn cannot always be distinguished.
+
+Markers under `~/.squid-pet/codex_awaiting_input/` are scoped to session, turn,
+and request. Another tool or Claude session working does not clear them.
+The existing alert toggle, snooze timeout, and **Calm Squid** apply to Codex too.
+**Calm Squid only silences the alert. It never answers, approves, skips, or
+cancels the pending request.**
+`squid why` reports `codex_requests_awaiting` alongside Claude's signals.
+To unregister only Squid's Codex hooks:
+
+```sh
+.venv/bin/python scripts/install_codex_hooks.py --remove
+```
 
 <details>
 <summary>Manual hook setup (if a machine doesn't have it wired up yet)</summary>
@@ -210,8 +254,7 @@ repo's `scripts/claude_pet_hook.py`:
 Merge this into your existing `hooks` key if you already have one, rather
 than overwriting the whole file. New Claude Code sessions (and, in
 practice, already-running ones — settings.json changes are hot-reloaded)
-pick this up automatically; no restart required. Codex has no direct-signal
-hook yet.
+pick this up automatically; no restart required.
 
 </details>
 
@@ -285,9 +328,11 @@ tick, so list only roots you actively work in. Paths may use `~`.
 `claude_code` and `codex` get the full working/thinking distinction (same
 cascade, OR-merged across both); the rest feed a flatter busy/idle signal.
 Edit any flag to `false` to disable that detector entirely — no scans,
-no process iteration, no filesystem walks for that source. Every detector
-reads only metadata (process names, CPU%, file mtimes) — never file
-contents, never network. Full per-detector data-access table:
+no process iteration, no filesystem walks for that source. Detectors use
+process names, CPU%, and file mtimes. Claude detection also
+reads up to 64 KiB of a recently changed transcript for record types and
+timestamps, excluding background ledger updates. No data is sent over the
+network. Full per-detector data-access table:
 [`docs/PRIVACY.md`](docs/PRIVACY.md). Run `squid why` to see exactly which
 detector fired on the current tick.
 

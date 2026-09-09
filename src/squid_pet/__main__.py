@@ -183,6 +183,7 @@ def _run_why(json_output: bool = False) -> None:
     approval_alert = {
         "enabled": bool(_cfg.get("approval_alert_enabled", True)),
         "claude_sessions_awaiting": claude_sessions_raw,
+        "codex_requests_awaiting": watcher.codex_requests_awaiting_input(),
         "claude_sessions_eligible": claude_sessions_eligible,
     }
 
@@ -293,6 +294,7 @@ def _print_why_human(report: dict) -> None:
         if claude_awaiting and not claude_eligible:
             print(f"  {YEL}(all snoozed -- seen and deferred, "
                   f"waiting for a reply or a fresh wait){RST}")
+        print(f"  Codex requests awaiting: {len(aa.get('codex_requests_awaiting') or [])}")
         if not aa["enabled"]:
             print(f"  {YEL}!! alerts are OFF -- flag-wave override disabled.{RST}")
             print("     Re-enable via tray: Bubbles -> 'Your turn' alerts.")

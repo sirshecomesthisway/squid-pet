@@ -35,9 +35,11 @@ generic fallback.
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Protocol, runtime_checkable
 
@@ -115,7 +117,8 @@ class ClaudeCodeDetector:
         at the cost of coarser granularity -- this is what maps to
         "thinking" when neither shell_active nor file_active fire.
 
-    No content is ever read from any transcript -- mtime only. See
+    A bounded transcript tail is read for record types/timestamps to exclude
+    background artifact ledger writes; message text is not used. See
     design.md for why (undocumented on-disk format; observed to include
     non-conversational bookkeeping lines, not just user/assistant turns).
     """
@@ -163,6 +166,7 @@ class ClaudeCodeDetector:
             lambda: _recent_file_ages_for_tick(
                 self.project_dirs, self.FILE_ACTIVE_WINDOW_SEC, self._scan_now)
         )
+        self._transcript_activity_cache: dict = {}
         self._candidates: list = []
         self._candidates_at: float = 0.0
         self._last_scan_ts: float = 0.0
@@ -201,13 +205,73 @@ class ClaudeCodeDetector:
         self._candidates_at = now
         return self._candidates
 
+    def _transcript_activity_mtime(self, path, stat) -> float:
+        """Ignore background ledger appends without reading entire transcripts.
+
+        Only record types and timestamps are used. Cache one bounded tail per
+        changed candidate; prompt/response contents are never retained or logged.
+        Unknown formats and unreadable files preserve the mtime fallback.
+        A tail containing only complete ledger records contributes no activity;
+        oversized records that cannot be decoded retain the mtime fallback.
+        """
+        key = (getattr(stat, "st_mtime_ns", stat.st_mtime),
+               getattr(stat, "st_size", None))
+        cached = self._transcript_activity_cache.get(str(path))
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        activity = stat.st_mtime
+        try:
+            with open(path, "rb") as stream:
+                size = stream.seek(0, os.SEEK_END)
+                offset = max(0, size - 65536)
+                stream.seek(offset)
+                lines = stream.read(65536).splitlines()
+            if offset:
+                lines = lines[1:]  # first record may be partial
+            saw_ledger = False
+            for line in reversed(lines):
+                try:
+                    record = json.loads(line)
+                except (ValueError, UnicodeDecodeError):
+                    activity = stat.st_mtime
+                    break
+                if not isinstance(record, dict):
+                    activity = stat.st_mtime
+                    break
+                if record.get("type") == "artifact-autoreact-ledger":
+                    saw_ledger = True
+                    activity = 0.0
+                    continue
+                if saw_ledger:
+                    activity = stat.st_mtime
+                    try:
+                        stamp = datetime.fromisoformat(record.get("timestamp", ""))
+                        if stamp.tzinfo is not None:
+                            activity = min(stat.st_mtime, stamp.timestamp())
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                break
+        except OSError:
+            pass
+        self._transcript_activity_cache[str(path)] = (key, activity)
+        return activity
+
     def _newest_transcript_age(self, now: float) -> float:
         newest_mtime = 0.0
-        for f in self._discover(now):
+        candidates = self._discover(now)
+        candidate_keys = {str(f) for f in candidates}
+        self._transcript_activity_cache = {
+            k: v for k, v in self._transcript_activity_cache.items()
+            if k in candidate_keys
+        }
+        for f in candidates:
             try:
-                mtime = self._stat(str(f)).st_mtime
+                stat = self._stat(str(f))
             except OSError:
                 continue
+            mtime = stat.st_mtime
+            if now - mtime < self.STREAMING_STALE_SEC:
+                mtime = self._transcript_activity_mtime(f, stat)
             newest_mtime = max(newest_mtime, mtime)
         if newest_mtime == 0.0:
             return float("inf")
