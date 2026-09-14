@@ -27,6 +27,12 @@ def _make_api():
     api._sm = None
     api._observer = MagicMock()
     api._observer.on_state_change.return_value = None
+    # Pink-2026-09-13: these tests exercise the throttled periodic reannounce
+    # with no live shell command (api._sm is None), so the new per-command
+    # narration path (Observer.on_new_command) has nothing concrete to say.
+    # Default it to None so a MagicMock auto-return can't inject a phantom
+    # bubble into the reannounce assertions below.
+    api._observer.on_new_command.return_value = None
     api._pending_bubble = None
     api._last_working_bubble_at = 0.0
     api._last_working_bubble_text = ""

@@ -40,7 +40,12 @@ WINDOW_HEIGHT = 300  # was 220; bumped to give hearts headroom above sprite
 # Pink-2026-08-27k: was 25.0; bumped to match idle chatter's ~30s cadence
 # ("too quiet" report -- both idle and working feedback loops should feel
 # similarly present).
-WORKING_REANNOUNCE_SEC = 30.0
+# Pink-2026-09-13: dropped to 15.0 -- "talk more while working". This is the
+# ambient/generic beat only; a genuinely NEW shell command now narrates
+# itself immediately via _maybe_announce_new_command, independent of this
+# throttle, so shortening it just makes the between-commands presence chattier
+# without gating the per-command updates.
+WORKING_REANNOUNCE_SEC = 15.0
 
 # Pink-2026-08-31: dblclick-while-waving acknowledge (see
 # acknowledge_approval) shows the "gotcha!" bubble immediately but holds
@@ -754,6 +759,9 @@ class PetApi:
                 self._last_working_bubble_at = state.timestamp
                 self._last_working_bubble_text = bubble or ""
         elif state.state == "working":
+            # Narrate a NEW command the instant we catch it (Pink-2026-09-13),
+            # then let the throttled generic beat fill the gaps between.
+            self._maybe_announce_new_command(state)
             self._maybe_reannounce_working(state)
 
     def _current_shell_cmdline(self) -> list[str] | None:
@@ -773,6 +781,27 @@ class PetApi:
         except Exception:
             pass
         return None
+
+    def _maybe_announce_new_command(self, state: watcher.PetState) -> None:
+        """While state STAYS 'working', fire a fresh "runs X" bubble the moment
+        a NEW shell command is caught -- BYPASSING the WORKING_REANNOUNCE_SEC
+        throttle that paces the generic beat. So a turn that runs several
+        commands narrates each one as it happens, not just the first on entry.
+
+        Dedup shares _last_working_bubble_text with the periodic reannounce, so
+        the same command never fires twice and the two paths can't double up.
+        Reset the reannounce clock on a hit so the next generic beat lands a
+        full window after this command, not right on top of it.
+
+        Best-effort by nature: the command is read from a live child process
+        (see _current_shell_cmdline); short Bash calls that finish between 1s
+        ticks are never sampled and simply don't get narrated."""
+        bubble = self._observer.on_new_command(self._current_shell_cmdline())
+        if bubble is None or bubble == self._last_working_bubble_text:
+            return
+        self._last_working_bubble_text = bubble
+        self._last_working_bubble_at = state.timestamp
+        self._set_pending_bubble(bubble, BUBBLE_PRIO_AMBIENT)
 
     def _maybe_reannounce_working(self, state: watcher.PetState) -> None:
         """While state STAYS 'working' across ticks (no transition, so

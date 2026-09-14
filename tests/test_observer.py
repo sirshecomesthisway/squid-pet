@@ -319,6 +319,34 @@ def test_shell_cmd_empty_returns_none():
 
 
 # ----------------------------------------------------------------------
+# on_new_command -- narrate each NEW shell command while staying 'working'
+# (Pink-2026-09-13: "talk more, on every new command / action")
+# ----------------------------------------------------------------------
+
+def test_on_new_command_names_the_command(obs):
+    """A live shell child yields a concrete 'runs X' line, same enrichment
+    as the on-entry working bubble."""
+    assert obs.on_new_command(["/usr/local/bin/pytest", "-x"]) == "runs pytest"
+
+
+def test_on_new_command_none_when_no_cmdline(obs):
+    """Unlike on_still_working, on_new_command NEVER falls back to a generic
+    line -- 'a new command appeared' is only meaningful when we can name it,
+    so nothing to name means nothing to say."""
+    assert obs.on_new_command(None) is None
+    assert obs.on_new_command([]) is None
+
+
+def test_on_new_command_none_when_unrecoverable(obs):
+    """A wrapper with no recoverable command yields None (no generic fallback)."""
+    assert obs.on_new_command(["/bin/zsh", "-c", ""]) is None
+
+
+def test_on_new_command_muted(muted_obs):
+    assert muted_obs.on_new_command(["pytest", "-x"]) is None
+
+
+# ----------------------------------------------------------------------
 # Interaction triggers (poke, sprint, etc.)
 # ----------------------------------------------------------------------
 

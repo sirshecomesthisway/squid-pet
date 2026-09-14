@@ -729,6 +729,23 @@ class Observer:
                 + BUBBLE_LINES["working_squid"])
         return random.choice(pool)
 
+    def on_new_command(self, shell_cmdline: Optional[list[str]]) -> Optional[str]:
+        """A NEW shell command was caught while state STAYS 'working'
+        (Pink-2026-09-13: "talk more -- update on every new command").
+
+        Returns a concrete "runs X" bubble for the live child. Unlike
+        on_still_working this NEVER falls back to a generic working line:
+        the caller fires this every tick (not on a throttle), so a generic
+        fallback here would spam. "A new command appeared" is only worth
+        saying when we can actually name it -- naming nothing means nothing
+        to say, and the throttled on_still_working owns the ambient beat.
+        """
+        if self._get_muted():
+            return None
+        if not shell_cmdline:
+            return None
+        return _shell_cmd_bubble(shell_cmdline)
+
     # ------------------------------------------------------------------
     # Interaction trigger
     # ------------------------------------------------------------------
