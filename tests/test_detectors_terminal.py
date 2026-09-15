@@ -1,6 +1,6 @@
 """Tests for TerminalDetector via synthetic psutil-shaped objects."""
 from __future__ import annotations
-import time
+
 from squid_pet.detectors import TerminalDetector
 
 

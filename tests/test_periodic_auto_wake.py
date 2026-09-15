@@ -20,8 +20,8 @@ import time
 import pytest
 
 from squid_pet import watcher
-from squid_pet.window import PetApi, PERIODIC_WAKE_CADENCE_SEC, PERIODIC_WAKE_AWAKE_SEC
 from squid_pet.watcher import PetState
+from squid_pet.window import PERIODIC_WAKE_AWAKE_SEC, PERIODIC_WAKE_CADENCE_SEC, PetApi
 
 
 class _StubObserver:
@@ -214,6 +214,7 @@ def test_watcher_thread_wires_the_machine_it_feeds_updates_from(monkeypatch):
     compute -- otherwise a wake in the opening seconds is silently dropped,
     which is the same class of gap that hid this bug in the first place."""
     import threading as _threading
+
     from squid_pet import window as window_mod
 
     made = []

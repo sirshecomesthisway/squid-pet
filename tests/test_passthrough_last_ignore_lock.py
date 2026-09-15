@@ -19,7 +19,6 @@ test_passthrough_state_mapping.py.
 from __future__ import annotations
 
 import threading
-import time
 from unittest.mock import MagicMock, patch
 
 from squid_pet.passthrough import PassthroughController
@@ -101,6 +100,7 @@ def test_loop_hysteresis_read_is_locked_snapshot(monkeypatch):
     source level: the snapshot variable name appears immediately after
     an acquisition of self._lock in the hysteresis block."""
     import inspect
+
     from squid_pet import passthrough
     src = inspect.getsource(passthrough.PassthroughController._loop)
     assert "_last_ignore_snapshot" in src

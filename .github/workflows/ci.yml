@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref (e.g. a force-push to a PR branch).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # squid-pet is a macOS desktop app (PyObjC / pywebview / Quartz), so the
+    # test suite must run on real macOS -- the Cocoa frameworks the modules
+    # import at load time do not exist on Linux runners.
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Lowest supported (pyproject requires-python) and the dev version.
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --python ${{ matrix.python-version }} --dev --frozen
+
+      - name: Lint (ruff)
+        run: uv run --python ${{ matrix.python-version }} ruff check src/ scripts/ tools/ tests/
+
+      - name: Type-check (mypy)
+        run: uv run --python ${{ matrix.python-version }} mypy --config-file pyproject.toml
+
+      - name: Test (pytest)
+        run: uv run --python ${{ matrix.python-version }} pytest

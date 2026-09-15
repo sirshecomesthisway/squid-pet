@@ -15,7 +15,9 @@ from __future__ import annotations
 import pytest
 
 from squid_pet.routine import (
-    RoutineController, CHATTER_MIN_INTERVAL_SEC, CHATTER_MAX_INTERVAL_SEC,
+    CHATTER_MAX_INTERVAL_SEC,
+    CHATTER_MIN_INTERVAL_SEC,
+    RoutineController,
 )
 
 

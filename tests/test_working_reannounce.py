@@ -13,8 +13,8 @@ from __future__ import annotations
 import threading
 from unittest.mock import MagicMock
 
-from squid_pet.window import PetApi, WORKING_REANNOUNCE_SEC
 from squid_pet.watcher import PetState
+from squid_pet.window import WORKING_REANNOUNCE_SEC, PetApi
 
 
 def _make_api():

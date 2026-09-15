@@ -9,7 +9,7 @@ clamped — strobing the frontend edge-rotation at rhythm-walk frequency.
 This test exists so a future edit to window dimensions cannot silently
 re-introduce the same class of bug.
 """
-from squid_pet import window, wanderer, passthrough
+from squid_pet import passthrough, wanderer, window
 
 
 def test_window_height_constants_agree():

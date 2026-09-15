@@ -3,10 +3,10 @@
 import argparse
 import json
 import os
-from pathlib import Path
 import shlex
 import sys
 import tempfile
+from pathlib import Path
 
 STATUS = 'Squid: update approval indicator'
 EVENTS = ('PermissionRequest', 'PreToolUse', 'PostToolUse', 'Stop',

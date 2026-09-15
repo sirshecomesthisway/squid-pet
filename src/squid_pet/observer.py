@@ -15,9 +15,9 @@ Reference: openspec/specs/observer-mode/spec.md
 """
 from __future__ import annotations
 
-import re
-import random
 import logging
+import random
+import re
 from typing import Callable, Optional, Union
 
 log = logging.getLogger(__name__)
@@ -725,8 +725,8 @@ class Observer:
             specific = _shell_cmd_bubble(shell_cmdline)
             if specific is not None:
                 return specific
-        pool = (BUBBLE_LINES["working_generic"] + BUBBLE_LINES["working_wrapup"]
-                + BUBBLE_LINES["working_squid"])
+        pool = [*BUBBLE_LINES["working_generic"], *BUBBLE_LINES["working_wrapup"],
+                *BUBBLE_LINES["working_squid"]]
         return random.choice(pool)
 
     def on_new_command(self, shell_cmdline: Optional[list[str]]) -> Optional[str]:

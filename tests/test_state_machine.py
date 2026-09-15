@@ -17,7 +17,6 @@ test_watcher_claude_code_cascade.py / test_watcher_codex_cascade.py.
 from __future__ import annotations
 
 import time
-import pytest
 
 from squid_pet import watcher
 from squid_pet.watcher import StateMachine

@@ -35,20 +35,34 @@ State is written to ~/.squid-pet/state.json every 1s, frontend polls it.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import time
-from dataclasses import dataclass, asdict
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Literal
 
 import psutil
+
+log = logging.getLogger(__name__)
 
 # ────────────────────────────────────────────────────────────────────────
 # Configuration
 # ────────────────────────────────────────────────────────────────────────
 STATE_DIR = Path.home() / ".squid-pet"
 STATE_FILE = STATE_DIR / "state.json"
+
+# Canonical set of states the backend can emit (see the module docstring for
+# what each means). Single source of truth on the Python side: the frontend
+# (frontend/index.html's spriteUrl) must resolve every one of these to a real
+# sprite, and tests/test_frontend_state_contract.py pins that the two sides
+# agree and that each state's PNG actually exists.
+STATES: frozenset[str] = frozenset({
+    "idle", "thinking", "working", "celebrating",
+    "grooving", "sleeping", "approval_needed", "concerned",
+})
 
 POLL_INTERVAL_SEC = 1.0
 IDLE_THRESHOLD_SEC = 315           # 5m15s with no agent activity → sleeping
@@ -136,7 +150,7 @@ class PetState:
 # 0.0014ms. Checked side by side against ioreg: the two agree to within
 # the time ioreg itself takes to run, against a 5-minute threshold.
 # ioreg stays as the fallback for a machine without the bindings.
-_QUARTZ_IDLE_FN = None      # resolved on first use; False once known missing
+_QUARTZ_IDLE_FN: Callable[[], float] | Literal[False] | None = None  # resolved on first use; False once known missing
 
 
 def _quartz_idle_seconds() -> float | None:
@@ -148,8 +162,8 @@ def _quartz_idle_seconds() -> float | None:
         try:
             from Quartz import (
                 CGEventSourceSecondsSinceLastEventType,
-                kCGEventSourceStateHIDSystemState,
                 kCGAnyInputEventType,
+                kCGEventSourceStateHIDSystemState,
             )
         except Exception:
             # Remembered, so a machine without pyobjc-framework-Quartz
@@ -1118,8 +1132,7 @@ class StateMachine:
         self.detectors = list(new_detectors)
         self._refresh_detector_refs()
         enabled_names = [d.name for d in self.detectors if d.enabled]
-        print(f"[squid-pet] settings.json changed -- detectors reloaded: "
-              f"{enabled_names}", flush=True)
+        log.info("settings.json changed -- detectors reloaded: %s", enabled_names)
 
     def _refresh_detector_refs(self) -> None:
         """Re-point the Claude-Code/Codex detector caches after a detector
@@ -1205,6 +1218,32 @@ class StateMachine:
         self._maybe_reload_settings()
         st = self._compute_inner()
         now = time.time()
+        self._track_agent_idle(st, now)
+
+        # Approval-needed is layered on AFTER the cascade, from Claude Code's
+        # and Codex's own hook-written flag files. It OVERRIDES whatever the
+        # cascade picked -- it is the only state that REQUIRES Pink to act.
+        # Self-heal runs first, clearing flags a hook failed to clear (see
+        # each helper's docstring for the live bugs that motivated them).
+        awaiting_sessions_raw = claude_sessions_awaiting_input()
+        awaiting_sessions_raw = self._self_heal_stale_claude_flags(
+            st, now, awaiting_sessions_raw)
+        self._self_heal_stale_codex_flags(now)
+        self._apply_approval_override(
+            st, now, awaiting_sessions_raw, notify=notify)
+        self._apply_force_state_override(st)
+        return st
+
+    # ── compute() helpers (extracted for readability + unit testing) ──
+    def _track_agent_idle(self, st: PetState, now: float) -> None:
+        """Maintain agent_idle_seconds -- seconds since the machine last left
+        an active state, independent of macOS HID activity (the frontend's
+        drowsy-entry logic reads it every tick).
+
+        Also latches self._last_state to the CASCADE state -- deliberately
+        here, before the approval override runs, so next tick's idle clock
+        keys off real agent activity rather than the approval_needed override.
+        """
         agent_active_now = st.state in self._AGENT_ACTIVE_STATES
         agent_active_prev = self._last_state in self._AGENT_ACTIVE_STATES
         if not agent_active_now:
@@ -1216,8 +1255,11 @@ class StateMachine:
             self._agent_idle_since = 0.0
         self._last_state = st.state
 
-        awaiting_sessions_raw = claude_sessions_awaiting_input()
-
+    def _self_heal_stale_claude_flags(
+        self, st: PetState, now: float, awaiting_sessions_raw: list
+    ) -> list:
+        """Clear a Claude Code awaiting-input flag that a hook failed to clear,
+        returning the (possibly re-scanned) awaiting list."""
         # ── STALE-FLAG SELF-HEAL ─────────────────────────────────────
         # Pink-2026-08-27, real bug caught via live use: Claude Code's
         # Notification hook fires permission_prompt and we
@@ -1277,7 +1319,13 @@ class StateMachine:
             except Exception:
                 pass
             awaiting_sessions_raw = claude_sessions_awaiting_input()
+        return awaiting_sessions_raw
 
+    def _self_heal_stale_codex_flags(self, now: float) -> None:
+        """Clear a Codex awaiting-input flag once the approved command is
+        actually running (codex.shell_active). Codex fires no hook when the
+        human grants approval -- only at command completion -- so the flag
+        would otherwise wave for the whole runtime of the approved command."""
         # ── CODEX APPROVAL SELF-HEAL ─────────────────────────────────
         # Pink-2026-09-13, caught live: unlike Claude Code, Codex fires NO
         # hook at the moment the human GRANTS an approval. Its lifecycle is
@@ -1312,6 +1360,15 @@ class StateMachine:
                     pass
                 _CODEX_SESSION_FLAG_FIRST_SEEN.pop(req, None)
 
+    def _apply_approval_override(
+        self, st: PetState, now: float, awaiting_sessions_raw: list,
+        *, notify: bool,
+    ) -> None:
+        """Override the cascade with approval_needed when a Claude Code or
+        Codex session is awaiting input (from the hook-written flag files),
+        firing the OS notification once per episode. approval_needed wins over
+        whatever the cascade picked because it is the only state that REQUIRES
+        Pink to act."""
         # ── APPROVAL-NEEDED ALERT ──────────────────────────────────
         # DIRECT signal: Claude Code's own Notification hook (scripts/
         # claude_pet_hook.py) writes ~/.squid-pet/claude_awaiting_input/
@@ -1353,11 +1410,7 @@ class StateMachine:
                 self._approval_alert_fired = True
                 self._approval_alert_at = now
                 _sound_label = _sound if _sound else "off"
-                print(
-                    "[squid-pet] approval alert fired ("
-                    + fired_reason + ", sound=" + _sound_label + ")",
-                    flush=True,
-                )
+                log.info("approval alert fired (%s, sound=%s)", fired_reason, _sound_label)
                 if notify:
                     if codex_waits:
                         source = "Claude Code and Codex" if awaiting_sessions else "Codex"
@@ -1369,6 +1422,8 @@ class StateMachine:
             # so the next genuine alert (after Pink replies + new response)
             # gets a fresh ping.
             self._approval_alert_fired = False
+
+    def _apply_force_state_override(self, st: PetState) -> None:
         # ── FORCE-STATE OVERRIDE (test/demo) ─────────────────────────
         # If ~/.squid-pet/force_state exists with a non-empty state name,
         # use it directly. Lets Pink test any state visually or take demo
@@ -1385,7 +1440,6 @@ class StateMachine:
                     st.state_reason = "force_state override (" + _forced + ")"
         except Exception:
             pass
-        return st
 
     def _other_detectors(self):
         """Iterator over detectors excluding ClaudeCode and Codex (both
@@ -1498,16 +1552,16 @@ class StateMachine:
 
         # Other-detector signals (computed lazily to avoid wasted scans
         # when we exit the cascade early).
-        other_busy_cache = [None]
-        other_celebrating_cache = [None]
-        other_grooving_cache = [None]
+        other_busy_cache: list[bool | None] = [None]
+        other_celebrating_cache: list[tuple[bool, str | None] | None] = [None]
+        other_grooving_cache: list[bool | None] = [None]
 
         def other_busy() -> bool:
             if other_busy_cache[0] is None:
                 other_busy_cache[0] = any(
                     d.is_busy(now) for d in self._other_detectors()
                 )
-            return other_busy_cache[0]
+            return bool(other_busy_cache[0])
 
         def other_celebrating() -> bool:
             # Cache holds (fired: bool, name: str|None) once computed --
@@ -1520,21 +1574,24 @@ class StateMachine:
                         fired, name = True, d.name
                         break
                 other_celebrating_cache[0] = (fired, name)
-            return other_celebrating_cache[0][0]
+            result = other_celebrating_cache[0]
+            assert result is not None
+            return result[0]
 
         def other_celebrating_name() -> str | None:
             """Only meaningful after other_celebrating() has actually run
             -- if the CELEBRATING branch's `or` short-circuited before
             reaching it (e.g. a manually-armed celebrate_until), the
             cache is still empty and there's no "other" name to report."""
-            return other_celebrating_cache[0][1] if other_celebrating_cache[0] else None
+            cached = other_celebrating_cache[0]
+            return cached[1] if cached else None
 
         def other_grooving() -> bool:
             if other_grooving_cache[0] is None:
                 other_grooving_cache[0] = any(
                     d.is_grooving(now) for d in self._other_detectors()
                 )
-            return other_grooving_cache[0]
+            return bool(other_grooving_cache[0])
 
         st = PetState(
             idle_seconds=round(idle, 1),
@@ -1840,8 +1897,7 @@ def _fire_approval_notification(text: str, sound: str, source_label: str = "Clau
                 subprocess.run(cmd, timeout=3, capture_output=True)
                 return
             except Exception as e:
-                print("[squid-pet] terminal-notifier failed, falling back: "
-                      + str(e), flush=True)
+                log.warning("terminal-notifier failed, falling back to osascript: %s", e)
         try:
             body_escaped = _applescript_escape(body)
             sound_clause = (
@@ -1855,7 +1911,7 @@ def _fire_approval_notification(text: str, sound: str, source_label: str = "Clau
                 capture_output=True,
             )
         except Exception as e:
-            print("[squid-pet] notification fire failed: " + str(e), flush=True)
+            log.warning("notification fire failed: %s", e)
 
     threading.Thread(target=_go, daemon=True).start()
 
@@ -1869,16 +1925,20 @@ def write_state(state: PetState) -> None:
 
 def run_watcher_loop() -> None:
     """Main watcher loop — runs forever, writes state.json every POLL_INTERVAL_SEC."""
+    from .logging_setup import setup_logging
+    setup_logging()
     sm = StateMachine()
-    print(f"[squid-pet] watcher started; state file: {STATE_FILE}")
+    log.info("watcher started; state file: %s", STATE_FILE)
     while True:
         try:
             state = sm.compute()
             write_state(state)
         except KeyboardInterrupt:
             raise
-        except Exception as e:
-            print(f"[squid-pet] watcher error: {e}")
+        except Exception:
+            # A tick failing must never kill the loop -- but capture the
+            # traceback so a real regression is diagnosable, not a one-liner.
+            log.exception("watcher tick failed")
         time.sleep(POLL_INTERVAL_SEC)
 
 

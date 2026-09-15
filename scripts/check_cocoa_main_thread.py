@@ -28,7 +28,6 @@ import ast
 import sys
 from pathlib import Path
 
-
 # Cocoa method names that MUST run on the main thread.
 SUSPICIOUS_ATTRS = frozenset({
     "setFrameOrigin_", "setFrame_", "setAlphaValue_",

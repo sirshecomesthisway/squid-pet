@@ -13,7 +13,7 @@ Covers:
 from __future__ import annotations
 
 import pytest
-from squid_pet import observer
+
 from squid_pet.observer import (
     BUBBLE_LINES,
     MAX_BUBBLE_CHARS,
@@ -21,7 +21,6 @@ from squid_pet.observer import (
     _format_concern_reason,
     _shell_cmd_bubble,
 )
-
 
 # ----------------------------------------------------------------------
 # BUBBLE_LINES voice-contract invariants
@@ -570,7 +569,7 @@ def test_every_real_watcher_reason_has_an_explanation():
     """Contract: these are the strings watcher.py actually emits. Any
     reason without an explanation silently falls back to mood-mush, which
     is exactly the "I can't tell why she did that" problem."""
-    from squid_pet.observer import _explain_reason, MAX_BUBBLE_CHARS
+    from squid_pet.observer import MAX_BUBBLE_CHARS, _explain_reason
 
     for reason in _REAL_WATCHER_REASONS:
         out = _explain_reason(reason)

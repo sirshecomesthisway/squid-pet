@@ -15,12 +15,12 @@ from __future__ import annotations
 import pytest
 
 from squid_pet.observer import (
+    MAX_BUBBLE_CHARS,
     Observer,
+    _looks_like_path,
+    _parse_command,
     _shell_cmd_bubble,
     _unwrap_eval_payload,
-    _parse_command,
-    _looks_like_path,
-    MAX_BUBBLE_CHARS,
 )
 
 # Real preamble (captured live), parameterized by the embedded command.

@@ -11,20 +11,29 @@ Tier 1 menu rebuild 2026-06-28 (Pink/Indigo):
     SQUID_DEV env var, "Pause Squid" -> "Pause wandering"
 """
 from __future__ import annotations
+
+import logging
 import os
+
 import objc
 from AppKit import (
-    NSMenu, NSMenuItem, NSApp, NSEvent, NSStatusBar, NSImage,
-    NSVariableStatusItemLength, NSAlert, NSAlertFirstButtonReturn,
+    NSAlert,
     NSAlertSecondButtonReturn,
+    NSApp,
+    NSEvent,
+    NSImage,
+    NSMenu,
+    NSMenuItem,
+    NSStatusBar,
+    NSVariableStatusItemLength,
 )
+
 try:
-    from AppKit import NSOnState, NSOffState
+    from AppKit import NSOffState, NSOnState
 except ImportError:
     NSOnState, NSOffState = 1, 0
 from Foundation import NSObject
 from PyObjCTools import AppHelper
-
 
 # Emoji constants -- declared at module top so the menu builder reads
 # clean and the SquidMenu can pick the right one for the status icon.
@@ -50,6 +59,9 @@ DEV_MODE = bool(os.environ.get("SQUID_DEV"))
 # Menu bar icon assets: use Squid's actual sprite (cuter than the
 # system squid emoji which renders pink/blobby in the menu bar).
 import pathlib as _pl
+
+log = logging.getLogger(__name__)
+
 SPRITES_DIR = _pl.Path(__file__).parent / "frontend" / "sprites"
 SPRITE_VISIBLE = SPRITES_DIR / "idle_menubar.png"      # cropped, fills the bar
 SPRITE_HIDDEN  = SPRITES_DIR / "sleeping_menubar.png"  # cropped, fills the bar
@@ -72,7 +84,7 @@ def _load_sprite_image(path: _pl.Path):
             _image_cache[key] = img
         return img
     except Exception as e:
-        print(f"[squid-pet] sprite load failed ({path.name}): {e}", flush=True)
+        log.warning(f"sprite load failed ({path.name}): {e}")
         return None
 
 
@@ -94,7 +106,7 @@ class _MenuTarget(NSObject):
             menu.removeAllItems()
             _populate_menu(menu, self, self.api)
         except Exception as e:
-            print(f"[squid-pet] menuNeedsUpdate failed: {e}", flush=True)
+            log.warning(f"menuNeedsUpdate failed: {e}")
 
     # Position
     def snapTL_(self, s): self.api._menu_snap("top-left")
@@ -151,10 +163,9 @@ class _MenuTarget(NSObject):
             if resp == NSAlertSecondButtonReturn:
                 self.api._menu_quit()
             else:
-                print("[squid-pet] quit cancelled by user", flush=True)
+                log.info("quit cancelled by user")
         except Exception as e:
-            print(f"[squid-pet] quit confirm failed, falling back to direct quit: {e}",
-                  flush=True)
+            log.warning(f"quit confirm failed, falling back to direct quit: {e}")
             self.api._menu_quit()
 
 
@@ -353,8 +364,9 @@ class SquidMenu:
     def _install_global_monitor(self):
         try:
             from AppKit import (
-                NSEvent, NSEventMaskRightMouseDown,
+                NSEvent,
                 NSEventMaskOtherMouseDown,
+                NSEventMaskRightMouseDown,
             )
             mask = NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown
             self._monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
@@ -363,10 +375,9 @@ class SquidMenu:
             self._local_monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
                 mask, self._on_local_rightclick
             )
-            print("[squid-pet] right-click global monitor installed", flush=True)
+            log.info("right-click global monitor installed")
         except Exception as e:
-            print(f"[squid-pet] could not install right-click monitor: {e}",
-                  flush=True)
+            log.warning(f"could not install right-click monitor: {e}")
 
     def _install_status_item(self):
         """Add the menu bar status item. Icon reflects current state.
@@ -379,9 +390,9 @@ class SquidMenu:
             self._status_menu.setDelegate_(self.target)  # rebuild on open
             self._status_item.setMenu_(self._status_menu)
             self.refresh_status_icon()
-            print("[squid-pet] menu bar status item installed", flush=True)
+            log.info("menu bar status item installed")
         except Exception as e:
-            print(f"[squid-pet] status item install failed: {e}", flush=True)
+            log.warning(f"status item install failed: {e}")
 
     def refresh_status_icon(self):
         """Menu bar icon = Squid's actual sprite (cuter than emoji).
@@ -406,7 +417,7 @@ class SquidMenu:
                 btn.setImage_(None)
                 btn.setTitle_(EMO_ZZZ if hidden else EMO_SQUID)
         except Exception as e:
-            print(f"[squid-pet] refresh_status_icon failed: {e}", flush=True)
+            log.warning(f"refresh_status_icon failed: {e}")
 
     def _on_global_rightclick(self, event):
         try:
@@ -419,14 +430,14 @@ class SquidMenu:
                     wf = w.frame()
                     if (wf.origin.x <= loc.x <= wf.origin.x + wf.size.width
                             and wf.origin.y <= loc.y <= wf.origin.y + wf.size.height):
-                        print(f"[squid-pet] global right-click hit Squid at "
-                              f"({loc.x:.0f},{loc.y:.0f})", flush=True)
+                        log.info(f"global right-click hit Squid at "
+                              f"({loc.x:.0f},{loc.y:.0f})")
                         self.show_at_cursor()
                         return
                 except Exception:
                     continue
         except Exception as e:
-            print(f"[squid-pet] right-click handler err: {e}", flush=True)
+            log.warning(f"right-click handler err: {e}")
 
     def _on_local_rightclick(self, event):
         self._on_global_rightclick(event)
@@ -445,18 +456,17 @@ class SquidMenu:
                     except Exception:
                         continue
                 if win is None:
-                    print("[squid-pet] menu: window not found", flush=True)
+                    log.info("menu: window not found")
                     return
                 NSApp.activateIgnoringOtherApps_(True)
                 win.makeKeyAndOrderFront_(None)
                 loc = NSEvent.mouseLocation()
-                print(f"[squid-pet] menu: popUp at screen ({loc.x:.0f},{loc.y:.0f})",
-                      flush=True)
+                log.info(f"menu: popUp at screen ({loc.x:.0f},{loc.y:.0f})")
                 menu.popUpMenuPositioningItem_atLocation_inView_(
                     None, loc, None
                 )
-                print("[squid-pet] menu: popUp returned", flush=True)
+                log.info("menu: popUp returned")
             except Exception as e:
-                print(f"[squid-pet] menu show failed: {e}", flush=True)
+                log.warning(f"menu show failed: {e}")
 
         AppHelper.callAfter(_on_main)

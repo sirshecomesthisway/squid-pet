@@ -16,11 +16,9 @@ only nudge, a direct reaction to being bumped, is exempt).
 from __future__ import annotations
 
 import threading
-import time as _time
-from unittest.mock import MagicMock
 
-from squid_pet.window import PetApi
 from squid_pet.watcher import PetState
+from squid_pet.window import PetApi
 
 
 def _make_api(state: str) -> PetApi:

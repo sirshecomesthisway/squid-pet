@@ -18,8 +18,8 @@ import threading
 from unittest.mock import MagicMock
 
 from squid_pet import window as window_mod
-from squid_pet.window import PetApi, ACKNOWLEDGE_DISMISS_DELAY_SEC
 from squid_pet.watcher import PetState
+from squid_pet.window import ACKNOWLEDGE_DISMISS_DELAY_SEC, PetApi
 
 
 def _make_api():

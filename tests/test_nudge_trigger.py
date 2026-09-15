@@ -13,9 +13,10 @@ from __future__ import annotations
 import threading
 
 from squid_pet.passthrough import (
-    NudgeApproachTracker, CornerFleeApproachTracker, PassthroughController,
+    CornerFleeApproachTracker,
+    NudgeApproachTracker,
+    PassthroughController,
 )
-
 
 # ── NudgeApproachTracker (pure logic) ───────────────────────────────────
 

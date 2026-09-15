@@ -14,8 +14,8 @@ import threading
 
 import pytest
 
-from squid_pet.window import PetApi
 from squid_pet.watcher import PetState
+from squid_pet.window import PetApi
 
 
 def _api(state: str, focus_fn=None):

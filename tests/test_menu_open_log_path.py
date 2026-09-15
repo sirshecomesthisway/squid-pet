@@ -50,6 +50,7 @@ def test_menu_open_log_path_matches_doctor_and_bin_squid():
     hardcoded, so all three can't silently drift apart again."""
     import re
     from pathlib import Path
+
     from squid_pet import doctor
 
     api = _make_api()

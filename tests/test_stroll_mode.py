@@ -9,17 +9,19 @@ Validates:
   anywhere -> band-based picker)
 """
 from __future__ import annotations
-from unittest.mock import MagicMock, patch
+
+import logging
+from unittest.mock import patch
+
 import pytest
 
 from squid_pet import window
 from squid_pet.wanderer import (
-    WanderController,
+    BOTTOM_MARGIN_PX,
     CHAR_TOP_IN_WIN,
     EDGE_MARGIN_PX,
-    BOTTOM_MARGIN_PX,
     TOP_MARGIN_PX,
-    WIN_W,
+    WanderController,
 )
 
 
@@ -55,20 +57,20 @@ def test_set_stroll_mode_edges(wc):
     assert wc.get_stroll_mode() == "edges"
 
 
-def test_set_stroll_mode_invalid_is_ignored(wc, capsys):
+def test_set_stroll_mode_invalid_is_ignored(wc, caplog):
     original = wc.get_stroll_mode()
-    wc.set_stroll_mode("sideways")  # bogus
+    with caplog.at_level(logging.WARNING, logger="squid_pet.wanderer"):
+        wc.set_stroll_mode("sideways")  # bogus
     assert wc.get_stroll_mode() == original
-    captured = capsys.readouterr()
-    assert "invalid" in captured.out.lower()
+    assert "invalid" in caplog.text.lower()
 
 
-def test_set_stroll_mode_same_value_is_noop(wc, capsys):
+def test_set_stroll_mode_same_value_is_noop(wc, caplog):
     """Flipping to current mode shouldn't log a transition message."""
-    wc.set_stroll_mode("edges")  # already edges by default
-    out = capsys.readouterr().out
+    with caplog.at_level(logging.INFO, logger="squid_pet.wanderer"):
+        wc.set_stroll_mode("edges")  # already edges by default
     # No "stroll mode: ... -> ..." transition log when value unchanged
-    assert "stroll mode:" not in out
+    assert "stroll mode:" not in caplog.text.lower()
 
 
 def test_picker_honors_edges_mode(wc, monkeypatch):

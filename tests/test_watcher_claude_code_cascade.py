@@ -10,8 +10,8 @@ import os
 from pathlib import Path
 
 from squid_pet import watcher
-from squid_pet.watcher import StateMachine
 from squid_pet.detectors import ClaudeCodeDetector
+from squid_pet.watcher import StateMachine
 
 
 def install_world(monkeypatch, idle=0.0, finished_dir="/nonexistent", recap_dir="/nonexistent",

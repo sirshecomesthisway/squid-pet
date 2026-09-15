@@ -5,9 +5,9 @@ Strategy: write temporary .py files into tmp_path with various
 shapes and assert the hook flags / passes them correctly.
 """
 from __future__ import annotations
-import sys
-from pathlib import Path
+
 import importlib.util
+from pathlib import Path
 
 
 def _load_hook():
@@ -64,6 +64,7 @@ def test_decorated_blocking_variant_is_safe(tmp_path):
 def m():
     return nw.frame()
 """)
+    assert HOOK.find_violations(p) == []
     # frame() isnt in SUSPICIOUS but lets also check a setter
     p2 = _write(tmp_path, """
 @cocoa_main_thread_blocking

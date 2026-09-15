@@ -15,9 +15,6 @@ from __future__ import annotations
 import json
 import os
 import time
-from pathlib import Path
-
-import pytest
 
 from squid_pet import doctor
 
@@ -385,7 +382,7 @@ def test_menu_bar_item_is_not_reported_as_the_pet_window():
     anyone reading a bug report chasing the wrong thing entirely.
     """
     from squid_pet.doctor import _pick_pet_cgwindow
-    from squid_pet.window import WINDOW_WIDTH, WINDOW_HEIGHT
+    from squid_pet.window import WINDOW_HEIGHT, WINDOW_WIDTH
 
     status = _cg(1147, 0, 38, 24)
     sprite = _cg(1282, 688, WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -394,7 +391,7 @@ def test_menu_bar_item_is_not_reported_as_the_pet_window():
 
 def test_pet_window_found_regardless_of_order():
     from squid_pet.doctor import _pick_pet_cgwindow
-    from squid_pet.window import WINDOW_WIDTH, WINDOW_HEIGHT
+    from squid_pet.window import WINDOW_HEIGHT, WINDOW_WIDTH
 
     sprite = _cg(1282, 688, WINDOW_WIDTH, WINDOW_HEIGHT)
     status = _cg(1147, 0, 38, 24)

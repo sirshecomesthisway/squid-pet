@@ -12,8 +12,8 @@ import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 
 def digest(value) -> str:

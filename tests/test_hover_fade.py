@@ -22,7 +22,6 @@ from squid_pet.passthrough import (
     shift_held,
 )
 
-
 # ── HoverDwellTracker (pure logic) ──────────────────────────────────────
 
 def test_fresh_entry_does_not_dwell_immediately():
