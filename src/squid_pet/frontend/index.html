@@ -117,20 +117,31 @@
     @keyframes concerned-tremble { 0%,100%{transform:translate(-50%,-50%) translate(0,0);} 10%,30%,50%,70%,90%{transform:translate(-50%,-50%) translate(-1.5px,1.5px);} 20%,40%,60%,80%{transform:translate(-50%,-50%) translate(1.5px,-1.5px);} }
     .pet[data-state="concerned"] { animation: concerned-tremble 0.25s linear infinite; }
 
-    /* ── APPROVAL-NEEDED ── agent waiting on user input. Big bouncy jump
-       PLUS golden glow ring (drop-shadow follows alpha of idle.png so
-       it hugs her silhouette, no ugly square box). Combined animation
-       so jump and glow stay in phase. */
-    /* attention_needed: gentle scale pulse synced to the flag-wave
-       (4 frames * 150ms = 600ms loop). The flag-wave itself is driven
-       by JS sprite swapping (startAttentionWave). No glow ring -- the
-       flag carries the visual weight. Replaces the older bounce-glow. */
-    @keyframes attention-pop {
-      0%, 100% { transform: translate(-50%,-50%) scale(1.00); }
-      50%      { transform: translate(-50%,-50%) scale(1.08); }
+    /* ── APPROVAL-NEEDED ── agent waiting on user input: the loudest of
+       her attention cues, so it borrows the elastic squash-and-stretch
+       from idle-squish (elongate, overshoot, settle -- what sells her as a
+       body, not a scaled picture) and turns it into a continuous springy
+       hop. Pink-2026-09-15: replaced the gentle scale pulse (1.00<->1.08),
+       which read as too subtle to catch her eye. Runs alongside, and
+       independent of, the JS flag-wave sprite cycling (startAttentionWave).
+
+       transform-origin is her FEET (as in idle-squish): she may be
+       edge-hugging with the wrapper rotated, so scaling from the centre
+       would push her into the wall. Invisible switch -- the loop both
+       starts and ends at scale(1)/translateY(0), where the pivot has no
+       effect. The hop (translateY) works in her rotated local frame the
+       same way celebrating-jump's does. */
+    @keyframes attention-bounce {
+      0%   { transform: translate(-50%,-50%) translateY(0)     scale(1.00, 1.00); }
+      18%  { transform: translate(-50%,-50%) translateY(3px)   scale(1.10, 0.90); } /* anticipation crouch */
+      42%  { transform: translate(-50%,-50%) translateY(-16px) scale(0.90, 1.14); } /* spring up + stretch */
+      62%  { transform: translate(-50%,-50%) translateY(0)     scale(1.14, 0.88); } /* land squash */
+      80%  { transform: translate(-50%,-50%) translateY(0)     scale(0.97, 1.05); } /* elastic overshoot */
+      100% { transform: translate(-50%,-50%) translateY(0)     scale(1.00, 1.00); }
     }
     .pet[data-state="approval_needed"] {
-      animation: attention-pop 0.6s ease-in-out infinite;
+      transform-origin: bottom center;
+      animation: attention-bounce 0.8s cubic-bezier(.5,-0.3,.35,1.4) infinite;
     }
 
 
