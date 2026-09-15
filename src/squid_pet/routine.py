@@ -30,10 +30,13 @@ Wake-from-drowsy preserves the saved index (she stirred and continued).
 """
 from __future__ import annotations
 
+import logging
 import random
 import threading
 import time
 from typing import Callable, Optional
+
+log = logging.getLogger(__name__)
 
 # ── Tunables ────────────────────────────────────────────────────────────
 IDLE_BEFORE_ROUTINE_SEC = 6.0    # don't start cycling immediately after wake
@@ -124,7 +127,7 @@ class RoutineController:
         t = threading.Thread(target=self._loop, daemon=True,
                              name="squid-routine")
         t.start()
-        print("[squid-pet] routine thread started", flush=True)
+        log.info("routine thread started")
 
     def stop(self) -> None:
         self._stop.set()
@@ -182,8 +185,8 @@ class RoutineController:
         while not self._stop.is_set():
             try:
                 self._tick()
-            except Exception as e:
-                print(f"[squid-pet] routine error: {e}", flush=True)
+            except Exception:
+                log.exception("routine tick failed")
             # Outer cadence: short sleep, then check whether to dispatch.
             self._stop.wait(MOOD_POLL_INTERVAL_SEC)
 
@@ -193,8 +196,7 @@ class RoutineController:
         mood = self._get_mood()
         if mood == "sleeping" and self._prev_mood != "sleeping":
             self._wake_from_sleeping_pending = True
-            print("[squid-pet] routine: noted sleeping entry, "
-                  "will reset on wake", flush=True)
+            log.debug("routine: noted sleeping entry, will reset on wake")
         self._prev_mood = mood
 
         # Gate check: if anything says "hard pause" (disabled/pinned/user-
@@ -253,14 +255,12 @@ class RoutineController:
         if self._wake_from_sleeping_pending:
             self._idx = 0
             self._wake_from_sleeping_pending = False
-            print("[squid-pet] routine: woke from sleeping → reset _idx=0",
-                  flush=True)
+            log.debug("routine: woke from sleeping -> reset _idx=0")
 
         # Fire current action.
         action, lo, hi = IDLE_ROUTINE[self._idx]
         dur = random.uniform(lo, hi)
-        print(f"[squid-pet] routine[{self._idx}]: {action} ({dur:.1f}s)",
-              flush=True)
+        log.debug("routine[%d]: %s (%.1fs)", self._idx, action, dur)
         self._fire(action)
         self._action_done_at = time.time() + dur
 
@@ -275,5 +275,4 @@ class RoutineController:
             band = action.split("-", 1)[1]  # "short" / "medium" / "edge"
             self.wanderer.request_walk(band)
             return
-        print(f"[squid-pet] routine: unknown action '{action}' (skipped)",
-              flush=True)
+        log.warning("routine: unknown action %r (skipped)", action)

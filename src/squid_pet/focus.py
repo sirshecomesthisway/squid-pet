@@ -33,8 +33,11 @@ limitation find_terminal_app_bundle_for_claude_code documents.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from typing import Callable, Optional
+
+log = logging.getLogger(__name__)
 
 TERMINAL_APP_BUNDLE_ID = "com.apple.Terminal"
 
@@ -255,5 +258,5 @@ def _run_osascript(script: str) -> Optional[str]:
                            capture_output=True, text=True, timeout=5)
         return r.stdout
     except Exception as e:
-        print(f"[squid-pet] focus failed: {e}", flush=True)
+        log.warning("focus (osascript) failed: %s", e)
         return None

@@ -35,6 +35,7 @@ State is written to ~/.squid-pet/state.json every 1s, frontend polls it.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import time
@@ -44,6 +45,8 @@ from pathlib import Path
 from typing import Literal
 
 import psutil
+
+log = logging.getLogger(__name__)
 
 # ────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -1119,8 +1122,7 @@ class StateMachine:
         self.detectors = list(new_detectors)
         self._refresh_detector_refs()
         enabled_names = [d.name for d in self.detectors if d.enabled]
-        print(f"[squid-pet] settings.json changed -- detectors reloaded: "
-              f"{enabled_names}", flush=True)
+        log.info("settings.json changed -- detectors reloaded: %s", enabled_names)
 
     def _refresh_detector_refs(self) -> None:
         """Re-point the Claude-Code/Codex detector caches after a detector
@@ -1354,11 +1356,7 @@ class StateMachine:
                 self._approval_alert_fired = True
                 self._approval_alert_at = now
                 _sound_label = _sound if _sound else "off"
-                print(
-                    "[squid-pet] approval alert fired ("
-                    + fired_reason + ", sound=" + _sound_label + ")",
-                    flush=True,
-                )
+                log.info("approval alert fired (%s, sound=%s)", fired_reason, _sound_label)
                 if notify:
                     if codex_waits:
                         source = "Claude Code and Codex" if awaiting_sessions else "Codex"
@@ -1844,8 +1842,7 @@ def _fire_approval_notification(text: str, sound: str, source_label: str = "Clau
                 subprocess.run(cmd, timeout=3, capture_output=True)
                 return
             except Exception as e:
-                print("[squid-pet] terminal-notifier failed, falling back: "
-                      + str(e), flush=True)
+                log.warning("terminal-notifier failed, falling back to osascript: %s", e)
         try:
             body_escaped = _applescript_escape(body)
             sound_clause = (
@@ -1859,7 +1856,7 @@ def _fire_approval_notification(text: str, sound: str, source_label: str = "Clau
                 capture_output=True,
             )
         except Exception as e:
-            print("[squid-pet] notification fire failed: " + str(e), flush=True)
+            log.warning("notification fire failed: %s", e)
 
     threading.Thread(target=_go, daemon=True).start()
 
@@ -1873,16 +1870,20 @@ def write_state(state: PetState) -> None:
 
 def run_watcher_loop() -> None:
     """Main watcher loop — runs forever, writes state.json every POLL_INTERVAL_SEC."""
+    from .logging_setup import setup_logging
+    setup_logging()
     sm = StateMachine()
-    print(f"[squid-pet] watcher started; state file: {STATE_FILE}")
+    log.info("watcher started; state file: %s", STATE_FILE)
     while True:
         try:
             state = sm.compute()
             write_state(state)
         except KeyboardInterrupt:
             raise
-        except Exception as e:
-            print(f"[squid-pet] watcher error: {e}")
+        except Exception:
+            # A tick failing must never kill the loop -- but capture the
+            # traceback so a real regression is diagnosable, not a one-liner.
+            log.exception("watcher tick failed")
         time.sleep(POLL_INTERVAL_SEC)
 
 

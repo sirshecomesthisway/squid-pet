@@ -17,11 +17,14 @@ doesn't accidentally toggle off mid-drag.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
 
 from PIL import Image
+
+log = logging.getLogger(__name__)
 
 # Window + sprite geometry (must match window.py + frontend)
 WINDOW_WIDTH    = 200
@@ -282,7 +285,7 @@ def load_alpha_masks() -> dict[str, "Image.Image"]:
             alpha = alpha.filter(ImageFilter.MaxFilter(25))   # 12px halo (was 6px - too tight, Pink missed too often)
             masks[png.stem] = alpha
         except Exception as e:
-            print(f"[squid-pet] failed loading alpha for {png.name}: {e}", flush=True)
+            log.warning("failed loading alpha for %s: %s", png.name, e)
     return masks
 
 
@@ -379,7 +382,7 @@ class PassthroughController:
         # Hover-fade-through (2026-08-27n) -- see HoverDwellTracker.
         self._hover_tracker = HoverDwellTracker()
         self._last_faded: bool | None = None
-        print(f"[squid-pet] passthrough: loaded {len(self._masks)} alpha masks", flush=True)
+        log.debug("passthrough: loaded %d alpha masks", len(self._masks))
 
     # ── Public API ──
     def set_nudge_callback(self, cb) -> None:
@@ -479,12 +482,12 @@ class PassthroughController:
             try:
                 self._nudge_callback(cx, cy)
             except Exception as e:
-                print(f"[squid-pet] nudge callback failed: {e}", flush=True)
+                log.warning("nudge callback failed: %s", e)
         if fire_corner and self._corner_flee_callback is not None:
             try:
                 self._corner_flee_callback(cx, cy)
             except Exception as e:
-                print(f"[squid-pet] corner-flee callback failed: {e}", flush=True)
+                log.warning("corner-flee callback failed: %s", e)
 
     def _alpha_at(self, mask, sx: int, sy: int) -> int:
         """MAX alpha in a 5-pixel cross neighborhood (robust to CSS animation jitter)."""
@@ -551,13 +554,13 @@ class PassthroughController:
                         if cv is not None:
                             _propagate_ignore(cv, ig)
                     except Exception as e:
-                        print(f"[squid-pet] _apply_on_main failed: {e}", flush=True)
+                        log.warning("_apply_on_main failed: %s", e)
 
                 AppHelper.callAfter(_apply_on_main)
                 self._last_ignore = ignore
-                print(f"[squid-pet] passthrough → ignore={ignore}", flush=True)
+                log.debug("passthrough -> ignore=%s", ignore)
             except Exception as e:
-                print(f"[squid-pet] setIgnoresMouseEvents failed: {e}", flush=True)
+                log.warning("setIgnoresMouseEvents failed: %s", e)
 
     def _apply_fade(self, faded: bool) -> None:
         """Set the NSWindow's alpha for the hover-fade-through feature
@@ -579,23 +582,23 @@ class PassthroughController:
                     try:
                         nw.setAlphaValue_(alpha)
                     except Exception as e:
-                        print(f"[squid-pet] _apply_fade_on_main failed: {e}", flush=True)
+                        log.warning("_apply_fade_on_main failed: %s", e)
 
                 AppHelper.callAfter(_apply_fade_on_main)
                 self._last_faded = faded
-                print(f"[squid-pet] passthrough → faded={faded}", flush=True)
+                log.debug("passthrough -> faded=%s", faded)
             except Exception as e:
-                print(f"[squid-pet] setAlphaValue (hover-fade) failed: {e}", flush=True)
+                log.warning("setAlphaValue (hover-fade) failed: %s", e)
 
     def _loop(self) -> None:
         try:
             import objc
             from AppKit import NSEvent, NSScreen
         except ImportError:
-            print("[squid-pet] AppKit unavailable; passthrough disabled", flush=True)
+            log.warning("AppKit unavailable; passthrough disabled")
             return
 
-        print("[squid-pet] passthrough loop started", flush=True)
+        log.info("passthrough loop started")
         tick = 0
 
         while not self._stop.is_set():
@@ -660,10 +663,11 @@ class PassthroughController:
                         if tick % 100 == 0:
                             with self._lock:
                                 _ignore_for_log = self._last_ignore
-                            print(f"[squid-pet] tick {tick}: cursor=({cx:.0f},{cy:.0f}) "
-                                  f"win=({win_x:.0f},{win_y:.0f},{win_w:.0f}x{win_h:.0f}) "
-                                  f"OUTSIDE state={state} ignore={_ignore_for_log}",
-                                  flush=True)
+                            log.debug(
+                                "tick %d: cursor=(%.0f,%.0f) win=(%.0f,%.0f,%.0fx%.0f) "
+                                "OUTSIDE state=%s ignore=%s",
+                                tick, cx, cy, win_x, win_y, win_w, win_h,
+                                state, _ignore_for_log)
                         time.sleep(POLL_INTERVAL)
                         continue
 
@@ -759,15 +763,15 @@ class PassthroughController:
                     if tick % 100 == 0:  # ~3 seconds
                         with self._lock:
                             _ignore_for_log = self._last_ignore
-                        print(_heartbeat_line(
+                        log.debug("%s", _heartbeat_line(
                             tick=tick, cursor=(cx, cy),
                             win=(win_x, win_y, win_w, win_h), inside=inside,
                             sprite=(sprite_x, sprite_y), state=state,
                             opaque=opaque, faded=faded,
                             click_through=click_through, ignore=_ignore_for_log,
-                        ), flush=True)
+                        ))
 
-                except Exception as e:
-                    print(f"[squid-pet] passthrough error: {e}", flush=True)
+                except Exception:
+                    log.exception("passthrough loop tick failed")
 
                 time.sleep(POLL_INTERVAL)
