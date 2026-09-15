@@ -1208,6 +1208,32 @@ class StateMachine:
         self._maybe_reload_settings()
         st = self._compute_inner()
         now = time.time()
+        self._track_agent_idle(st, now)
+
+        # Approval-needed is layered on AFTER the cascade, from Claude Code's
+        # and Codex's own hook-written flag files. It OVERRIDES whatever the
+        # cascade picked -- it is the only state that REQUIRES Pink to act.
+        # Self-heal runs first, clearing flags a hook failed to clear (see
+        # each helper's docstring for the live bugs that motivated them).
+        awaiting_sessions_raw = claude_sessions_awaiting_input()
+        awaiting_sessions_raw = self._self_heal_stale_claude_flags(
+            st, now, awaiting_sessions_raw)
+        self._self_heal_stale_codex_flags(now)
+        self._apply_approval_override(
+            st, now, awaiting_sessions_raw, notify=notify)
+        self._apply_force_state_override(st)
+        return st
+
+    # ── compute() helpers (extracted for readability + unit testing) ──
+    def _track_agent_idle(self, st: PetState, now: float) -> None:
+        """Maintain agent_idle_seconds -- seconds since the machine last left
+        an active state, independent of macOS HID activity (the frontend's
+        drowsy-entry logic reads it every tick).
+
+        Also latches self._last_state to the CASCADE state -- deliberately
+        here, before the approval override runs, so next tick's idle clock
+        keys off real agent activity rather than the approval_needed override.
+        """
         agent_active_now = st.state in self._AGENT_ACTIVE_STATES
         agent_active_prev = self._last_state in self._AGENT_ACTIVE_STATES
         if not agent_active_now:
@@ -1219,8 +1245,11 @@ class StateMachine:
             self._agent_idle_since = 0.0
         self._last_state = st.state
 
-        awaiting_sessions_raw = claude_sessions_awaiting_input()
-
+    def _self_heal_stale_claude_flags(
+        self, st: PetState, now: float, awaiting_sessions_raw: list
+    ) -> list:
+        """Clear a Claude Code awaiting-input flag that a hook failed to clear,
+        returning the (possibly re-scanned) awaiting list."""
         # ── STALE-FLAG SELF-HEAL ─────────────────────────────────────
         # Pink-2026-08-27, real bug caught via live use: Claude Code's
         # Notification hook fires permission_prompt and we
@@ -1280,7 +1309,13 @@ class StateMachine:
             except Exception:
                 pass
             awaiting_sessions_raw = claude_sessions_awaiting_input()
+        return awaiting_sessions_raw
 
+    def _self_heal_stale_codex_flags(self, now: float) -> None:
+        """Clear a Codex awaiting-input flag once the approved command is
+        actually running (codex.shell_active). Codex fires no hook when the
+        human grants approval -- only at command completion -- so the flag
+        would otherwise wave for the whole runtime of the approved command."""
         # ── CODEX APPROVAL SELF-HEAL ─────────────────────────────────
         # Pink-2026-09-13, caught live: unlike Claude Code, Codex fires NO
         # hook at the moment the human GRANTS an approval. Its lifecycle is
@@ -1315,6 +1350,15 @@ class StateMachine:
                     pass
                 _CODEX_SESSION_FLAG_FIRST_SEEN.pop(req, None)
 
+    def _apply_approval_override(
+        self, st: PetState, now: float, awaiting_sessions_raw: list,
+        *, notify: bool,
+    ) -> None:
+        """Override the cascade with approval_needed when a Claude Code or
+        Codex session is awaiting input (from the hook-written flag files),
+        firing the OS notification once per episode. approval_needed wins over
+        whatever the cascade picked because it is the only state that REQUIRES
+        Pink to act."""
         # ── APPROVAL-NEEDED ALERT ──────────────────────────────────
         # DIRECT signal: Claude Code's own Notification hook (scripts/
         # claude_pet_hook.py) writes ~/.squid-pet/claude_awaiting_input/
@@ -1368,6 +1412,8 @@ class StateMachine:
             # so the next genuine alert (after Pink replies + new response)
             # gets a fresh ping.
             self._approval_alert_fired = False
+
+    def _apply_force_state_override(self, st: PetState) -> None:
         # ── FORCE-STATE OVERRIDE (test/demo) ─────────────────────────
         # If ~/.squid-pet/force_state exists with a non-empty state name,
         # use it directly. Lets Pink test any state visually or take demo
@@ -1384,7 +1430,6 @@ class StateMachine:
                     st.state_reason = "force_state override (" + _forced + ")"
         except Exception:
             pass
-        return st
 
     def _other_detectors(self):
         """Iterator over detectors excluding ClaudeCode and Codex (both
