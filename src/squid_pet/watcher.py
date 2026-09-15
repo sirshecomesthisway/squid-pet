@@ -54,6 +54,16 @@ log = logging.getLogger(__name__)
 STATE_DIR = Path.home() / ".squid-pet"
 STATE_FILE = STATE_DIR / "state.json"
 
+# Canonical set of states the backend can emit (see the module docstring for
+# what each means). Single source of truth on the Python side: the frontend
+# (frontend/index.html's spriteUrl) must resolve every one of these to a real
+# sprite, and tests/test_frontend_state_contract.py pins that the two sides
+# agree and that each state's PNG actually exists.
+STATES: frozenset[str] = frozenset({
+    "idle", "thinking", "working", "celebrating",
+    "grooving", "sleeping", "approval_needed", "concerned",
+})
+
 POLL_INTERVAL_SEC = 1.0
 IDLE_THRESHOLD_SEC = 315           # 5m15s with no agent activity → sleeping
 # 315, not 300, on purpose: the frontend stages drowsy at 300s (a slump
