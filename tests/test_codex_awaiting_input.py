@@ -63,3 +63,47 @@ def test_stale_codex_wait_is_pruned(flags):
     os.utime(marker, (0, 0))
     assert machine().compute(notify=False).state == 'working'
     assert not marker.exists()
+
+
+def _codex_detector(shell_active):
+    return type('FakeCodex', (), {'name': 'codex', 'shell_active': shell_active})()
+
+
+def test_codex_wait_clears_once_approved_command_runs(flags):
+    # Codex fires no hook when the human grants approval; the only evidence
+    # is the approved command actually executing (a live shell child under
+    # Codex). When that shows up, stop the wave instead of holding it for the
+    # whole command runtime.
+    import os
+    marker = flags / 'request-a'
+    marker.touch()
+    os.utime(marker, (time.time() - 5, time.time() - 5))  # past self-heal min age
+    sm = machine()
+    sm._codex_detector = _codex_detector(shell_active=True)
+    assert sm.compute(notify=False).state == 'working'
+    assert not marker.exists()
+
+
+def test_codex_wait_persists_while_awaiting_approval(flags):
+    # shell_active is False the whole time the user is still deciding, so a
+    # genuinely-pending approval must keep waving and keep its flag.
+    import os
+    marker = flags / 'request-a'
+    marker.touch()
+    os.utime(marker, (time.time() - 5, time.time() - 5))
+    sm = machine()
+    sm._codex_detector = _codex_detector(shell_active=False)
+    assert sm.compute(notify=False).state == 'approval_needed'
+    assert marker.exists()
+
+
+def test_fresh_codex_wait_not_reaped_even_if_shell_active(flags):
+    # A flag raised this very tick must be seen at least once before the
+    # self-heal may reap it -- otherwise a wave could be cleared before it
+    # ever shows (the same freshness guard the Claude self-heal uses).
+    marker = flags / 'request-a'
+    marker.touch()  # age ~0, below SELF_HEAL_MIN_FLAG_AGE_SEC
+    sm = machine()
+    sm._codex_detector = _codex_detector(shell_active=True)
+    assert sm.compute(notify=False).state == 'approval_needed'
+    assert marker.exists()

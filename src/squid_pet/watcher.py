@@ -1278,6 +1278,40 @@ class StateMachine:
                 pass
             awaiting_sessions_raw = claude_sessions_awaiting_input()
 
+        # ── CODEX APPROVAL SELF-HEAL ─────────────────────────────────
+        # Pink-2026-09-13, caught live: unlike Claude Code, Codex fires NO
+        # hook at the moment the human GRANTS an approval. Its lifecycle is
+        # PreToolUse (model proposes -- BEFORE the permission gate) ->
+        # PermissionRequest (gate opens, we raise the flag) -> [approve] ->
+        # PostToolUse (only when the command FINISHES). So codex_pet_hook can
+        # only clear the flag at command completion, which left the "your
+        # turn" wave up for the entire runtime of an approved command (a 20s
+        # sleep waved ~20s past the click; a long build, minutes).
+        #
+        # The one honest signal that approval was granted is the approved
+        # command actually RUNNING: a live shell child under Codex
+        # (codex.shell_active). It is False the whole time the user is still
+        # deciding -- nothing runs behind the permission gate -- so clearing
+        # on it cannot eat a genuinely-pending approval (no false "stopped
+        # waving too early"). Residual wave is bounded by Codex's own
+        # approve->exec setup latency (~seconds), NOT by command duration.
+        # Same freshness guard as the Claude self-heal: never reap a flag so
+        # fresh it has not been shown at least once.
+        codex = self._codex_detector
+        if codex is not None and getattr(codex, "shell_active", False):
+            for req in codex_requests_awaiting_input():
+                path = os.path.join(CODEX_AWAITING_INPUT_DIR, req)
+                try:
+                    if now - os.stat(path).st_mtime < SELF_HEAL_MIN_FLAG_AGE_SEC:
+                        continue  # too fresh -- let it be seen at least once
+                except OSError:
+                    continue
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                _CODEX_SESSION_FLAG_FIRST_SEEN.pop(req, None)
+
         # ── APPROVAL-NEEDED ALERT ──────────────────────────────────
         # DIRECT signal: Claude Code's own Notification hook (scripts/
         # claude_pet_hook.py) writes ~/.squid-pet/claude_awaiting_input/
