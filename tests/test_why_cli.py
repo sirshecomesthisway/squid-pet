@@ -5,6 +5,7 @@ runtime state); they just verify the command exits 0 and produces
 parseable output containing the expected sections.
 """
 from __future__ import annotations
+
 import json
 import subprocess
 import sys
@@ -109,9 +110,10 @@ def test_why_json_stays_valid_json_when_approval_needed_is_live(monkeypatch, cap
     level (not subprocess) so it stays hermetic -- a subprocess run
     would need a real flag file under the developer's actual
     ~/.squid-pet."""
+    from unittest.mock import patch
+
     from squid_pet import watcher
     from squid_pet.__main__ import _run_why
-    from unittest.mock import patch
 
     with patch.object(watcher, "claude_sessions_awaiting_input",
                       return_value=["sess-regression-test"]), \

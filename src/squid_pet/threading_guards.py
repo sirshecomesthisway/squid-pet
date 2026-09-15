@@ -60,8 +60,8 @@ F = TypeVar("F", bound=Callable[..., Any])
 # Platform detection -- import-time, cached
 # ----------------------------------------------------------------------
 try:
-    from PyObjCTools import AppHelper  # type: ignore
     from AppKit import NSThread  # type: ignore
+    from PyObjCTools import AppHelper  # type: ignore
 
     _COCOA_AVAILABLE = True
 

@@ -18,8 +18,9 @@ script itself (scripts/claude_pet_hook.py) is tested separately in
 tests/test_claude_pet_hook_script.py by invoking it as a real subprocess.
 """
 from __future__ import annotations
+
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 

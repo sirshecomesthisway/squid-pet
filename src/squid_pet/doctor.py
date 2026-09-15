@@ -28,12 +28,10 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
-
 
 # ----------------------------------------------------------------------
 # Filesystem paths (single source of truth -- mirrors window.py / watcher.py)
@@ -177,7 +175,7 @@ def _pick_pet_cgwindow(entries: list) -> Optional[dict]:
     """
     if not entries:
         return None
-    from .window import WINDOW_WIDTH, WINDOW_HEIGHT
+    from .window import WINDOW_HEIGHT, WINDOW_WIDTH
     for e in entries:
         if e["w"] == float(WINDOW_WIDTH) and e["h"] == float(WINDOW_HEIGHT):
             return e
@@ -190,12 +188,12 @@ def _get_visible_window_for_pid(pid: int) -> Optional[dict]:
     try:
         from Quartz import (
             CGWindowListCopyWindowInfo,
-            kCGWindowListOptionAll,
             kCGNullWindowID,
-            kCGWindowOwnerPID,
             kCGWindowAlpha,
-            kCGWindowIsOnscreen,
             kCGWindowBounds,
+            kCGWindowIsOnscreen,
+            kCGWindowListOptionAll,
+            kCGWindowOwnerPID,
         )
     except ImportError:
         return None

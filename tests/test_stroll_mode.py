@@ -9,17 +9,18 @@ Validates:
   anywhere -> band-based picker)
 """
 from __future__ import annotations
-from unittest.mock import MagicMock, patch
+
+from unittest.mock import patch
+
 import pytest
 
 from squid_pet import window
 from squid_pet.wanderer import (
-    WanderController,
+    BOTTOM_MARGIN_PX,
     CHAR_TOP_IN_WIN,
     EDGE_MARGIN_PX,
-    BOTTOM_MARGIN_PX,
     TOP_MARGIN_PX,
-    WIN_W,
+    WanderController,
 )
 
 

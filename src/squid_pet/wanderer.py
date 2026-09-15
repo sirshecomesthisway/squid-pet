@@ -32,10 +32,9 @@ import math
 import random
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable
 
 from . import window
-
 
 # Motion params (unchanged from pre-refactor)
 WANDER_SPEED_PX_PER_SEC = 110          # walking speed
@@ -847,8 +846,8 @@ class WanderController:
             ty = oy + (fdy / fdist) * NUDGE_HOP_DISTANCE_PX
             tx = max(min_x, min(max_x, tx))
             ty = max(min_y, min(max_y, ty))
-            print(f"[squid-pet] nudge: stuck in corner, falling back to "
-                  f"away-from-corner direction", flush=True)
+            print("[squid-pet] nudge: stuck in corner, falling back to "
+                  "away-from-corner direction", flush=True)
 
         print(f"[squid-pet] nudge: ({ox:.0f},{oy:.0f}) -> ({tx:.0f},{ty:.0f}) "
               f"away from cursor ({cursor_x:.0f},{cursor_y:.0f})", flush=True)

@@ -18,11 +18,8 @@ from pathlib import Path
 
 import webview
 
-from . import watcher
+from . import config, observer, watcher
 from .passthrough import PassthroughController
-from . import observer
-from . import config
-
 
 # ──────────────────────────────────────────────────────────────────
 HERE = Path(__file__).parent
@@ -1448,7 +1445,8 @@ class PetApi:
     def _menu_restart(self) -> None:
         """Re-exec squid via the launcher script — clean restart."""
         try:
-            import subprocess, os
+            import os
+            import subprocess
             launcher = os.path.expanduser("~/.local/bin/squid")
             subprocess.Popen(
                 [launcher, "restart"],
@@ -1514,7 +1512,7 @@ class PetApi:
 def watcher_thread(api: PetApi, stop_event: threading.Event) -> None:
     sm = watcher.StateMachine()
     api.set_state_machine(sm)
-    print(f"[squid-pet] watcher thread started", flush=True)
+    print("[squid-pet] watcher thread started", flush=True)
     while not stop_event.is_set():
         try:
             state = sm.compute()
@@ -1879,7 +1877,7 @@ def main() -> None:
     def _watchdog():
         if api._loaded.wait(timeout=STARTUP_TIMEOUT_SEC):
             return  # healthy startup
-        import os as _os, signal as _signal
+        import os as _os
         print(
             f"[squid-pet] FATAL: webview did not finish loading within "
             f"{STARTUP_TIMEOUT_SEC:.0f}s -- self-terminating so CLI can recover",

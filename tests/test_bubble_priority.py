@@ -14,9 +14,9 @@ import threading
 
 from squid_pet.watcher import PetState
 from squid_pet.window import (
-    PetApi,
     BUBBLE_PRIO_MOOD,
     BUBBLE_PRIO_STATE,
+    PetApi,
 )
 
 

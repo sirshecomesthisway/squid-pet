@@ -14,7 +14,7 @@ runloop in the test process.
 from __future__ import annotations
 
 import threading
-import time
+
 import pytest
 
 from squid_pet import threading_guards as tg

@@ -1,8 +1,9 @@
 """Tests for the build_detectors factory + DEFAULT_TRIGGERS."""
 from __future__ import annotations
+
 from squid_pet.detectors import (
-    build_detectors, GitDetector,
-    TerminalDetector, IDEDetector, DEFAULT_TRIGGERS,
+    DEFAULT_TRIGGERS,
+    build_detectors,
 )
 
 

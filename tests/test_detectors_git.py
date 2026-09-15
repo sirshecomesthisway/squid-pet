@@ -4,10 +4,10 @@ We create fake .git/HEAD + .git/index files and tweak their mtimes
 via os.utime() to simulate commits / staging / pushes.
 """
 from __future__ import annotations
+
 import os
 import time
 from pathlib import Path
-import pytest
 
 from squid_pet.detectors import GitDetector
 
@@ -110,7 +110,7 @@ def test_max_repos_cap_respected(tmp_path):
 
 
 def test_discovery_cache_reused_within_60s(tmp_path):
-    git = _make_repo(tmp_path, "myrepo")
+    _make_repo(tmp_path, "myrepo")
     calls = {"n": 0}
     real_walk = os.walk
     def counting_walk(*a, **kw):

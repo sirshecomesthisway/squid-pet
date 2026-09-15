@@ -8,8 +8,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from squid_pet import watcher
-from squid_pet.watcher import StateMachine
 from squid_pet.detectors import CodexDetector
+from squid_pet.watcher import StateMachine
 
 
 def install_world(monkeypatch, idle=0.0):

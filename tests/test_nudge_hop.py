@@ -15,9 +15,15 @@ import pytest
 
 from squid_pet import window
 from squid_pet.wanderer import (
-    WanderController, NUDGE_HOP_DISTANCE_PX, WIN_W, CHAR_TOP_IN_WIN,
-    EDGE_MARGIN_PX, BOTTOM_MARGIN_PX, TOP_MARGIN_PX, NUDGE_STUCK_THRESHOLD_PX,
+    BOTTOM_MARGIN_PX,
+    CHAR_TOP_IN_WIN,
+    EDGE_MARGIN_PX,
+    NUDGE_HOP_DISTANCE_PX,
+    NUDGE_STUCK_THRESHOLD_PX,
     STUCK_ESCAPE_STICKY_SEC,
+    TOP_MARGIN_PX,
+    WIN_W,
+    WanderController,
 )
 
 
@@ -123,7 +129,6 @@ def test_request_nudge_is_noop_during_sprint(wc, monkeypatch):
 
 def test_request_nudge_spawns_hop_when_idle(wc, monkeypatch):
     import threading
-    import time as _time
 
     called = threading.Event()
     monkeypatch.setattr(
@@ -307,9 +312,6 @@ def test_edges_mode_pins_normal_hop_to_current_edge_not_just_corners(monkeypatch
     recorder = []
     vx, vy, vw, vh = 0.0, 0.0, 1000.0, 800.0
     min_x = vx + EDGE_MARGIN_PX
-    max_x = vx + vw - window.CHAR_RIGHT_IN_WIN
-    min_y = vy + BOTTOM_MARGIN_PX
-    max_y = vy + vh - CHAR_TOP_IN_WIN - TOP_MARGIN_PX
     origin = (min_x, 300.0)  # mid LEFT edge, well clear of top/bottom corners
     wc = WanderController(
         get_state=lambda: "idle",

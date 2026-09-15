@@ -11,20 +11,28 @@ Tier 1 menu rebuild 2026-06-28 (Pink/Indigo):
     SQUID_DEV env var, "Pause Squid" -> "Pause wandering"
 """
 from __future__ import annotations
+
 import os
+
 import objc
 from AppKit import (
-    NSMenu, NSMenuItem, NSApp, NSEvent, NSStatusBar, NSImage,
-    NSVariableStatusItemLength, NSAlert, NSAlertFirstButtonReturn,
+    NSAlert,
     NSAlertSecondButtonReturn,
+    NSApp,
+    NSEvent,
+    NSImage,
+    NSMenu,
+    NSMenuItem,
+    NSStatusBar,
+    NSVariableStatusItemLength,
 )
+
 try:
-    from AppKit import NSOnState, NSOffState
+    from AppKit import NSOffState, NSOnState
 except ImportError:
     NSOnState, NSOffState = 1, 0
 from Foundation import NSObject
 from PyObjCTools import AppHelper
-
 
 # Emoji constants -- declared at module top so the menu builder reads
 # clean and the SquidMenu can pick the right one for the status icon.
@@ -50,6 +58,7 @@ DEV_MODE = bool(os.environ.get("SQUID_DEV"))
 # Menu bar icon assets: use Squid's actual sprite (cuter than the
 # system squid emoji which renders pink/blobby in the menu bar).
 import pathlib as _pl
+
 SPRITES_DIR = _pl.Path(__file__).parent / "frontend" / "sprites"
 SPRITE_VISIBLE = SPRITES_DIR / "idle_menubar.png"      # cropped, fills the bar
 SPRITE_HIDDEN  = SPRITES_DIR / "sleeping_menubar.png"  # cropped, fills the bar
@@ -353,8 +362,9 @@ class SquidMenu:
     def _install_global_monitor(self):
         try:
             from AppKit import (
-                NSEvent, NSEventMaskRightMouseDown,
+                NSEvent,
                 NSEventMaskOtherMouseDown,
+                NSEventMaskRightMouseDown,
             )
             mask = NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown
             self._monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(

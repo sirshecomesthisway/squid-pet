@@ -3,11 +3,8 @@ when git pull is a no-op (HEAD didn't move) and venv is healthy."""
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from pathlib import Path
-
-import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -70,7 +67,7 @@ cmd_update 2>&1
     bin_shim = tmp_path / "shim"
     bin_shim.mkdir()
     git_shim = bin_shim / "git"
-    git_shim.write_text(f"""#!/bin/bash
+    git_shim.write_text("""#!/bin/bash
 # Pass through everything to real git EXCEPT 'pull --ff-only' which is a no-op
 if [ "$1" = "pull" ]; then
     echo "Already up to date." # simulate no-op pull
@@ -128,7 +125,7 @@ cmd_update 2>&1 || true
     bin_shim = tmp_path / "shim"
     bin_shim.mkdir()
     git_shim = bin_shim / "git"
-    git_shim.write_text(f"""#!/bin/bash
+    git_shim.write_text("""#!/bin/bash
 if [ "$1" = "pull" ]; then echo "Already up to date."; exit 0; fi
 exec /usr/bin/git "$@"
 """)

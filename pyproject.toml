@@ -17,6 +17,8 @@ squid-pet = "squid_pet.__main__:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
 ]
 
 [build-system]
@@ -30,3 +32,37 @@ packages = ["src/squid_pet"]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
 pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Scoped deliberately. squid-pet is a desktop daemon whose broad
+# `except Exception` / `try: ... except: pass` blocks are intentional
+# (a failed psutil/Cocoa call must never crash the pet -- see the module
+# docstrings), so the blind-except / try-except-pass families (BLE, S110,
+# S112) are NOT selected. This set targets real defects instead:
+#   F  -- pyflakes: undefined names, unused imports, bad f-strings
+#   E9 -- syntax errors
+#   I  -- import ordering/hygiene
+select = ["F", "E9", "I"]
+
+[tool.mypy]
+python_version = "3.11"
+# pyobjc / pywebview ship no (usable) type stubs; don't drown real
+# findings in "module is missing stubs" noise.
+ignore_missing_imports = true
+# The Cocoa/AppKit-heavy modules are built almost entirely on dynamic
+# PyObjC objects that mypy cannot meaningfully check. Type-check the
+# pure-logic core (state machine, detectors, observer, config, focus,
+# routine, doctor) where types actually catch bugs.
+files = [
+    "src/squid_pet/watcher.py",
+    "src/squid_pet/detectors.py",
+    "src/squid_pet/observer.py",
+    "src/squid_pet/config.py",
+    "src/squid_pet/focus.py",
+    "src/squid_pet/routine.py",
+    "src/squid_pet/doctor.py",
+]

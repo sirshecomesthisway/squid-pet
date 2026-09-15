@@ -23,7 +23,6 @@ from pathlib import Path
 
 from PIL import Image
 
-
 # Window + sprite geometry (must match window.py + frontend)
 WINDOW_WIDTH    = 200
 WINDOW_HEIGHT   = 300  # was 220; matches window.py

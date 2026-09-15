@@ -10,8 +10,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import sys
+from pathlib import Path
 
 
 def main() -> None:
@@ -57,14 +57,16 @@ def main() -> None:
 
 
     if args.check:
+        import json as _j
+        import time as _t
+        from dataclasses import asdict
+
         from . import watcher
         sm = watcher.StateMachine()
         # Prime CPU sampling
         sm.compute()
-        import time as _t; _t.sleep(0.3)
+        _t.sleep(0.3)
         state = sm.compute()
-        from dataclasses import asdict
-        import json as _j
         print(_j.dumps(asdict(state), indent=2))
         return
 
@@ -78,8 +80,8 @@ def main() -> None:
     # Old version (check pid then write) had a race: two launches could both
     # see "no live pid" and both write their own pid before either claimed.
     # flock() in non-blocking mode is the canonical fix.
-    import os as _os
     import fcntl as _fcntl
+    import os as _os
     lock_path = Path.home() / ".squid-pet" / "lock"
     pid_path  = Path.home() / ".squid-pet" / "pid"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -115,7 +117,7 @@ def main() -> None:
         from . import window
     except ImportError as e:
         print(f"[squid-pet] pywebview not available ({e})", file=sys.stderr)
-        print(f"[squid-pet] falling back to watcher-only mode", file=sys.stderr)
+        print("[squid-pet] falling back to watcher-only mode", file=sys.stderr)
         from . import watcher
         watcher.run_watcher_loop()
         return
@@ -126,10 +128,11 @@ def main() -> None:
 
 def _run_why(json_output: bool = False) -> None:
     """Implementation of --why and --why-json."""
-    from . import watcher
-    from dataclasses import asdict
     import json as _j
     import time as _t
+    from dataclasses import asdict
+
+    from . import watcher
 
     sm = watcher.StateMachine()
     # Pink-2026-08-26: --why is read-only diagnostics -- it must never

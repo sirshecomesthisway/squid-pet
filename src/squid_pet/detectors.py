@@ -38,7 +38,6 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Protocol, runtime_checkable
@@ -281,6 +280,8 @@ class ClaudeCodeDetector:
         if now == self._last_scan_ts:
             return
         self._lazy_defaults()
+        # _lazy_defaults() guarantees these are resolved to real callables.
+        assert self._find_processes is not None and self._aggregate_cpu is not None
         procs = self._find_processes()
         self.claude_code_running = bool(procs)
         self.cpu_percent = round(
@@ -453,6 +454,8 @@ class CodexDetector:
         if now == self._last_scan_ts:
             return
         self._lazy_defaults()
+        # _lazy_defaults() guarantees these are resolved to real callables.
+        assert self._find_processes is not None and self._aggregate_cpu is not None
         procs = self._find_processes()
         self.codex_running = bool(procs)
         self.cpu_percent = round(

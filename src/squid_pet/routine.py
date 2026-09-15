@@ -35,7 +35,6 @@ import threading
 import time
 from typing import Callable, Optional
 
-
 # ── Tunables ────────────────────────────────────────────────────────────
 IDLE_BEFORE_ROUTINE_SEC = 6.0    # don't start cycling immediately after wake
 MOOD_POLL_INTERVAL_SEC = 1.0     # how often we re-check the gate while paused
@@ -98,9 +97,9 @@ class RoutineController:
         is_drag_active: Callable[[], bool],
         is_busy: Callable[[], bool],                     # agent is actively working
         get_mood: Callable[[], str],                     # "" / drowsy / sleeping / stretch
-        is_pinned: Callable[[], bool] = None,            #  from menu
-        is_user_paused: Callable[[], bool] = None,       # menu pause-N-min
-        chatter_cb: Callable[[], None] = None,           # fires an idle_chatter bubble
+        is_pinned: Callable[[], bool] | None = None,        #  from menu
+        is_user_paused: Callable[[], bool] | None = None,   # menu pause-N-min
+        chatter_cb: Callable[[], None] | None = None,       # fires an idle_chatter bubble
     ):
         self.wanderer = wanderer
         self._get_state = get_state

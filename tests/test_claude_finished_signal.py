@@ -28,6 +28,7 @@ separately in tests/test_claude_pet_hook_script.py by invoking it as a
 real subprocess.
 """
 from __future__ import annotations
+
 import os
 import time
 from unittest.mock import patch

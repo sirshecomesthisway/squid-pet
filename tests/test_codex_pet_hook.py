@@ -1,9 +1,9 @@
 """Run the actual hook without a Codex process or user configuration."""
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -56,7 +56,7 @@ def test_identical_concurrent_calls_need_both_results(tmp_path):
 
 
 def test_permission_description_does_not_break_matching(tmp_path):
-    from importlib.util import spec_from_file_location, module_from_spec
+    from importlib.util import module_from_spec, spec_from_file_location
     spec = spec_from_file_location('codex_hook', SCRIPT)
     module = module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -86,7 +86,7 @@ def test_accepted_async_question_signals_from_post_tool_hook(tmp_path):
 
 @pytest.mark.parametrize('reply_turn', [None, 'new-turn'])
 def test_user_reply_clears_only_own_async_questions(tmp_path, reply_turn):
-    from importlib.util import spec_from_file_location, module_from_spec
+    from importlib.util import module_from_spec, spec_from_file_location
     spec = spec_from_file_location('codex_hook', SCRIPT)
     module = module_from_spec(spec)
     spec.loader.exec_module(module)

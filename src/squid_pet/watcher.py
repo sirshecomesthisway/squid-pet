@@ -38,9 +38,10 @@ import json
 import os
 import subprocess
 import time
-from dataclasses import dataclass, asdict
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Literal
 
 import psutil
 
@@ -136,7 +137,7 @@ class PetState:
 # 0.0014ms. Checked side by side against ioreg: the two agree to within
 # the time ioreg itself takes to run, against a 5-minute threshold.
 # ioreg stays as the fallback for a machine without the bindings.
-_QUARTZ_IDLE_FN = None      # resolved on first use; False once known missing
+_QUARTZ_IDLE_FN: Callable[[], float] | Literal[False] | None = None  # resolved on first use; False once known missing
 
 
 def _quartz_idle_seconds() -> float | None:
@@ -148,8 +149,8 @@ def _quartz_idle_seconds() -> float | None:
         try:
             from Quartz import (
                 CGEventSourceSecondsSinceLastEventType,
-                kCGEventSourceStateHIDSystemState,
                 kCGAnyInputEventType,
+                kCGEventSourceStateHIDSystemState,
             )
         except Exception:
             # Remembered, so a machine without pyobjc-framework-Quartz
@@ -1498,16 +1499,16 @@ class StateMachine:
 
         # Other-detector signals (computed lazily to avoid wasted scans
         # when we exit the cascade early).
-        other_busy_cache = [None]
-        other_celebrating_cache = [None]
-        other_grooving_cache = [None]
+        other_busy_cache: list[bool | None] = [None]
+        other_celebrating_cache: list[tuple[bool, str | None] | None] = [None]
+        other_grooving_cache: list[bool | None] = [None]
 
         def other_busy() -> bool:
             if other_busy_cache[0] is None:
                 other_busy_cache[0] = any(
                     d.is_busy(now) for d in self._other_detectors()
                 )
-            return other_busy_cache[0]
+            return bool(other_busy_cache[0])
 
         def other_celebrating() -> bool:
             # Cache holds (fired: bool, name: str|None) once computed --
@@ -1520,21 +1521,24 @@ class StateMachine:
                         fired, name = True, d.name
                         break
                 other_celebrating_cache[0] = (fired, name)
-            return other_celebrating_cache[0][0]
+            result = other_celebrating_cache[0]
+            assert result is not None
+            return result[0]
 
         def other_celebrating_name() -> str | None:
             """Only meaningful after other_celebrating() has actually run
             -- if the CELEBRATING branch's `or` short-circuited before
             reaching it (e.g. a manually-armed celebrate_until), the
             cache is still empty and there's no "other" name to report."""
-            return other_celebrating_cache[0][1] if other_celebrating_cache[0] else None
+            cached = other_celebrating_cache[0]
+            return cached[1] if cached else None
 
         def other_grooving() -> bool:
             if other_grooving_cache[0] is None:
                 other_grooving_cache[0] = any(
                     d.is_grooving(now) for d in self._other_detectors()
                 )
-            return other_grooving_cache[0]
+            return bool(other_grooving_cache[0])
 
         st = PetState(
             idle_seconds=round(idle, 1),

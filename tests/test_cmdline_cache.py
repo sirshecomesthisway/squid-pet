@@ -20,7 +20,6 @@ import pytest
 
 from squid_pet import watcher
 
-
 SETTLED = time.time() - 3600.0   # old enough that its argv cannot still change
 
 

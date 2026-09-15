@@ -8,6 +8,7 @@ SQUID_PET_HOME is overridden per-test to a tmp_path so nothing here ever
 touches the real ~/.squid-pet.
 """
 from __future__ import annotations
+
 import json
 import os
 import subprocess

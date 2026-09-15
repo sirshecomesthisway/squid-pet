@@ -1,7 +1,8 @@
 """Tests for IDEDetector via synthetic procs + injected recent_files_fn."""
 from __future__ import annotations
+
 import time
-from pathlib import Path
+
 from squid_pet.detectors import IDEDetector
 
 
@@ -156,7 +157,6 @@ def test_multiple_project_dirs_are_all_watched(tmp_path):
     busy. This is what lets an IDE user whose code lives outside the default
     ~/Projects be seen -- they add their roots via triggers.project_dirs
     (2026-09-06: IDE-agnostic capture depends on watching the right dirs)."""
-    import time
     root_a = tmp_path / "projects"
     root_a.mkdir()
     root_b = tmp_path / "dev"
