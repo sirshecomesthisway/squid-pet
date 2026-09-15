@@ -117,31 +117,23 @@
     @keyframes concerned-tremble { 0%,100%{transform:translate(-50%,-50%) translate(0,0);} 10%,30%,50%,70%,90%{transform:translate(-50%,-50%) translate(-1.5px,1.5px);} 20%,40%,60%,80%{transform:translate(-50%,-50%) translate(1.5px,-1.5px);} }
     .pet[data-state="concerned"] { animation: concerned-tremble 0.25s linear infinite; }
 
-    /* ── APPROVAL-NEEDED ── agent waiting on user input: the loudest of
-       her attention cues, so it borrows the elastic squash-and-stretch
-       from idle-squish (elongate, overshoot, settle -- what sells her as a
-       body, not a scaled picture) and turns it into a continuous springy
-       hop. Pink-2026-09-15: replaced the gentle scale pulse (1.00<->1.08),
-       which read as too subtle to catch her eye. Runs alongside, and
-       independent of, the JS flag-wave sprite cycling (startAttentionWave).
-
-       transform-origin is her FEET (as in idle-squish): she may be
-       edge-hugging with the wrapper rotated, so scaling from the centre
-       would push her into the wall. Invisible switch -- the loop both
-       starts and ends at scale(1)/translateY(0), where the pivot has no
-       effect. The hop (translateY) works in her rotated local frame the
-       same way celebrating-jump's does. */
-    @keyframes attention-bounce {
-      0%   { transform: translate(-50%,-50%) translateY(0)     scale(1.00, 1.00); }
-      18%  { transform: translate(-50%,-50%) translateY(3px)   scale(1.10, 0.90); } /* anticipation crouch */
-      42%  { transform: translate(-50%,-50%) translateY(-16px) scale(0.90, 1.14); } /* spring up + stretch */
-      62%  { transform: translate(-50%,-50%) translateY(0)     scale(1.14, 0.88); } /* land squash */
-      80%  { transform: translate(-50%,-50%) translateY(0)     scale(0.97, 1.05); } /* elastic overshoot */
-      100% { transform: translate(-50%,-50%) translateY(0)     scale(1.00, 1.00); }
-    }
+    /* ── APPROVAL-NEEDED ── agent waiting on user input, her loudest cue.
+       CHOREOGRAPHED (Pink-2026-09-15): one JS timeline (startAttentionWave)
+       drives a single clock so the flag waves ONLY at full stretch, never
+       mid-motion:
+         EXTEND (stretch up, flag static) -> WAVE (~1s, cycle the flag frames,
+         held at full stretch) -> RETRACT (springy snap back, flag static)
+         -> brief settle -> repeat.
+       The body transform is set inline by JS and CSS-transitioned per phase
+       (ease-out on the extend, springy back-ease on the retract), so there is
+       no continuous CSS animation here -- `animation: none` keeps the
+       per-state keyframes from fighting the inline transform. transform-origin
+       is her FEET (as in idle-squish) so the stretch grows away from whatever
+       edge she is hugging, and clearing the inline transform on exit re-centres
+       her via base .pet. */
     .pet[data-state="approval_needed"] {
       transform-origin: bottom center;
-      animation: attention-bounce 0.8s cubic-bezier(.5,-0.3,.35,1.4) infinite;
+      animation: none;
     }
 
 
@@ -728,27 +720,85 @@
       pet.src = src;
     }
 
-    // ATTENTION-NEEDED FLAG WAVE
-    // Backend state "approval_needed" triggers a 4-frame flag-wave cycle.
-    // Sprite layer (this) handles the wave; CSS .pet[data-state="approval_needed"]
-    // handles the synchronised scale pop. Combined cycle = 600ms (4 * 150ms).
+    // ATTENTION-NEEDED CHOREOGRAPHY (Pink-2026-09-15)
+    // Backend state "approval_needed" plays a single-clock timeline so the
+    // flag waves ONLY while she is fully extended, never during the
+    // extend/retract motion:
+    //   EXTEND (flag static) -> WAVE ~1s (cycle frames, held up) -> RETRACT
+    //   (flag static) -> small gap -> repeat.
+    // The body transform is inline + CSS-transitioned per phase; the flag is
+    // the img.src cycle. One JS timeline owns both, so they cannot drift.
+    // The static (extend/retract) pose is wave-frame 0, NOT the base sprite,
+    // so entering the wave is seamless: she is already holding this exact
+    // frame, and the wave just starts advancing it -- no frame jump, no beat.
+    const ATTENTION_STATIC = "sprites/attention_needed_1.png";
     const ATTENTION_FRAMES = [
       "sprites/attention_needed_1.png",
       "sprites/attention_needed_2.png",
       "sprites/attention_needed_3.png",
       "sprites/attention_needed_4.png",
     ];
-    const ATTENTION_FRAME_MS = 150;
-    let _attentionTimer = null;
-    let _attentionIdx = 0;
+    const ATTN_EXTEND_MS     = 260;   // stretch up (quick, per "faster")
+    const ATTN_WAVE_MS       = 2000;  // wave the flag at full stretch
+    const ATTN_RETRACT_MS    = 340;   // hard springy snap back
+    const ATTN_GAP_MS        = 90;    // brief settle before the next extend
+    const ATTN_WAVE_FRAME_MS = 110;   // flag frame cadence during the wave
+    // A vertical STRETCH from her planted feet (transform-origin bottom-
+    // center): she elongates UP, taller but the SAME width -- reads as a
+    // stretch, not a zoom (uniform scale) and not thin (the old scale(0.85,
+    // 1.17) narrowed her). Tentacles stay on the edge.
+    const ATTN_EXTENDED = "translate(-50%,-50%) scale(1.0, 1.22)";
+    const ATTN_REST     = "translate(-50%,-50%) translateY(0) scale(1, 1)";
+    const ATTN_EXTEND_EASE  = "cubic-bezier(.22,.68,.35,1)";   // ease-out, settle into stretch
+    const ATTN_RETRACT_EASE = "cubic-bezier(.28,2.4,.5,1)";    // back-ease: HARD springy overshoot
+    let _attnActive = false;
+    let _attnTimers = [];
+
+    function _attnClearTimers() {
+      for (const id of _attnTimers) { clearTimeout(id); clearInterval(id); }
+      _attnTimers = [];
+    }
+
+    function _attnRunCycle() {
+      if (!_attnActive) return;
+      // Phase 1 -- EXTEND, flag static.
+      setSpriteSrcDirect(ATTENTION_STATIC);
+      pet.style.transition = `transform ${ATTN_EXTEND_MS}ms ${ATTN_EXTEND_EASE}`;
+      void pet.offsetWidth;                    // reflow so the transition runs from rest
+      pet.style.transform = ATTN_EXTENDED;
+      _attnTimers.push(setTimeout(() => {
+        if (!_attnActive) return;
+        // Phase 2 -- WAVE, held at full stretch, cycle the flag frames.
+        // She is already holding ATTENTION_FRAMES[0] from the extend, so
+        // ADVANCE immediately (no initial 110ms hold): the wave starts the
+        // instant she is fully extended, seamlessly.
+        let idx = 0;
+        const _advance = () => {
+          if (!_attnActive) return;
+          idx = (idx + 1) % ATTENTION_FRAMES.length;
+          setSpriteSrcDirect(ATTENTION_FRAMES[idx]);
+        };
+        _advance();
+        const iv = setInterval(_advance, ATTN_WAVE_FRAME_MS);
+        _attnTimers.push(iv);
+        _attnTimers.push(setTimeout(() => {
+          clearInterval(iv);
+          if (!_attnActive) return;
+          // Phase 3 -- RETRACT, flag static, springy snap back.
+          setSpriteSrcDirect(ATTENTION_STATIC);
+          pet.style.transition = `transform ${ATTN_RETRACT_MS}ms ${ATTN_RETRACT_EASE}`;
+          pet.style.transform = ATTN_REST;
+          // Phase 4 -- settle, then repeat.
+          _attnTimers.push(setTimeout(_attnRunCycle, ATTN_RETRACT_MS + ATTN_GAP_MS));
+        }, ATTN_WAVE_MS));
+      }, ATTN_EXTEND_MS));
+    }
 
     function startAttentionWave() {
-      if (_attentionTimer !== null) return;     // already running
+      if (_attnActive) return;                 // already running
       // attention_needed takes PRIME above all other rhythms (Pink's design).
-      // Force-clear every override layer that could mask the wave:
-      //   - mood (drowsy / sleeping / stretch)
-      //   - sub-state (walking / looking-around)
-      // Notify backend so the mood layer stays consistent with what's on screen.
+      // Force-clear every override layer that could mask it, and tell the
+      // backend so the mood layer stays consistent with what is on screen.
       if (_mood === "drowsy" || _mood === "sleeping" || _mood === "stretch") {
         console.log(`[squid] attention_needed forcing wake from ${_mood}`);
         _mood = "";
@@ -760,22 +810,18 @@
         const wrapper = document.getElementById("pet-wrapper");
         if (wrapper) wrapper.dataset.substate = "";
       }
-      _attentionIdx = 0;
-      setSpriteSrcDirect(ATTENTION_FRAMES[_attentionIdx]);
-      _attentionTimer = setInterval(() => {
-        // No deferrals. attention_needed is the highest-priority state.
-        // If something else tried to swap the sprite mid-wave, we win
-        // the next tick by swapping right back to the next frame.
-        _attentionIdx = (_attentionIdx + 1) % ATTENTION_FRAMES.length;
-        setSpriteSrcDirect(ATTENTION_FRAMES[_attentionIdx]);
-      }, ATTENTION_FRAME_MS);
+      _attnActive = true;
+      _attnRunCycle();
     }
 
     function stopAttentionWave() {
-      if (_attentionTimer === null) return;
-      clearInterval(_attentionTimer);
-      _attentionTimer = null;
-      _attentionIdx = 0;
+      if (!_attnActive) return;
+      _attnActive = false;
+      _attnClearTimers();
+      // Release the inline transform so the normal per-state CSS animations
+      // (breathe / thinking-tilt / ...) resume and she re-centres via base .pet.
+      pet.style.transition = "";
+      pet.style.transform = "";
     }
 
     function enterDrowsy() {
