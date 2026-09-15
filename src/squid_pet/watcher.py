@@ -735,6 +735,14 @@ CLAUDE_TURN_ACTIVE_DIR = os.path.join(
 # exit; this is only for a kill -9.
 CLAUDE_TURN_ACTIVE_STALE_SEC = 3600.0
 
+# How long a turn may stay open with a SILENT transcript before the cascade
+# stops reading it as "thinking" (branch 4c) and lets her fall through to idle.
+# A usage-limit block (Claude Code halts without firing Stop) keeps the turn
+# bracket open for minutes-to-hours; a genuine silent thinking stretch is much
+# shorter (measured <~60s). 180s sits well clear of both. Hot-reloadable via
+# config.get("turn_stall_sec").
+TURN_STALL_SEC_DEFAULT = 180.0
+
 
 # ── WHICH session is waving? (Pink-2026-09-01) ─────────────────────────
 # The flag directory says how many sessions are waiting, but its filenames
@@ -1465,6 +1473,10 @@ class StateMachine:
             claude_shell_active = claude.shell_active
             claude_file_active = claude.file_active
             claude_streaming = claude.streaming
+            # Seconds since Claude last wrote its transcript (inf if none).
+            # Used only to tell "thinking some more" from a stalled turn in
+            # branch 4c -- see the usage-limit note there.
+            claude_transcript_age = claude.transcript_age
             # Pink-2026-08-27f: was claude.is_celebrating(now) -- the
             # detector's own busy->idle heuristic edge (shell/file/
             # transcript-mtime activity dropping). Replaced with the
@@ -1493,6 +1505,7 @@ class StateMachine:
             claude_shell_active = False
             claude_file_active = False
             claude_streaming = False
+            claude_transcript_age = float("inf")
             claude_finished_age = None
 
         codex = self._codex_detector
@@ -1781,8 +1794,10 @@ class StateMachine:
             try:
                 from . import config as _cfg
                 _work_hold = float(_cfg.get('working_hold_sec', 25))
+                _turn_stall = float(_cfg.get('turn_stall_sec', TURN_STALL_SEC_DEFAULT))
             except Exception:
                 _work_hold = 25.0
+                _turn_stall = TURN_STALL_SEC_DEFAULT
             # 4a. WORKING -- actively running tool / shell command, or a
             # project file was just written (catches in-process
             # Edit/Write/apply_patch calls that never spawn a
@@ -1814,7 +1829,19 @@ class StateMachine:
             # stretch produces no transcript write at all, so 4b above goes
             # stale and she used to fall through to idle. Ranked last so it
             # only ever decides what would otherwise be idle.
-            if turn_in_flight:
+            #
+            # Pink-2026-09-15: BUT a turn bracket that has stayed open while
+            # the transcript has been SILENT for a long stretch is almost
+            # certainly BLOCKED, not thinking -- the classic case is Claude
+            # Code hitting a usage limit, which halts the turn WITHOUT firing
+            # the Stop hook, so turn_in_flight stayed True (and she stayed
+            # "thinking") for up to CLAUDE_TURN_ACTIVE_STALE_SEC (1h). Real
+            # silent thinking stretches are short (measured <~60s); a usage
+            # limit blocks for minutes to hours. Past _turn_stall seconds of
+            # transcript silence, stop claiming she is thinking and fall
+            # through to idle. transcript_age needs no transcript CONTENT --
+            # mtime only, same privacy stance as the rest of the detector.
+            if turn_in_flight and claude_transcript_age <= _turn_stall:
                 st.state = "thinking"
                 st.state_reason = "claude turn in flight"
                 st.message = "🤔 thinking"

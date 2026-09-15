@@ -54,6 +54,12 @@ DEFAULTS: dict[str, Any] = {
     "tool_active_window_sec": 20,
     # Fix 7: sticky working window -- bridges model-generation gaps
     "working_hold_sec": 25,
+    # Pink-2026-09-15: how long a turn may stay open with a silent transcript
+    # before the cascade stops calling it "thinking" and falls through to idle.
+    # Guards against Claude Code hitting a usage limit (turn never closes, no
+    # Stop hook) pinning her to "thinking" for up to an hour. See watcher.py's
+    # branch 4c / TURN_STALL_SEC_DEFAULT.
+    "turn_stall_sec": 180,
 }
 
 

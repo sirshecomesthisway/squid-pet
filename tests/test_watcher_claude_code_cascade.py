@@ -656,3 +656,52 @@ def test_grooving_returns_on_the_next_turn(monkeypatch, tmp_path):
     _write_flag(finished_dir, "sess-1", 1_000_000.0 - 1.0)
     st = sm.compute()
     assert st.state == "grooving"
+
+
+# ── Usage-limit stall (Pink-2026-09-15) ─────────────────────────────────
+# A turn bracket that stays open while the transcript is SILENT for a long
+# stretch is a blocked turn, not a thinking one -- the classic cause is
+# Claude Code hitting a usage limit, which halts without firing Stop, so the
+# turn flag (and "thinking") used to persist for up to an hour.
+
+def test_usage_limit_stall_falls_to_idle(monkeypatch, tmp_path):
+    """turn_in_flight + transcript silent past turn_stall_sec -> idle, not
+    a forever-'thinking'."""
+    from squid_pet import config
+    monkeypatch.setattr(config, "_load_raw", lambda: {})  # default 180s stall
+    turn_dir = tmp_path / "claude_turn_active"
+    sm = _claude_machine(monkeypatch, transcript_age_sec=300.0,
+                         turn_active_dir=str(turn_dir))
+    _write_flag(turn_dir, "sess-1", 1_000_000.0 - 30.0)
+
+    st = sm.compute()
+    assert st.state == "idle", (
+        "a turn open but silent for 5 min is blocked (e.g. usage limit), "
+        "not thinking")
+
+
+def test_turn_in_flight_just_under_stall_still_thinking(monkeypatch, tmp_path):
+    """Just below the stall window she is still 'thinking some more' -- the
+    original silent-thinking backstop must survive."""
+    from squid_pet import config
+    monkeypatch.setattr(config, "_load_raw", lambda: {})  # default 180s stall
+    turn_dir = tmp_path / "claude_turn_active"
+    sm = _claude_machine(monkeypatch, transcript_age_sec=150.0,
+                         turn_active_dir=str(turn_dir))
+    _write_flag(turn_dir, "sess-1", 1_000_000.0 - 30.0)
+
+    st = sm.compute()
+    assert st.state == "thinking"
+
+
+def test_turn_stall_sec_is_config_tunable(monkeypatch, tmp_path):
+    from squid_pet import config
+    monkeypatch.setattr(config, "_load_raw", lambda: {"turn_stall_sec": 30})
+    turn_dir = tmp_path / "claude_turn_active"
+    sm = _claude_machine(monkeypatch, transcript_age_sec=60.0,
+                         turn_active_dir=str(turn_dir))
+    _write_flag(turn_dir, "sess-1", 1_000_000.0 - 30.0)
+
+    # 60s silent > 30s configured stall -> idle
+    st = sm.compute()
+    assert st.state == "idle"
