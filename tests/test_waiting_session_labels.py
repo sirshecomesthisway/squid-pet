@@ -90,6 +90,67 @@ def test_tty_resolves_through_the_matching_process(tmp_path, monkeypatch):
     assert watcher.claude_session_tty("sess-4") == "/dev/ttys002"
 
 
+# ── Same-cwd disambiguation (Pink-2026-09-16 wrong-window bug) ──────────
+# Two sessions in the SAME directory -- one in Terminal, one in Cursor --
+# both match the encoded cwd, so cwd alone returns whichever process is
+# listed first. The hook records each session's controlling tty; that tty
+# is the authoritative key that tells them apart.
+
+def _record_tty(monkeypatch, tmp_path, session_id, tty):
+    d = tmp_path / "session_tty"; d.mkdir(exist_ok=True)
+    (d / session_id).write_text(tty)
+    monkeypatch.setattr(watcher, "CLAUDE_SESSION_TTY_DIR", str(d))
+
+
+def test_recorded_tty_picks_the_right_same_cwd_session(tmp_path, monkeypatch):
+    """The failed session is the Cursor one (/dev/ttys008); a Terminal
+    session shares its cwd and is listed first. The recorded tty must win,
+    so tty and host both resolve to Cursor -- not the Terminal bystander."""
+    projects = tmp_path / "projects"
+    (projects / "-Users-p-Projects-squid-pet").mkdir(parents=True)
+    (projects / "-Users-p-Projects-squid-pet" / "sess-cursor.jsonl").write_text("")
+    monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(projects))
+    monkeypatch.setattr(watcher, "find_claude_code_processes", lambda: [
+        _FakeProc("/Users/p/Projects/squid-pet", "/dev/ttys000"),  # Terminal, first
+        _FakeProc("/Users/p/Projects/squid-pet", "/dev/ttys008"),  # Cursor
+    ])
+    _record_tty(monkeypatch, tmp_path, "sess-cursor", "/dev/ttys008")
+
+    assert watcher.claude_session_proc("sess-cursor").terminal() == "/dev/ttys008"
+    assert watcher.claude_session_tty("sess-cursor") == "/dev/ttys008"
+
+
+def test_without_a_recorded_tty_it_falls_back_to_cwd(tmp_path, monkeypatch):
+    """Older/detached session with no recorded tty: the cwd match still
+    resolves it (correct whenever sessions live in distinct directories)."""
+    projects = tmp_path / "projects"
+    (projects / "-Users-p-api").mkdir(parents=True)
+    (projects / "-Users-p-api" / "sess-old.jsonl").write_text("")
+    monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(projects))
+    monkeypatch.setattr(watcher, "find_claude_code_processes", lambda: [
+        _FakeProc("/Users/p/other", "/dev/ttys001"),
+        _FakeProc("/Users/p/api", "/dev/ttys002"),
+    ])
+    monkeypatch.setattr(watcher, "CLAUDE_SESSION_TTY_DIR", str(tmp_path / "empty"))
+
+    assert watcher.claude_session_tty("sess-old") == "/dev/ttys002"
+
+
+def test_stale_recorded_tty_with_no_live_match_falls_back_to_cwd(tmp_path, monkeypatch):
+    """A recorded tty whose process is gone must not strand resolution: fall
+    through to the cwd match rather than returning nothing."""
+    projects = tmp_path / "projects"
+    (projects / "-Users-p-api").mkdir(parents=True)
+    (projects / "-Users-p-api" / "sess-z.jsonl").write_text("")
+    monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(projects))
+    monkeypatch.setattr(watcher, "find_claude_code_processes", lambda: [
+        _FakeProc("/Users/p/api", "/dev/ttys002"),
+    ])
+    _record_tty(monkeypatch, tmp_path, "sess-z", "/dev/ttys999")  # no live proc
+
+    assert watcher.claude_session_tty("sess-z") == "/dev/ttys002"
+
+
 def test_label_falls_back_to_none_when_unresolvable(tmp_path, monkeypatch):
     monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(tmp_path))
     assert watcher.claude_session_label("nope") is None

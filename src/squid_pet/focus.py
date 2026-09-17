@@ -62,6 +62,13 @@ def _signal_dirs() -> dict:
         "approval_needed": w.CLAUDE_AWAITING_INPUT_DIR,
         "celebrating":     w.CLAUDE_TASK_COMPLETE_DIR,
         "grooving":        w.CLAUDE_FINISHED_DIR,
+        # Pink-2026-09-16: a concerned face means a Claude turn just failed
+        # on an API error -- double-click should take you to THAT session's
+        # terminal, same session->tty->tab chain as the others. Keyed by the
+        # claude_failed flag the StopFailure hook writes. (A Codex-sourced
+        # concern has no per-session flag dir, so take_me_there falls through
+        # to "resting" there -- acknowledge_concern still calms it.)
+        "concerned":       w.CLAUDE_FAILED_DIR,
     }
 
 
@@ -255,15 +262,25 @@ def _focus_claude_state(state: str,
         return "resting"
     sid = _freshest_in(signal_dir)
     tty = None
+    bundle = None
     if sid:
         try:
-            from .watcher import claude_session_tty
+            from .watcher import (claude_session_tty,
+                                  find_terminal_app_bundle_for_session)
+            # Resolve BOTH the tab (tty) and the app (bundle) through the one
+            # session that caused the state. Resolving the app separately, as
+            # _raise's session-blind fallback does, can name a different
+            # session's host when several run in different apps -- the
+            # Pink-2026-09-16 bug where a failed Cursor turn sent the
+            # concerned double-click to a Terminal window instead.
             tty = claude_session_tty(sid)
+            bundle = find_terminal_app_bundle_for_session(sid)
         except Exception:
             tty = None
+            bundle = None
     if tty is None:
         tty = _any_claude_tty()
-    return _raise(tty, run)
+    return _raise(tty, run, bundle=bundle)
 
 
 def focus_for_state(state: str,
@@ -300,13 +317,23 @@ def _any_claude_tty() -> Optional[str]:
 
 
 def _raise(tty: Optional[str],
-           run: Optional[Callable[[str], Optional[str]]] = None) -> str:
+           run: Optional[Callable[[str], Optional[str]]] = None,
+           bundle: Optional[str] = None) -> str:
+    """Raise the window for a tty, hosted by `bundle`.
+
+    `bundle` is the app the caller already resolved through the specific
+    responsible session; when it is None (session gone, or a source with no
+    per-session process such as Codex) we fall back to the session-blind
+    first-found lookup -- no worse than before, but never overriding a
+    correct per-session answer with it.
+    """
     runner = run if run is not None else _run_osascript
-    try:
-        from .watcher import find_terminal_app_bundle_for_claude_code
-        bundle = find_terminal_app_bundle_for_claude_code()
-    except Exception:
-        bundle = None
+    if bundle is None:
+        try:
+            from .watcher import find_terminal_app_bundle_for_claude_code
+            bundle = find_terminal_app_bundle_for_claude_code()
+        except Exception:
+            bundle = None
     if bundle == TERMINAL_APP_BUNDLE_ID and tty:
         out = runner(build_terminal_focus_script(tty))
         if out is not None:

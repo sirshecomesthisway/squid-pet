@@ -1367,6 +1367,35 @@ class PetApi:
         timer.start()
         return {"status": "calmed", "bubble": bubble}
 
+    def acknowledge_concern(self) -> dict:
+        """JS-exposed: dblclick while state=="concerned" is "I saw the error"
+        -- calm the worried face. Mirrors acknowledge_approval: the same
+        dblclick's take_me_there() raises the errored session's terminal, so
+        this does only the calm. No-ops (status "not-concerned") at any other
+        state, leaving the plain poke+heart untouched.
+
+        Calms by SNOOZING the concerned override (watcher.dismiss_concern),
+        not by deleting the failed flag -- take_me_there, which runs right
+        after this in the same gesture, still needs that flag to resolve the
+        session (same reason acknowledge_approval snoozes rather than deletes
+        the awaiting flag). Covers a Codex-sourced concern too, which has no
+        flag to delete. Returns the bubble on the RPC response so it shows
+        immediately instead of racing the ~1s poll -- see the dblclick
+        handler in index.html."""
+        with self._lock:
+            current_state = self._latest.state
+        if current_state != "concerned":
+            return {"status": "not-concerned", "bubble": None}
+        bubble = self._observer.on_interaction("like")
+        if bubble is not None:
+            self._set_pending_bubble(bubble, BUBBLE_PRIO_STATE)
+        from . import watcher as _w
+        try:
+            _w.dismiss_concern()
+        except Exception as e:
+            log.warning(f"dismiss_concern failed: {e}")
+        return {"status": "calmed", "bubble": bubble}
+
     def take_me_there(self) -> dict:
         """JS-exposed: dblclick -> raise the window responsible for whatever
         she is currently showing.

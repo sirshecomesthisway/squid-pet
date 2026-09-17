@@ -16,7 +16,13 @@ PROJECT = Path(__file__).parent.parent
 
 def _run(*flags) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [sys.executable, "-m", "squid_pet", *flags],
+        # Exercise the real module entry point, isolating only the OS idle
+        # call: Quartz can block indefinitely without WindowServer access.
+        [sys.executable, "-c",
+         "from squid_pet import watcher; "
+         "watcher.macos_idle_seconds = lambda: 0.0; "
+         "import runpy; runpy.run_module('squid_pet', run_name='__main__')",
+         *flags],
         capture_output=True, text=True, timeout=15,
         cwd=str(PROJECT),
     )
@@ -114,6 +120,8 @@ def test_why_json_stays_valid_json_when_approval_needed_is_live(monkeypatch, cap
 
     from squid_pet import watcher
     from squid_pet.__main__ import _run_why
+
+    monkeypatch.setattr(watcher, "macos_idle_seconds", lambda: 0.0)
 
     with patch.object(watcher, "claude_sessions_awaiting_input",
                       return_value=["sess-regression-test"]), \

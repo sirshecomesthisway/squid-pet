@@ -51,6 +51,10 @@ def _recap_path(home: Path, session_id: str) -> Path:
     return home / "claude_recapping" / session_id
 
 
+def _failed_path(home: Path, session_id: str) -> Path:
+    return home / "claude_failed" / session_id
+
+
 def test_script_exists_and_is_executable():
     assert SCRIPT.exists(), f"missing {SCRIPT}"
     assert os.access(SCRIPT, os.X_OK), f"{SCRIPT} is not executable"
@@ -486,4 +490,172 @@ def test_turn_active_flag_holds_no_prompt_content(home):
     _run({"session_id": "sess-t6", "hook_event_name": "UserPromptSubmit",
           "prompt": "something private the user typed"}, home)
     assert "private" not in _turn_active_path(home, "sess-t6").read_text()
+
+
+# ── StopFailure (Pink-2026-09-16: the real "turn failed on an API error"
+# signal that drives the concerned/warning sprite -- see
+# watcher.claude_freshest_failure()). Claude Code fires StopFailure, NOT
+# Stop, when a turn ends due to an API error (usage/rate limit, overload,
+# auth, billing, ...), carrying a machine-readable error_type. This is the
+# only inference-free way to know she is blocked by an error rather than
+# just quiet. ────────────────────────────────────────────────────────────
+def test_stop_failure_writes_failed_flag_with_error_type(home):
+    r = _run({"session_id": "sess-f1", "hook_event_name": "StopFailure",
+              "error_type": "rate_limit"}, home)
+    assert r.returncode == 0, r.stderr
+    fp = _failed_path(home, "sess-f1")
+    assert fp.exists()
+    assert fp.read_text() == "rate_limit"
+
+
+def test_stop_failure_missing_error_type_defaults_unknown(home):
+    """A StopFailure with no error_type still means the turn failed -- record
+    it as 'unknown' rather than dropping the signal."""
+    r = _run({"session_id": "sess-f2", "hook_event_name": "StopFailure"}, home)
+    assert r.returncode == 0, r.stderr
+    assert _failed_path(home, "sess-f2").read_text() == "unknown"
+
+
+def test_stop_failure_closes_the_turn_bracket(home):
+    """A failed turn is an ended turn: StopFailure must clear claude_turn_active
+    so the stall/thinking path can't keep painting 'thinking' over the error."""
+    _run({"session_id": "sess-f3", "hook_event_name": "UserPromptSubmit"}, home)
+    assert _turn_active_path(home, "sess-f3").exists()
+
+    r = _run({"session_id": "sess-f3", "hook_event_name": "StopFailure",
+              "error_type": "overloaded"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _turn_active_path(home, "sess-f3").exists()
+
+
+def test_stop_failure_does_not_write_finished_flag(home):
+    """A failed turn is not a completion -- it must never look like a Stop and
+    trigger the celebrate/groove path."""
+    r = _run({"session_id": "sess-f4", "hook_event_name": "StopFailure",
+              "error_type": "server_error"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _finished_path(home, "sess-f4").exists()
+
+
+def test_stop_failure_is_content_blind(home):
+    """Only the error_type CATEGORY is recorded, never any message text --
+    same privacy contract as every other flag here."""
+    r = _run({"session_id": "sess-f5", "hook_event_name": "StopFailure",
+              "error_type": "rate_limit",
+              "last_assistant_message": "some potentially sensitive text",
+              "message": "another sensitive detail"}, home)
+    assert r.returncode == 0, r.stderr
+    body = _failed_path(home, "sess-f5").read_text()
+    assert "sensitive" not in body
+    assert body == "rate_limit"
+
+
+def test_user_prompt_submit_clears_failed_flag(home):
+    """Retrying (a new prompt) means the user has reacted to the error -- the
+    concerned state should stand down."""
+    _run({"session_id": "sess-f6", "hook_event_name": "StopFailure",
+          "error_type": "rate_limit"}, home)
+    assert _failed_path(home, "sess-f6").exists()
+
+    r = _run({"session_id": "sess-f6", "hook_event_name": "UserPromptSubmit"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _failed_path(home, "sess-f6").exists()
+
+
+def test_session_end_clears_failed_flag(home):
+    """Crash safety: a session that ends must not leave a stuck failure flag."""
+    _run({"session_id": "sess-f7", "hook_event_name": "StopFailure",
+          "error_type": "billing_error"}, home)
+    assert _failed_path(home, "sess-f7").exists()
+
+    r = _run({"session_id": "sess-f7", "hook_event_name": "SessionEnd"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _failed_path(home, "sess-f7").exists()
+
+
+def test_stop_failure_is_not_logged_as_unknown_event(home):
+    """StopFailure is a HANDLED event -- it must not also appear as
+    UNKNOWN_EVENT in claude_hook.log, which is exactly the log someone reads
+    when a concerned flag looks stuck."""
+    _run({"session_id": "sess-f8", "hook_event_name": "StopFailure",
+          "error_type": "rate_limit"}, home)
+    log = (home / "claude_hook.log").read_text()
+    assert "StopFailure sess-f8 WRITE" in log
+    assert "UNKNOWN_EVENT" not in log
+
+
+# ── session -> tty registry (Pink-2026-09-16 wrong-window fix) ──────────
+# The hook records the session's controlling terminal so "take me there"
+# can raise the exact tab/app that fired a signal, instead of guessing by
+# cwd (ambiguous when two sessions share a directory). The recording itself
+# depends on the process having a controlling tty, which a pytest subprocess
+# may not -- so recording is unit-tested by importing the module, while the
+# SessionEnd cleanup (which must run regardless) is tested end-to-end.
+import importlib.util as _ilu
+
+
+def _load_hook_module():
+    spec = _ilu.spec_from_file_location("claude_pet_hook", SCRIPT)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _tty_path(home: Path, session_id: str) -> Path:
+    return home / "claude_session_tty" / session_id
+
+
+def test_ancestor_walk_finds_the_claude_tty_when_the_hook_has_none():
+    """The real Claude Code runtime: the hook process has no controlling
+    terminal (tty ??), but its `claude` parent does. The walk must climb
+    past the terminal-less hook to the ancestor that owns the tty -- this
+    is what makes the whole fix work in production, where the hook's own
+    /dev/tty is unavailable."""
+    mod = _load_hook_module()
+    # pid 500 = hook (no tty), 400 = claude (ttys008), 300 = login shell
+    ps_output = (
+        "500 400 ??\n"
+        "400 300 ttys008\n"
+        "300   1 ttys008\n"
+        "999   1 ttys000\n"   # an unrelated session -- must be ignored
+    )
+    assert mod._first_ancestor_tty(ps_output, 500) == "/dev/ttys008"
+
+
+def test_ancestor_walk_returns_none_when_no_ancestor_has_a_tty():
+    """A truly headless run (no terminal anywhere up the chain) yields None,
+    and the reader falls back to the cwd guess."""
+    mod = _load_hook_module()
+    ps_output = "500 400 ??\n400 300 ??\n300 1 ??\n"
+    assert mod._first_ancestor_tty(ps_output, 500) is None
+
+
+def test_records_the_controlling_tty_when_there_is_one(tmp_path, monkeypatch):
+    mod = _load_hook_module()
+    monkeypatch.setattr(mod, "TTY_DIR", str(tmp_path / "tty"))
+    monkeypatch.setattr(mod, "_controlling_tty", lambda: "/dev/ttys008")
+    mod._record_session_tty("sess-cursor")
+    assert (tmp_path / "tty" / "sess-cursor").read_text() == "/dev/ttys008"
+
+
+def test_records_nothing_when_there_is_no_tty(tmp_path, monkeypatch):
+    """A detached/headless spawn has no controlling terminal -- leave no
+    entry (the reader falls back to cwd) rather than crashing the hook."""
+    mod = _load_hook_module()
+    monkeypatch.setattr(mod, "TTY_DIR", str(tmp_path / "tty"))
+    monkeypatch.setattr(mod, "_controlling_tty", lambda: None)
+    mod._record_session_tty("sess-x")
+    assert not (tmp_path / "tty" / "sess-x").exists()
+
+
+def test_session_end_clears_the_tty_registry_entry(home):
+    """A recorded tty must not outlive its session (it would misdirect a
+    later same-tty session). SessionEnd removes it; it runs whether or not
+    the ending process still has a tty."""
+    (home / "claude_session_tty").mkdir(parents=True)
+    _tty_path(home, "sess-gone").write_text("/dev/ttys008")
+
+    r = _run({"session_id": "sess-gone", "hook_event_name": "SessionEnd"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _tty_path(home, "sess-gone").exists()
 

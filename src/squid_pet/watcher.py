@@ -15,6 +15,13 @@ State model:
                    see the sleeping branch in _compute_inner)
   - approval_needed : Claude Code's Notification hook (scripts/
                    claude_pet_hook.py) reports a session is waiting on you
+  - concerned    : Claude Code's StopFailure hook or Codex's failed turn
+                   record reports that the turn ended
+                   on an API error (usage/rate limit, overload, auth,
+                   billing, ...). Driven by that explicit hook signal,
+                   never inferred from a stalled/silent turn -- see
+                   claude_freshest_failure(), codex_freshest_failure(),
+                   and _apply_failure_override().
 
   Pink-2026-08-27: the legacy agent (a third-party CLI coding agent
   this project originally watched) has been fully removed, including the
@@ -25,9 +32,12 @@ State model:
   2026-08-26. "grooving" now has a real
   Claude Code path (Stop hook, no resumed work yet -- see
   claude_grooving_now below) and other-detector paths (e.g. IDE).
-  "concerned" still has no Claude Code/Codex equivalent and remains
-  unreachable via natural detection (still settable via the
-  ~/.squid-pet/force_state debug override for testing/demos).
+  Pink-2026-09-16: "concerned" now has a real Claude Code path too --
+  the StopFailure hook (turn ended on an API error) -- so it is no
+  longer force_state-only. Codex uses a read-only SQLite adapter for
+  explicit failed turns; validated with CLI/app-server 0.153.4. No
+  transcript or free-text error fields are returned by the adapter.
+  Still settable via the ~/.squid-pet/force_state debug override too.
 
 State is written to ~/.squid-pet/state.json every 1s, frontend polls it.
 """
@@ -37,9 +47,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import time
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -455,26 +467,46 @@ def find_terminal_app_bundle_for_claude_code() -> str | None:
     different apps, this returns whichever is found first -- the hook
     payload carries no PID to disambiguate. Returns None if no claude
     process is found or its ancestry hits no app within a few hops.
+
+    When the caller knows WHICH session it means (a session-id-keyed flag
+    dir named it), find_terminal_app_bundle_for_session resolves the app
+    through that exact process instead, which is what makes "take me there"
+    land in the right app when sessions run in different hosts.
     """
     for proc in find_claude_code_processes():
-        try:
-            cur = proc
-            depth = 0
-            while cur is not None and depth < 10:
-                name = cur.name()
-                if name in _TERMINAL_APP_BUNDLE_IDS:
-                    return _TERMINAL_APP_BUNDLE_IDS[name]
-                try:
-                    exe = cur.exe()
-                except Exception:
-                    exe = None
-                bid = _bundle_id_from_exe_path(exe)
-                if bid:
-                    return bid
-                cur = cur.parent()
-                depth += 1
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+        bundle = _terminal_app_bundle_for_proc(proc)
+        if bundle:
+            return bundle
+    return None
+
+
+def _terminal_app_bundle_for_proc(proc: "psutil.Process | None") -> str | None:
+    """Walk one process's parent chain to the terminal/IDE app hosting it.
+
+    The per-process half of find_terminal_app_bundle_for_claude_code, split
+    out so a specific session's process can be resolved to its own host app
+    rather than whichever claude process happens to be found first.
+    """
+    if proc is None:
+        return None
+    try:
+        cur = proc
+        depth = 0
+        while cur is not None and depth < 10:
+            name = cur.name()
+            if name in _TERMINAL_APP_BUNDLE_IDS:
+                return _TERMINAL_APP_BUNDLE_IDS[name]
+            try:
+                exe = cur.exe()
+            except Exception:
+                exe = None
+            bid = _bundle_id_from_exe_path(exe)
+            if bid:
+                return bid
+            cur = cur.parent()
+            depth += 1
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return None
     return None
 
 
@@ -696,6 +728,199 @@ def claude_sessions_recapping() -> list[str]:
     )
 
 
+# ── "turn failed" flag → concerned (Pink-2026-09-16) ────────────────────
+# Claude Code fires the StopFailure hook (NOT Stop) when a turn ends because
+# of an API error, carrying a machine-readable error_type (rate_limit,
+# overloaded, authentication_failed, billing_error, ...). scripts/
+# claude_pet_hook.py writes <dir>/<session_id> holding just that error_type
+# CATEGORY. This is the ONLY inference-free signal that Squid is BLOCKED by
+# an error rather than merely quiet -- Pink explicitly rejected inferring
+# "concerned" from a stalled/silent turn, since a false worried face is
+# worse than none. Cleared by the hook on UserPromptSubmit (retry) or
+# SessionEnd; the fresh window below bounds how long a failure shows even if
+# neither fires. Unlike the awaiting/finished dirs' mtime-only readers, this
+# one reads the flag's CONTENT -- but that content is a bounded error
+# CATEGORY, never message text, so it holds the same privacy line.
+CLAUDE_FAILED_DIR = os.path.join(
+    os.path.expanduser("~"), ".squid-pet", "claude_failed"
+)
+CLAUDE_FAILED_STALE_SEC = 7200.0  # 2h -- crashed-session disk cleanup only
+# How long a StopFailure keeps her concerned when nothing clears it sooner.
+# Long enough that a real usage-limit block stays visible while Pink is away,
+# short enough that a flag orphaned by a missed clear-event can't sulk
+# forever (the 2h stale sweep is only disk cleanup, far too long for a mood).
+CLAUDE_FAILED_FRESH_SEC = 300.0
+
+# error_type category -> (human reason headline, severity). "transient" marks
+# a self-resolving network/server condition (the frontend tooltip tints these
+# differently); "hard" marks anything that needs Pink to actually do
+# something -- sign in, fix billing, wait out a quota. Values are Claude
+# Code's StopFailure error_type set (see its hooks reference); an
+# unrecognized value falls back to the generic "hard" entry so a newly-added
+# error type still surfaces rather than silently vanishing.
+_CONCERN_BY_ERROR_TYPE: dict[str, tuple[str, str]] = {
+    "rate_limit": ("Usage limit reached", "transient"),
+    "overloaded": ("Claude's servers are overloaded", "transient"),
+    "server_error": ("Claude's servers hit an error", "transient"),
+    "authentication_failed": ("Sign-in expired — re-authenticate", "hard"),
+    "oauth_org_not_allowed": ("Your org isn't allowed here", "hard"),
+    "account_on_hold": ("Account is on hold", "hard"),
+    "billing_error": ("Billing needs attention", "hard"),
+    "invalid_request": ("The request was rejected", "hard"),
+    "model_not_found": ("That model isn't available", "hard"),
+    "max_output_tokens": ("Hit the max response length", "hard"),
+    "cloud_credential_error": ("Cloud credentials failed", "hard"),
+    "unknown": ("Something went wrong", "hard"),
+    "usage_limited": ("Usage limit reached", "hard"),
+    "codex_overloaded": ("Codex servers are overloaded", "transient"),
+    "codex_server_error": ("Codex servers hit an error", "transient"),
+    "codex_connection_error": ("Codex connection failed", "transient"),
+}
+_CONCERN_FALLBACK: tuple[str, str] = ("Something went wrong", "hard")
+
+
+def concern_for_error_type(error_type: str) -> tuple[str, str]:
+    """Map a Claude or normalized Codex error category to (reason headline, severity).
+    Unrecognized categories fall back to a generic hard error."""
+    return _CONCERN_BY_ERROR_TYPE.get(error_type, _CONCERN_FALLBACK)
+
+
+# ── "I saw the error" dismiss (Pink-2026-09-16) ─────────────────────────
+# A dblclick while she's showing concerned calms the worried face (see
+# window.PetApi.acknowledge_concern), mirroring acknowledge_approval. Like
+# that path, it does NOT delete the underlying failed flag -- the SAME
+# gesture's take_me_there still needs it to resolve the errored session --
+# it snoozes the concerned override instead. The window equals the flag's
+# fresh window, so a Claude flag goes stale before the snooze lifts and
+# won't re-assert; a Codex-sourced concern (no flag to delete) is covered by
+# the same snooze. Trade-off: a genuinely NEW failure within the window is
+# suppressed too -- acceptable, since you just acknowledged an error and a
+# fast retry that fails again is the same story, not news.
+CONCERN_DISMISS_SEC = CLAUDE_FAILED_FRESH_SEC
+_concern_dismissed_until: float = 0.0
+
+
+def dismiss_concern(now: float | None = None) -> None:
+    """Snooze the concerned override for CONCERN_DISMISS_SEC from now."""
+    global _concern_dismissed_until
+    if now is None:
+        now = time.time()
+    _concern_dismissed_until = now + CONCERN_DISMISS_SEC
+
+
+def claude_freshest_failure(now: float | None = None) -> str | None:
+    """error_type of the most-recently-written, still-fresh StopFailure flag,
+    or None if no Claude Code session failed within CLAUDE_FAILED_FRESH_SEC.
+
+    Reads the freshest flag's content (an error CATEGORY, not message text).
+    """
+    if now is None:
+        now = time.time()
+    session_ids = _scan_session_flag_dir(
+        CLAUDE_FAILED_DIR, CLAUDE_FAILED_STALE_SEC, CLAUDE_FAILED_FRESH_SEC
+    )
+    if not session_ids:
+        return None
+    freshest_sid: str | None = None
+    freshest_age: float | None = None
+    for sid in session_ids:
+        try:
+            age = now - os.stat(os.path.join(CLAUDE_FAILED_DIR, sid)).st_mtime
+        except OSError:
+            continue
+        if freshest_age is None or age < freshest_age:
+            freshest_age = age
+            freshest_sid = sid
+    if freshest_sid is None:
+        return None
+    try:
+        with open(os.path.join(CLAUDE_FAILED_DIR, freshest_sid)) as f:
+            return f.read().strip() or "unknown"
+    except OSError:
+        return None
+
+
+# Versioned internal schema, verified against installed codex-cli 0.153.4.
+CODEX_THREAD_HISTORY_DB = Path(
+    os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
+) / "thread_history_1.sqlite"
+CODEX_FAILED_FRESH_SEC = 300.0
+
+
+def codex_freshest_failure(now: float | None = None) -> str | None:
+    """Return only a bounded category from the freshest unresolved failed turn.
+
+    Validated 2026-09-16 with genuine failed turns from both `codex exec`
+    and `codex app-server` 0.153.4 in a throwaway CODEX_HOME: an invalid
+    provider URL produced status='failed', codexErrorInfo='other', and
+    Unix-second started_at/completed_at. The real ~/.codex schema matched.
+    App-server coverage applies to IDEs using this same local history DB;
+    remote/ephemeral sessions and other versions are not guaranteed.
+
+    SQLite projects allowlisted constants from error_json.codexErrorInfo
+    (string enum or tagged object). Never SELECT error_json itself, message,
+    additionalDetails, thread_items, or transcripts. Unknown categories on
+    explicit failures become 'unknown'; malformed JSON/schema is a no-op.
+    A newer turn in the same thread suppresses its previous failure; ties
+    conservatively suppress it too. Silence never creates a failure.
+
+    mode=ro preserves WAL visibility (immutable=1 would miss live WAL rows).
+    No writes, migrations, explicit locks, or busy waits; the short SQLite
+    read transaction closes each tick. Missing schema/JSON support, locks,
+    corruption, or any other exception must never break the watcher.
+    """
+    try:
+        if now is None:
+            now = time.time()
+        uri = Path(CODEX_THREAD_HISTORY_DB).absolute().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0)) as conn:
+            # Bound work on unexpectedly large/internal-schema databases.
+            conn.set_progress_handler(lambda: 1, 2_000_000)
+            row = conn.execute(
+                """
+                SELECT CASE WHEN json_valid(f.error_json) THEN
+                    CASE json_extract(f.error_json, '$.codexErrorInfo')
+                        WHEN 'usageLimitExceeded' THEN 'usage_limited'
+                        WHEN 'rateLimitExceeded' THEN 'rate_limit'
+                        WHEN 'badRequest' THEN 'invalid_request'
+                        WHEN 'unauthorized' THEN 'authentication_failed'
+                        WHEN 'serverOverloaded' THEN 'codex_overloaded'
+                        WHEN 'internalServerError' THEN 'codex_server_error'
+                        ELSE CASE WHEN
+                            json_type(f.error_json,
+                                '$.codexErrorInfo.httpConnectionFailed') = 'object'
+                            OR json_type(f.error_json,
+                                '$.codexErrorInfo.responseStreamConnectionFailed') = 'object'
+                            OR json_type(f.error_json,
+                                '$.codexErrorInfo.responseStreamDisconnected') = 'object'
+                            OR json_type(f.error_json,
+                                '$.codexErrorInfo.responseTooManyFailedAttempts') = 'object'
+                            THEN 'codex_connection_error' ELSE 'unknown' END
+                    END
+                END
+                FROM thread_turns AS f
+                WHERE f.status = 'failed'
+                  AND typeof(f.completed_at) = 'integer'
+                  AND typeof(f.started_at) = 'integer'
+                  AND f.started_at <= f.completed_at
+                  AND f.completed_at BETWEEN ? AND ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM thread_turns AS newer
+                      WHERE newer.thread_id = f.thread_id
+                        AND newer.turn_id != f.turn_id
+                        AND (newer.started_at >= f.started_at
+                             OR newer.started_at IS NULL)
+                  )
+                ORDER BY f.completed_at DESC, f.thread_id, f.turn_id
+                LIMIT 1
+                """,
+                (now - CODEX_FAILED_FRESH_SEC, now),
+            ).fetchone()
+            return str(row[0]) if row and row[0] is not None else None
+    except Exception:
+        return None
+
+
 # ── "task complete" flag (Pink-2026-08-30) ──────────────────────────────
 # Unlike every other flag above (all driven by claude_pet_hook.py off a
 # real Claude Code hook event), this one is written by scripts/
@@ -820,24 +1045,94 @@ def claude_session_label(session_id: str) -> str | None:
     return tail or None
 
 
-def claude_session_tty(session_id: str) -> str | None:
-    """Controlling terminal of the process running this session.
+CLAUDE_SESSION_TTY_DIR = os.path.join(
+    os.path.expanduser("~"), ".squid-pet", "claude_session_tty"
+)
 
-    Matches by comparing each live claude process's encoded cwd against the
-    session's project directory -- which is what makes "take me to it"
-    correct with several sessions running, where the hook payload's missing
-    PID otherwise leaves it guessing.
+
+def claude_session_recorded_tty(session_id: str) -> str | None:
+    """The controlling tty the hook recorded for this session, or None.
+
+    Authoritative: the hook that writes it is a child of the exact session
+    process, so it shares that session's controlling terminal. This is what
+    disambiguates two sessions sharing a cwd (one in Terminal, one in
+    Cursor) that the cwd match below cannot. Best-effort -- a session
+    whose tty was never recorded (older session, detached spawn) just
+    returns None and the caller falls back to the cwd match."""
+    if not session_id:
+        return None
+    try:
+        with open(os.path.join(CLAUDE_SESSION_TTY_DIR, session_id)) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def claude_session_proc(session_id: str) -> "psutil.Process | None":
+    """The live claude process running this session.
+
+    Two matches, strongest first, because "which process is this session"
+    is the crux of taking you to the right window with several sessions
+    running:
+
+      1. RECORDED TTY (authoritative). The hook stamped this session's
+         controlling terminal; the one live claude process on that tty IS
+         this session. Exact even when two sessions share a directory --
+         the Pink-2026-09-16 wrong-window bug (a failed Cursor turn's
+         concerned double-click raised a same-cwd Terminal session).
+      2. ENCODED CWD (fallback). No recorded tty (older/detached session):
+         match the session's project directory. Correct whenever sessions
+         live in distinct directories; ambiguous only in the same-cwd case
+         (1) is there to resolve.
+
+    Both the session's tty and the app hosting it are resolved through this
+    one process, so they can never disagree about which session they mean.
     """
+    procs = find_claude_code_processes()
+    rec_tty = claude_session_recorded_tty(session_id)
+    if rec_tty:
+        for proc in procs:
+            try:
+                if proc.terminal() == rec_tty:
+                    return proc
+            except Exception:
+                continue
     enc = claude_session_project_dir(session_id)
     if not enc:
         return None
-    for proc in find_claude_code_processes():
+    for proc in procs:
         try:
             if encode_project_dir(proc.cwd()) == enc:
-                return proc.terminal()
+                return proc
         except Exception:
             continue
     return None
+
+
+def claude_session_tty(session_id: str) -> str | None:
+    """Controlling terminal of the process running this session."""
+    proc = claude_session_proc(session_id)
+    if proc is None:
+        return None
+    try:
+        return proc.terminal()
+    except Exception:
+        return None
+
+
+def find_terminal_app_bundle_for_session(session_id: str) -> str | None:
+    """The terminal/IDE app hosting a SPECIFIC session, resolved through
+    that session's own process.
+
+    Companion to claude_session_tty: the tty tells "take me there" which
+    tab, this tells it which app. Both come from the same claude_session_proc
+    match, so a failed session in Cursor is never raised as the Terminal.app
+    session that merely happened to be found first (Pink-2026-09-16 bug:
+    double-clicking the concerned face landed in the wrong window). Returns
+    None when the session's process can't be located -- the caller then
+    falls back to the session-blind lookup, no worse than before.
+    """
+    return _terminal_app_bundle_for_proc(claude_session_proc(session_id))
 
 
 def describe_waiting_sessions(session_ids: list[str]) -> str | None:
@@ -1270,6 +1565,7 @@ class StateMachine:
         awaiting_sessions_raw = claude_sessions_awaiting_input()
         awaiting_sessions_raw = self._self_heal_stale_claude_flags(
             st, now, awaiting_sessions_raw)
+        self._apply_failure_override(st, now)
         self._apply_approval_override(
             st, now, awaiting_sessions_raw, notify=notify)
         self._apply_force_state_override(st)
@@ -1489,6 +1785,38 @@ class StateMachine:
             # gets a fresh ping.
             self._approval_alert_fired = False
             self._approval_notification_token = None
+
+    def _apply_failure_override(self, st: PetState, now: float) -> None:
+        # ── CONCERNED OVERRIDE (Pink-2026-09-16) ─────────────────────
+        # Claude Code's StopFailure hook reported the current turn ended on
+        # an API error (usage/rate limit, overload, auth/billing, ...).
+        # Layer "concerned" over whatever the cascade picked, from the
+        # hook-written flag file -- the same override shape as
+        # approval_needed, and applied JUST BEFORE it so a genuine pending
+        # approval still wins (an errored turn and a pending permission
+        # prompt are near-mutually-exclusive, but approval stays the prime
+        # "act now" state). Never inferred from silence: only a real
+        # StopFailure flag or explicit Codex failed-turn row reaches here.
+        # A dblclick "I saw it" (acknowledge_concern -> dismiss_concern)
+        # snoozes this override for CONCERN_DISMISS_SEC.
+        if now < _concern_dismissed_until:
+            return
+        error_type = claude_freshest_failure(now)
+        source = "claude StopFailure"
+        # Preserve Claude priority; only consult Codex when its detector is
+        # enabled. The process may already have exited after the failure.
+        if (error_type is None and self._codex_detector is not None
+                and getattr(self._codex_detector, "enabled", False)):
+            error_type = codex_freshest_failure(now)
+            source = "codex failed turn"
+        if error_type is None:
+            return
+        reason, severity = concern_for_error_type(error_type)
+        st.state = "concerned"
+        st.concern_reason = reason
+        st.concern_severity = severity
+        st.state_reason = f"{source} ({error_type})"
+        st.message = f"⚠️ {reason}"
 
     def _apply_force_state_override(self, st: PetState) -> None:
         # ── FORCE-STATE OVERRIDE (test/demo) ─────────────────────────

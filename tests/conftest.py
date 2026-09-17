@@ -10,6 +10,8 @@ def isolate_codex_wait_markers(tmp_path, monkeypatch):
                         str(tmp_path / 'codex_awaiting_input'))
     monkeypatch.setattr(watcher, '_CODEX_SESSION_FLAG_FIRST_SEEN', {})
 
+    monkeypatch.setattr(watcher, "CODEX_THREAD_HISTORY_DB",
+                        tmp_path / "thread_history_1.sqlite")
 
 @pytest.fixture(autouse=True)
 def isolate_codex_turns(tmp_path, monkeypatch):

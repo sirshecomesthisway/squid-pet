@@ -40,22 +40,33 @@ config, outside this repo).
 | Reads (via stdin, from Claude Code itself) | What for |
 |-------|----------|
 | `session_id` | names the flag file; the only identifier Claude Code's hook payload provides (no PID) |
-| `hook_event_name` | branches behavior: write on `Notification`, remove on `UserPromptSubmit`/`SessionEnd` |
+| `hook_event_name` | branches behavior: write on `Notification`/`Stop`/`StopFailure`, remove on `UserPromptSubmit`/`SessionEnd` |
 | `notification_type` (Notification events only) | only `permission_prompt` creates a flag; every other value, `idle_prompt` included, is ignored |
+| `error_type` (StopFailure events only) | the error CATEGORY (e.g. `rate_limit`, `billing_error`) that ended the turn -- drives the concerned/warning sprite. A bounded enum, never message text |
 
 | Writes | What for |
 |--------|----------|
 | `~/.squid-pet/claude_awaiting_input/<session_id>` (content: the notification_type string) | direct signal: this Claude Code session is waiting on you right now |
+| `~/.squid-pet/claude_failed/<session_id>` (content: the error_type category) | direct signal: this session's turn ended on an API error (usage limit, overload, auth, billing, ...) -- shows "concerned". Never contains message text |
+| `~/.squid-pet/claude_session_tty/<session_id>` (content: a `/dev/ttysNNN` string) | lets "take me there" raise the exact terminal/tab a signal came from, rather than guessing by working directory (which cannot tell apart two sessions in the same folder). A terminal device number only -- not the working directory, project name, or any content. Removed on `SessionEnd` |
 | `~/.squid-pet/claude_hook.log` (one line per hook invocation, auto-truncated past 200KB) | lets you verify the hook is actually firing -- `tail -f` it while using Claude Code |
 
 Does NOT read: the `message` field's human-readable text, `transcript_path`,
-`cwd`, `prompt_id`, or any other field Claude Code's hook payload
-includes beyond the three above; does not read transcript file contents,
+`cwd`, `prompt_id`, `last_assistant_message`, or any other field Claude
+Code's hook payload includes beyond the fields above; does not read
+transcript file contents,
 prompt/response text, or tool call arguments/results. Never imports the
 `squid_pet` package and has
 zero dependencies beyond the Python stdlib, so a bug in squid-pet proper
 can't affect it (or vice versa) -- it's wired up and torn down entirely
 through `~/.claude/settings.json`.
+
+To fill `claude_session_tty/` the hook runs `ps -Ao pid=,ppid=,tty=` once
+per event and walks the parent chain up to its own `claude` process to read
+that session's terminal (Claude Code spawns hooks without a controlling
+terminal of their own). It requests only three process-table columns --
+pid, parent pid, and tty -- never command lines, arguments, environments, or
+any other process's details beyond those numbers.
 
 Two self-heal reads in `watcher.py` back this mechanism, both metadata-only:
 `StateMachine.compute()` deletes a flag outright the moment its own
@@ -149,6 +160,56 @@ Does NOT read: transcript file contents, prompt/response text, tool call
 arguments or results, `~/.codex/history/` prompt-recall content,
 `~/.codex/` auth tokens or config, or the contents of any file under
 `project_dirs`.
+
+### Codex failed-turn signal — `watcher.codex_freshest_failure()`
+
+When the Codex detector is enabled, Squid queries
+`$CODEX_HOME/thread_history_1.sqlite` (default `~/.codex/thread_history_1.sqlite`)
+using a read-only SQLite URI. This is a direct failure signal, never a guess
+from a silent or stalled turn. No new hooks or network calls are involved.
+
+| Fields examined inside SQLite | What for |
+|-------|----------|
+| `thread_turns.status` | requires exactly `failed`; running, interrupted, and completed turns cannot trigger concern |
+| `thread_id`, `turn_id`, `started_at` | suppress a failure when another turn has started in the same thread; identifiers are not returned or persisted |
+| `completed_at` | Unix seconds; select the freshest failure within five minutes, excluding future timestamps |
+| `error_json` → `$.codexErrorInfo` | SQL maps a string enum or a known tagged-object key to a fixed, bounded category constant |
+
+Only the normalized category leaves SQLite. Squid never selects the raw
+`error_json`, `error.message`, `additionalDetails`, tagged-object payloads,
+`thread_items`, or transcript contents. Unknown categories on an explicit
+failed row yield a generic concern; malformed JSON or an incompatible schema
+is a safe no-op. SQLite necessarily processes database pages and the JSON
+container to extract the category; the application never receives that
+container or its free text. The category determines the existing concerned
+reason/severity presentation. Usage exhaustion is `hard`; rate limits,
+server overload, and connection failures are `transient`. Pending approval
+still takes priority, and the existing Claude failure path is preserved.
+
+The connection uses `mode=ro`, zero busy timeout, a bounded query instruction
+budget, and closes each tick. It performs no writes, migrations, or explicit
+locking. SQLite's normal short read transaction sees live WAL rows;
+`immutable=1` is deliberately avoided because it would miss those rows.
+Any open/query failure returns no signal. Squid does not query `goals_1.sqlite`:
+a goal status alone is not proof that a turn failed.
+
+Validated against installed codex-cli **0.153.4** and the real `~/.codex`
+schema on 2026-09-16. A throwaway invalid-model `codex exec` attempt timed
+out after 40 seconds without a terminal row. A subsequent invalid-provider-URL
+request produced genuine `failed` rows with `codexErrorInfo: "other"` from
+both `codex exec` and standalone `codex app-server`; no model generation or
+quota exhaustion was needed. Their `started_at`/`completed_at` values were
+Unix seconds. Validation used an isolated temporary Codex home and working
+directory, not project or existing conversation state.
+
+Terminal exec persistence is verified. IDE coverage applies to app-server
+clients writing this same local database; an actual IDE UI was not exercised.
+Remote, ephemeral, custom database-location, and other-version coverage is
+not guaranteed. This versioned schema is internal and may change; unsupported
+schemas fail closed. Extremely large histories can exceed the query budget
+and produce no signal; the real schema has no status/time index. Coverage
+includes a synthetic 70,000-turn history. Synthetic-row tests exercise usage limits and other
+categories without requiring live account failures.
 
 ### GitDetector — observes git activity
 
