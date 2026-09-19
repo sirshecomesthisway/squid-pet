@@ -60,6 +60,17 @@ DEFAULTS: dict[str, Any] = {
     # Stop hook) pinning her to "thinking" for up to an hour. See watcher.py's
     # branch 4c / TURN_STALL_SEC_DEFAULT.
     "turn_stall_sec": 180,
+    # Pink-2026-09-19 (feat/pancake-flip-long-working): once the CURRENT
+    # continuous "working" stretch has lasted at least this many seconds,
+    # the frontend swaps the static working.png for the 20-frame
+    # "Squid flipping a pancake" cycle ("this one's really cooking"). This
+    # is a PRESENTATION variant of the existing `working` state -- same
+    # detection, bubbles, transitions -- only the artwork differs. Reset
+    # to zero every time she leaves working; a "still working" reannounce
+    # refresh does NOT reset it. Default 1h. Shorten it (e.g. edit
+    # ~/.squid-pet/config.json to {"long_working_threshold_sec": 30}) to
+    # eyeball the animation without waiting an hour; tests patch it too.
+    "long_working_threshold_sec": 3600,
 }
 
 
@@ -128,6 +139,14 @@ def toggle_muted() -> bool:
     new_val = not is_muted()
     set("muted", new_val)
     return new_val
+
+def long_working_threshold_sec() -> float:
+    """Seconds a continuous 'working' stretch must last before the frontend
+    plays the pancake-flip animation instead of the static working sprite.
+    Named accessor mirroring is_muted()/approval_alert_enabled() so callers
+    (window.PetApi) and tests share one tunable source of truth."""
+    return float(get("long_working_threshold_sec", 3600))
+
 
 def approval_alert_enabled() -> bool:
     """Approval-needed notification + sticky bubble (default ON)."""

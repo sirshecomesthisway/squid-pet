@@ -633,6 +633,13 @@ def get_visible_frame() -> tuple[float, float, float, float] | None:
 
 
 class PetApi:
+    # CLASS-level default so instances built via PetApi.__new__() -- the
+    # fixture pattern used across tests/ to skip the real __init__ (which
+    # would spin up a window/menu/watcher thread) -- still carry it.
+    # update() reads it on EVERY tick, so without this default every such
+    # test AttributeErrors. __init__ still sets the instance attribute.
+    _working_since: float | None = None
+
     def __init__(self) -> None:
         self._latest = watcher.PetState()
         self._lock = threading.Lock()
@@ -702,6 +709,15 @@ class PetApi:
         # "Still working on X" periodic refresh (see _maybe_reannounce_working).
         self._last_working_bubble_at: float = 0.0
         self._last_working_bubble_text: str = ""
+        # Timestamp (PetState.timestamp) at which the CURRENT continuous
+        # working stretch began, or None when not working. Drives the
+        # long-running "pancake flip" presentation variant of `working`
+        # (see _is_long_working / get_state's long_working field). Set only
+        # on an actual transition INTO working and cleared on the transition
+        # OUT -- the periodic "still working" reannounce refresh runs on the
+        # same-state branch below and deliberately never touches it, so a
+        # long stretch keeps counting from its true start.
+        self._working_since: float | None = None
         self._observer = observer.Observer(get_muted=config.is_muted)
 
     def signal_ready(self) -> dict:
@@ -732,6 +748,17 @@ class PetApi:
             shown = self._forced_state or state.state
         if self._passthrough:
             self._passthrough.set_state(shown)
+        # Continuous-working duration tracking for the pancake-flip variant.
+        # Only actual transitions touch _working_since: entering working
+        # stamps the start, leaving working clears it. The "still working"
+        # reannounce refresh takes the same-state branch below and never
+        # runs this, so it can't reset the clock (that distinction is the
+        # whole point -- a reannounce is not a new working stretch).
+        if prev_state != state.state:
+            if state.state == "working":
+                self._working_since = state.timestamp
+            elif prev_state == "working":
+                self._working_since = None
         # Observer: fire on actual state transitions only
         if prev_state != state.state:
             # Pink-2026-08-27k: was hardcoded None -- the original wiring
@@ -815,6 +842,26 @@ class PetApi:
         self._last_working_bubble_text = bubble
         self._set_pending_bubble(bubble, BUBBLE_PRIO_AMBIENT)
 
+    def _is_long_working(self) -> bool:
+        """True when the CURRENT continuous working stretch has lasted at
+        least config.long_working_threshold_sec(). Surfaced to the frontend
+        as get_state()['long_working']; the frontend uses it to swap the
+        static working sprite for the pancake-flip animation. Purely a
+        presentation signal -- it never changes which backend state is
+        reported, only how `working` is drawn.
+
+        Duration is measured from PetState timestamps (entry stamp vs the
+        latest tick's stamp), the same monotonic clock the reannounce
+        throttle uses, so it needs no wall-clock read and stays trivially
+        testable."""
+        if self._working_since is None:
+            return False
+        latest = self._latest
+        if latest.state != "working":
+            return False
+        elapsed = latest.timestamp - self._working_since
+        return elapsed >= config.long_working_threshold_sec()
+
     def _wake(self, duration_sec: float) -> None:
         """Force a wake-from-drowsy/sleeping stretch transition (frontend
         watches wake_trigger_seq) and hold her awake-faced for duration_sec
@@ -877,6 +924,11 @@ class PetApi:
         if self._wrapper_deg_override is not None:
             d["wrapper_deg"] = self._wrapper_deg_override
         d["wake_trigger_seq"] = self._wake_trigger_seq
+        # Presentation flag for the pancake-flip variant of `working`: True
+        # once the current continuous working stretch passes the threshold.
+        # Computed under the same lock context as the state read above via
+        # _is_long_working (reads self._latest/_working_since only).
+        d["long_working"] = self._is_long_working()
         # User-interaction wake override (poke/sprint take prime over agent-idle counter)
         d["user_wake_remaining"] = max(0.0, self._user_wake_until - _time.time())
         d["sprint_fast_transition"] = self._sprint_fast_transition
