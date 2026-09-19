@@ -104,6 +104,14 @@
 
     @keyframes working-shake { 0%,100%{transform:translate(-50%,-50%) translateX(0);} 25%{transform:translate(-50%,-50%) translateX(-1.5px);} 75%{transform:translate(-50%,-50%) translateX(1.5px);} }
     .pet[data-state="working"] { animation: working-shake 0.18s linear infinite; }
+    /* Long-running "pancake flip" variant of working: the flip is carried
+       entirely by the 20-frame sprite cycle (startPancakeFlip), so the
+       body-shake would fight it -- drop the shake and hold her centred while
+       the frames animate. Set via pet.dataset.longworking (see poll()). */
+    .pet[data-state="working"][data-longworking="1"] {
+      animation: none;
+      transform: translate(-50%,-50%);
+    }
 
     @keyframes grooving-bounce { 0%,100%{transform:translate(-50%,-50%) translateY(0) rotate(-5deg);} 25%{transform:translate(-50%,-50%) translateY(-10px) rotate(5deg);} 50%{transform:translate(-50%,-50%) translateY(0) rotate(-5deg);} 75%{transform:translate(-50%,-50%) translateY(-5px) rotate(5deg);} }
     .pet[data-state="grooving"] { animation: grooving-bounce 0.5s ease-in-out infinite; }
@@ -824,6 +832,96 @@
       pet.style.transform = "";
     }
 
+    /* ─────── Long-running working: the pancake-flip cycle ───────
+       Once the CURRENT continuous working stretch passes the backend
+       threshold (config long_working_threshold_sec, default 1h),
+       get_state() reports long_working=true and `working` is drawn as
+       this 20-frame cycle instead of the static working.png -- "this one
+       is really cooking". PRESENTATION ONLY: the backend state is still
+       plain `working`, so detection, bubbles, transitions and the menu
+       are all inherited untouched.
+
+       Frames 1..20 are a closed loop (frame 20 wraps seamlessly back to
+       1) and Squid's body sits at exactly her idle.png position/scale in
+       every one, so the swap in and out never moves or resizes her. */
+    const PANCAKE_FRAMES = Array.from(
+      { length: 20 }, (_, i) => `sprites/pancake_flip_${i + 1}.png`);
+    const PANCAKE_FRAME_MS = 125;   // 8fps -> 2.5s per loop (~0.6s airtime/flip)
+    let _longWorking   = false;     // latest backend flag
+    let _pancakeActive = false;
+    let _pancakeTimer  = null;
+    let _pancakeIdx    = 0;
+    let _pancakeReady  = null;      // null=untried, Promise<bool> once probed
+
+    // Preload every frame before the first cycle: avoids a flicker on the
+    // opening loop, and doubles as the existence check -- if any frame is
+    // missing we never start, and she just keeps the static working sprite
+    // (same spirit as spriteUrl's idle.png fallback: never show a broken img).
+    function _pancakePreload() {
+      if (_pancakeReady) return _pancakeReady;
+      _pancakeReady = Promise.all(PANCAKE_FRAMES.map(src => new Promise(res => {
+        const im = new Image();
+        im.onload  = () => res(true);
+        im.onerror = () => res(false);
+        im.src = src;
+      }))).then(oks => {
+        const ok = oks.every(Boolean);
+        if (!ok) console.warn("[squid] pancake_flip frames missing -- keeping static working sprite");
+        return ok;
+      });
+      return _pancakeReady;
+    }
+
+    function startPancakeFlip() {
+      if (_pancakeActive) return;
+      _pancakeActive = true;
+      _pancakePreload().then(ok => {
+        // Bail if the frames are unusable, or if we left working while loading.
+        if (!ok || !_pancakeActive) { _pancakeActive = false; return; }
+        _pancakeIdx = 0;
+        setSpriteSrcDirect(PANCAKE_FRAMES[0]);
+        _pancakeTimer = setInterval(() => {
+          if (!_pancakeActive) return;
+          // The mood (drowsy/sleeping/stretch) and sub-state (walk/look)
+          // layers own the sprite while active -- skip the tick instead of
+          // fighting them, exactly as the attention cycler does.
+          if (_mood === "drowsy" || _mood === "sleeping" || _mood === "stretch") return;
+          if (pet.dataset.substate) return;
+          _pancakeIdx = (_pancakeIdx + 1) % PANCAKE_FRAMES.length;
+          setSpriteSrcDirect(PANCAKE_FRAMES[_pancakeIdx]);
+        }, PANCAKE_FRAME_MS);
+      });
+    }
+
+    function stopPancakeFlip() {
+      if (!_pancakeActive) return;
+      _pancakeActive = false;
+      if (_pancakeTimer) { clearInterval(_pancakeTimer); _pancakeTimer = null; }
+      // Hand the sprite back to whatever state we are in now, unless another
+      // layer already owns it.
+      if (_mood === "drowsy" || _mood === "sleeping" || _mood === "stretch") return;
+      if (pet.dataset.substate) return;
+      setSpriteSrcDirect(spriteUrl(currentState));
+    }
+
+    // Single source of truth for "should the flip be running right now?",
+    // driven by the (state, long_working) pair. Called on every poll tick and
+    // from setState, so either input changing is picked up.
+    function syncPancakeFlip() {
+      const want = currentState === "working" && _longWorking;
+      if (want === _pancakeActive) {
+        pet.dataset.longworking = want ? "1" : "";
+        return;
+      }
+      if (want) {
+        pet.dataset.longworking = "1";   // CSS drops working-shake (it would fight)
+        startPancakeFlip();
+      } else {
+        pet.dataset.longworking = "";
+        stopPancakeFlip();
+      }
+    }
+
     function enterDrowsy() {
       if (_mood === "drowsy") return;
       _mood = "drowsy";
@@ -1158,7 +1256,11 @@
             window.pywebview.api.signal_ready().catch(() => {});
           }
           const result = await window.pywebview.api.get_state();
+          // Long-running working variant: read the flag BEFORE setState so a
+          // state change and a flag change settle in the same tick.
+          _longWorking = result?.long_working === true;
           setState(result?.state || "idle");
+          syncPancakeFlip();
           applySubState(result?.sub_state || "");
           // PetState.message (backend's short per-state caption, e.g.
           // "🛠️ running shell") was computed every tick but never
