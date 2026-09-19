@@ -161,11 +161,19 @@ def test_non_working_state_is_never_long_working():
 
 
 def test_default_threshold_is_one_hour():
-    """The shipped default is 1h so real long stretches trip it, not short
-    ones. (Manual override: ~/.squid-pet/config.json long_working_threshold_sec.)"""
+    """The shipped default is 1h so only genuinely long stretches trip it.
+
+    Deliberately does NOT assert the *live* value: that reads the developer's
+    own ~/.squid-pet/config.json, so this used to fail on any machine where
+    the setting had been tuned (e.g. shortened to eyeball the animation).
+    Patch get() to ignore user config and return the caller's fallback, which
+    is what pins the accessor's own default."""
+    from unittest.mock import patch as _patch
+
     from squid_pet import config
     assert config.DEFAULTS["long_working_threshold_sec"] == 3600
-    assert config.long_working_threshold_sec() == 3600
+    with _patch("squid_pet.config.get", side_effect=lambda key, default=None: default):
+        assert config.long_working_threshold_sec() == 3600
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -281,3 +289,42 @@ def test_chef_hat_is_visible_against_a_white_desktop():
             f"frame {i}: hat top edge luminance {lum:.0f} is too pale to read "
             f"against a white desktop -- the outline is missing"
         )
+
+
+def test_sprite_url_yields_to_the_running_pancake_cycle():
+    """Regression (2026-09-19): several layers restore the "base sprite" by
+    calling setSpriteSrcDirect(spriteUrl(currentState)) -- applySubState does
+    it on EVERY poll tick when there is no sub-state. While the pancake cycle
+    is running that resolved to working.png and stomped the animation, so she
+    visibly alternated between flipping a pancake and standing still.
+
+    spriteUrl() must therefore hand back the frame currently on screen for
+    `working`, and it must do so BEFORE the generic `sprites/${state}.png`
+    return or the guard is dead code."""
+    text = INDEX_HTML.read_text()
+    m = re.search(r"function spriteUrl\(state\)\s*\{(.*?)\n    \}", text, re.S)
+    assert m, "could not find spriteUrl() in index.html"
+    body = m.group(1)
+    guard = body.find("_pancakeSrc")
+    generic = body.find("VALID.has(state)")
+    assert guard != -1, "spriteUrl() no longer yields to the pancake cycle"
+    assert generic != -1
+    assert guard < generic, (
+        "the pancake guard must come BEFORE spriteUrl's generic return, "
+        "otherwise working.png wins and the animation is stomped again"
+    )
+
+
+def test_pancake_cycle_releases_sprite_ownership_when_it_stops():
+    """The flip side of the guard above: stopPancakeFlip must clear
+    _pancakeSrc *before* restoring, or spriteUrl would keep handing back a
+    stale pancake frame after she has left working."""
+    text = INDEX_HTML.read_text()
+    m = re.search(r"function stopPancakeFlip\(\)\s*\{(.*?)\n    \}", text, re.S)
+    assert m, "could not find stopPancakeFlip() in index.html"
+    body = m.group(1)
+    release = body.find("_pancakeSrc = null")
+    restore = body.find("setSpriteSrcDirect(spriteUrl(currentState))")
+    assert release != -1, "stopPancakeFlip no longer releases _pancakeSrc"
+    assert restore != -1
+    assert release < restore, "ownership must be released before the restore"
