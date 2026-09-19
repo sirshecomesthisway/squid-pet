@@ -186,7 +186,7 @@ from squid_pet import watcher
 FRONTEND_DIR = Path(watcher.__file__).parent / "frontend"
 INDEX_HTML = FRONTEND_DIR / "index.html"
 SPRITES_DIR = FRONTEND_DIR / "sprites"
-PANCAKE_FRAME_COUNT = 20
+PANCAKE_FRAME_COUNT = 24
 
 
 def _frame(i: int) -> Path:
@@ -256,8 +256,28 @@ def test_squid_keeps_her_size_and_only_bobs_by_whole_cells():
 
 
 def test_the_loop_closes():
-    """Frame 20 must hand back to frame 1 seamlessly, otherwise the cycle
-    visibly pops once every 2.5s."""
+    """The last frame must hand back to frame 1 seamlessly, otherwise the cycle
+    visibly pops once every 3s."""
     first = Image.open(_frame(1)).convert("RGBA")
     last = Image.open(_frame(PANCAKE_FRAME_COUNT)).convert("RGBA")
     assert first.tobytes() == last.tobytes()
+
+
+def test_chef_hat_is_visible_against_a_white_desktop():
+    """The toque is near-white, so without a border it disappears on a white
+    background (she is composited straight onto the desktop). Guard the
+    outline: the topmost pixel of the sprite is the hat's crown, and it must
+    be meaningfully darker than white or the hat has lost its border."""
+    for i in (1, PANCAKE_FRAME_COUNT // 2, PANCAKE_FRAME_COUNT):
+        im = Image.open(_frame(i)).convert("RGBA")
+        alpha = im.getchannel("A")
+        top_y = min(y for y in range(im.height)
+                    if any(alpha.getpixel((x, y)) > 128 for x in range(im.width)))
+        row = [im.getpixel((x, top_y)) for x in range(im.width)
+               if alpha.getpixel((x, top_y)) > 128]
+        # Luminance of the hat's top edge -- the outline, not the white crown.
+        lum = min(0.299 * r + 0.587 * g + 0.114 * b for r, g, b, _ in row)
+        assert lum < 200, (
+            f"frame {i}: hat top edge luminance {lum:.0f} is too pale to read "
+            f"against a white desktop -- the outline is missing"
+        )

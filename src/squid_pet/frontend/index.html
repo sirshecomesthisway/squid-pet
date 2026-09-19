@@ -841,12 +841,12 @@
        plain `working`, so detection, bubbles, transitions and the menu
        are all inherited untouched.
 
-       Frames 1..20 are a closed loop (frame 20 wraps seamlessly back to
+       Frames 1..24 are a closed loop (frame 24 wraps seamlessly back to
        1) and Squid's body sits at exactly her idle.png position/scale in
        every one, so the swap in and out never moves or resizes her. */
     const PANCAKE_FRAMES = Array.from(
-      { length: 20 }, (_, i) => `sprites/pancake_flip_${i + 1}.png`);
-    const PANCAKE_FRAME_MS = 125;   // 8fps -> 2.5s per loop (~0.6s airtime/flip)
+      { length: 24 }, (_, i) => `sprites/pancake_flip_${i + 1}.png`);
+    const PANCAKE_FRAME_MS = 125;   // 8fps -> 3.0s per loop (~0.6s airtime/flip)
     let _longWorking   = false;     // latest backend flag
     let _pancakeActive = false;
     let _pancakeTimer  = null;
