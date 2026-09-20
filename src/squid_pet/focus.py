@@ -265,8 +265,7 @@ def _focus_claude_state(state: str,
     bundle = None
     if sid:
         try:
-            from .watcher import (claude_session_tty,
-                                  find_terminal_app_bundle_for_session)
+            from .watcher import claude_session_tty, find_terminal_app_bundle_for_session
             # Resolve BOTH the tab (tty) and the app (bundle) through the one
             # session that caused the state. Resolving the app separately, as
             # _raise's session-blind fallback does, can name a different
