@@ -128,16 +128,20 @@ def handle(payload: dict, root: Path) -> None:
             for path in flags.glob(prefix + 'async.*'):
                 path.unlink(missing_ok=True)
                 (flags / ('.owner.' + path.name)).unlink(missing_ok=True)
-            # A new main turn supersedes any approval cohort left behind by
-            # a lost Stop/PostToolUse hook. Codex does not run concurrent
-            # main turns in one session; leaving those markers alive makes a
-            # completed approval wave reappear on the next turn.
-            for path in flags.glob(prefix + '*'):
-                if '.async.' not in path.name:
-                    path.unlink(missing_ok=True)
-                    (flags / ('.owner.' + path.name)).unlink(missing_ok=True)
-            for path in flags.glob('.permissions.' + prefix.rstrip('.') + '.*'):
-                path.unlink(missing_ok=True)
+            # A new main turn supersedes approval cohorts left by lost
+            # Stop/PostToolUse hooks, but preserve the cohort for this turn.
+            # A missing turn_id cannot establish ordering, so it clears none.
+            current_prefix = prefix + digest(turn) + '.' if isinstance(turn, str) and turn else None
+            current_ledger = ('.permissions.' + current_prefix.rstrip('.')
+                              if current_prefix else None)
+            if current_prefix:
+                for path in flags.glob(prefix + '*'):
+                    if '.async.' not in path.name and not path.name.startswith(current_prefix):
+                        path.unlink(missing_ok=True)
+                        (flags / ('.owner.' + path.name)).unlink(missing_ok=True)
+                for path in flags.glob('.permissions.' + prefix.rstrip('.') + '.*'):
+                    if path.name != current_ledger:
+                        path.unlink(missing_ok=True)
             return
         if event == 'PostToolUse' and tool == 'request_user_input_async':
             response = payload.get('tool_response')
@@ -190,6 +194,9 @@ def handle(payload: dict, root: Path) -> None:
         if count <= 0:
             path.unlink(missing_ok=True)
             (flags / ('.owner.' + path.name)).unlink(missing_ok=True)
+            ledger = flags / ('.permissions.' + prefix.rstrip('.'))
+            if not any(flags.glob(prefix + '*')):
+                ledger.unlink(missing_ok=True)
         else:
             # Atomic publication: the watcher never sees a partial flag.
             temp = flags / ('.' + path.name)
