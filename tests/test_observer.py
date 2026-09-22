@@ -240,7 +240,7 @@ def test_celebrating_names_git_deterministically(obs):
     result = obs.on_state_change(
         "idle", "celebrating", state_reason="git celebrating",
     )
-    assert result == "nice, fresh commit!"
+    assert result == "git activity!"
 
 
 def test_celebrating_falls_back_to_generic_mood_pick_when_unspecific(obs):
@@ -265,7 +265,7 @@ def test_celebrating_reason_is_deterministic_not_probabilistic(obs):
         obs.on_state_change("working", "celebrating", state_reason="git celebrating")
         for _ in range(20)
     }
-    assert results == {"nice, fresh commit!"}
+    assert results == {"git activity!"}
 
 
 # ----------------------------------------------------------------------
