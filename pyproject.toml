@@ -30,7 +30,7 @@ packages = ["src/squid_pet"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short --strict-config --strict-markers"
 pythonpath = ["src"]
 
 [tool.ruff]
@@ -65,4 +65,5 @@ files = [
     "src/squid_pet/focus.py",
     "src/squid_pet/routine.py",
     "src/squid_pet/doctor.py",
+    "tools/verify_sprites.py",
 ]
