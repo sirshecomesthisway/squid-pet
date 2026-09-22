@@ -1196,6 +1196,11 @@ class StateMachine:
         # Hold "working" for working_hold_sec between tool calls
         # so Squid does not flicker to "thinking" in LLM-gen gaps.
         self.working_hold_until = 0.0
+        # Keep the exact owner that caused the working stretch available
+        # through the short hold after its shell child exits. Without this,
+        # a double-click during that generation gap can lose provenance and
+        # return no destination even though the agent is still active.
+        self._working_focus_target: dict | None = None
         # Pink-2026-09-04: awake hold. A wake -- poke, sprint, or the
         # 15-min periodic auto-wake -- used to live entirely in PetApi
         # (wake_trigger_seq + user_wake_until), which only the frontend
@@ -1837,7 +1842,12 @@ class StateMachine:
                 self.working_hold_until = now + _work_hold
                 st.state = "working"
                 st.state_reason = _working_reason()
-                st.focus_target = working_target()
+                target = working_target()
+                if target is not None:
+                    self._working_focus_target = target
+                elif self._last_state != "working":
+                    self._working_focus_target = None
+                st.focus_target = target or self._working_focus_target
                 st.message = "🛠️ running shell"
                 return st
             # 4a-prime: STICKY WORKING -- LLM-gen gap, recent work + still busy.
@@ -1846,7 +1856,12 @@ class StateMachine:
             ):
                 st.state = "working"
                 st.state_reason = f"working hold ({int(self.working_hold_until - now)}s left)"
-                st.focus_target = streaming_target()
+                target = streaming_target()
+                if target is not None:
+                    self._working_focus_target = target
+                elif self._last_state != "working":
+                    self._working_focus_target = None
+                st.focus_target = target or self._working_focus_target
                 st.message = "✨ working"
                 return st
             # 4b. THINKING -- Claude Code's / Codex's transcript-write-

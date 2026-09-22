@@ -100,3 +100,50 @@ def test_claude_snapshot_does_not_switch_to_new_codex_wait(monkeypatch):
     assert focus.focus_for_snapshot(state, run=lambda script: seen.append(script) or 'app-only') == 'app-only'
     assert seen
     assert 'ttysCLAUDE' in seen[0]
+
+
+def test_working_hold_preserves_owner_after_shell_quiets(monkeypatch):
+    """A working sprite remains tied to the process that started its hold.
+
+    The shell can finish while the agent is still generating; losing the
+    exact owner at that boundary made a double-click return ``none``.
+    """
+    owner = {'pid': 456, 'created': 50}
+
+    class FakeCodex:
+        name = 'codex'
+        enabled = True
+        codex_running = True
+        shell_active = True
+        shell_owner = owner
+        file_active = False
+        streaming = False
+        transcript_path = None
+
+        def is_busy(self, _now):
+            return self.shell_active or self.streaming
+
+        def is_celebrating(self, _now):
+            return False
+
+    monkeypatch.setattr(watcher, 'macos_idle_seconds', lambda: 0.0)
+    monkeypatch.setattr(watcher, 'CLAUDE_AWAITING_INPUT_DIR', '/nonexistent')
+    monkeypatch.setattr(watcher, 'CLAUDE_FINISHED_DIR', '/nonexistent')
+    monkeypatch.setattr(watcher, 'CLAUDE_TASK_COMPLETE_DIR', '/nonexistent')
+    monkeypatch.setattr(watcher, 'CLAUDE_TURN_ACTIVE_DIR', '/nonexistent')
+    monkeypatch.setattr(watcher, 'claude_sessions_awaiting_input', lambda: [])
+    monkeypatch.setattr(watcher, 'codex_requests_awaiting_input', lambda: [])
+    monkeypatch.setattr(watcher.time, 'time', lambda: 1_000.0)
+    monkeypatch.setattr(codex_turns, 'active_turns', lambda _now: [])
+
+    detector = FakeCodex()
+    machine = watcher.StateMachine(detectors=[detector])
+    first = machine.compute(notify=False)
+    assert first.focus_target == {'agent': 'codex', 'owner': owner}
+
+    detector.shell_active = False
+    detector.streaming = True
+    machine.working_hold_until = 1_025.0
+    second = machine.compute(notify=False)
+    assert second.state == 'working'
+    assert second.focus_target == {'agent': 'codex', 'owner': owner}
