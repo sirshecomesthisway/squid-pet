@@ -89,7 +89,29 @@ startup/lifecycle mechanics on its runner image, not those experiences.
 
 ## Validation record
 
-Hosted runs and any observed limitations are recorded in the PR. The native run exposed a logging bug: `StreamHandler()` used stderr while
+On 2026-09-22, commit `06933b7` passed two complete three-run matrices on
+macOS 15.7.9 / arm64 (Python 3.13.15): [native run and repeat attempt](https://github.com/sirshecomesthisway/squid-pet/actions/runs/35704914676).
+All six clean installs reached final shutdown; all 18 health intervals
+recorded 16 distinct watcher ticks. Launchd counts were verified as 1 → 2 → 1.
+All 36 window captures were produced. The first matrix's images decoded as
+200×300 RGBA and showed the expected representative artwork on inspection;
+raw pixel hashes varied across runs, confirming that pixel gating is premature.
+Six successful jobs are initial repeatability evidence, not proof of no flakes.
+
+Earlier runs exposed two harness defects (shallow Git history could not seed
+the installer repository, and the JSON doctor flag was misspelled). Both were
+corrected without retries or longer startup delays. Independent review also
+caught hidden launchd crash retries, missing post-interval window checks, and
+optional screenshot timeouts being treated as health failures; all were fixed
+with regression coverage. Logs/artifacts from the failed runs were usable.
+
+Local validation: Ruff, mypy (9 explicit targets), 44 sprites, Cocoa static
+audit, 60 targeted tests, and full pytest (965 tests) passed. The first local
+baseline had two `--why` CLI timeouts; subsequent unchanged full runs passed.
+Those tests still read live system state and retain their original 15s limit.
+Python CI passed on both 3.11 and 3.13. No personal app was restarted to test CI.
+
+The native run exposed a logging bug: `StreamHandler()` used stderr while
 doctor reads stdout. A regression test reproduces the missing markers; the
 minimal fix explicitly selects `sys.stdout`, matching the existing logging
 contract. App rendering, detection, and lifecycle behavior remain unchanged.
