@@ -99,6 +99,12 @@ def test_user_reply_clears_only_own_async_questions(tmp_path, reply_turn):
     assert len(before) == 5
     remaining = set(send(tmp_path, 'UserPromptSubmit', turn=reply_turn))
     expected_removed = {p for p in before
-                        if p.name.startswith(module.digest('session-a') + '.async.')}
-    assert len(expected_removed) == 2
+                        if p.name.startswith(module.digest('session-a') + '.')}
+    assert len(expected_removed) == 3
     assert remaining == before - expected_removed
+
+
+def test_new_main_turn_clears_old_approval_cohort(tmp_path):
+    send(tmp_path, 'PermissionRequest', session='s', turn='old-turn')
+    send(tmp_path, 'UserPromptSubmit', session='s', turn='new-turn')
+    assert not list((tmp_path / 'codex_awaiting_input').glob('[!.]*'))

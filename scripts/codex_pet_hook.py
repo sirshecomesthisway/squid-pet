@@ -128,6 +128,16 @@ def handle(payload: dict, root: Path) -> None:
             for path in flags.glob(prefix + 'async.*'):
                 path.unlink(missing_ok=True)
                 (flags / ('.owner.' + path.name)).unlink(missing_ok=True)
+            # A new main turn supersedes any approval cohort left behind by
+            # a lost Stop/PostToolUse hook. Codex does not run concurrent
+            # main turns in one session; leaving those markers alive makes a
+            # completed approval wave reappear on the next turn.
+            for path in flags.glob(prefix + '*'):
+                if '.async.' not in path.name:
+                    path.unlink(missing_ok=True)
+                    (flags / ('.owner.' + path.name)).unlink(missing_ok=True)
+            for path in flags.glob('.permissions.' + prefix.rstrip('.') + '.*'):
+                path.unlink(missing_ok=True)
             return
         if event == 'PostToolUse' and tool == 'request_user_input_async':
             response = payload.get('tool_response')
