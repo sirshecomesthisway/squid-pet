@@ -296,3 +296,23 @@ revive the previous episode's queued notification. macOS controls delivery
 once a notification has been submitted: AppleScript provides no request ID
 with which Squid can retract its already-submitted banner. OS notification
 queueing, Focus settings and audible/banner timing still need a real Mac check.
+
+
+### Codex approval click targeting
+
+Pending Codex requests now have an opaque `.owner.<request-hash>` companion
+containing only the owning PID and process creation time. Completion removes it
+with the final reference; turn/session cleanup removes matching companions.
+Click targeting validates that identity, reads its live controlling TTY and
+walks its executable/app ancestry. It does not store window titles or terminal
+contents. Requests created before this update can use their exact turn marker
+as identity evidence; there is no fallback to an arbitrary agent process.
+
+While Codex requests are pending, approval double-clicks target the newest
+Codex request. Terminal.app must expose an exact matching TTY tab before Squid
+activates/selects anything. Unknown/exited owners, missing tabs and unsupported
+hosts return `none` rather than activating an unrelated window. Other terminal
+hosts need a future exact-tab adapter; Claude-only routing remains as before.
+A resolved wave with no remaining Claude or Codex request also opens nothing.
+Real multi-window Terminal focus and OS Automation permissions need a local
+Mac check; fixtures verify the selected identity and generated AppleScript.

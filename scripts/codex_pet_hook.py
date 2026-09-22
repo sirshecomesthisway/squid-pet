@@ -67,6 +67,16 @@ def codex_owner() -> dict | None:
     return None
 
 
+def record_owner(flags: Path, name: str) -> None:
+    owner = codex_owner()
+    if owner is None:
+        return
+    path = flags / ('.owner.' + name)
+    temp = path.with_name(path.name + '.tmp')
+    temp.write_text(json.dumps(owner))
+    temp.replace(path)
+
+
 def update_turn(root: Path, session: str, turn, event: str) -> None:
     directory = root / 'codex_turn_active'
     directory.mkdir(parents=True, exist_ok=True)
@@ -114,6 +124,7 @@ def handle(payload: dict, root: Path) -> None:
             # A reply may start a new turn; leave separate tool approvals alone.
             for path in flags.glob(prefix + 'async.*'):
                 path.unlink(missing_ok=True)
+                (flags / ('.owner.' + path.name)).unlink(missing_ok=True)
             return
         if event == 'PostToolUse' and tool == 'request_user_input_async':
             response = payload.get('tool_response')
@@ -126,6 +137,7 @@ def handle(payload: dict, root: Path) -> None:
             if (isinstance(response, dict) and response.get('accepted') is True
                     and isinstance(call_id, str) and call_id):
                 path = flags / (prefix + 'async.' + digest(call_id))
+                record_owner(flags, path.name)
                 temp = flags / ('.' + path.name)
                 temp.write_text('1')
                 temp.replace(path)
@@ -134,6 +146,8 @@ def handle(payload: dict, root: Path) -> None:
             prefix += digest(turn) + '.'
         if event in {'Stop', 'Interrupt', 'SessionEnd'}:
             for path in flags.glob(prefix + '*'):
+                path.unlink(missing_ok=True)
+            for path in flags.glob('.owner.' + prefix + '*'):
                 path.unlink(missing_ok=True)
             for path in flags.glob('.permissions.' + prefix.rstrip('.') + '*'):
                 path.unlink(missing_ok=True)
@@ -156,11 +170,13 @@ def handle(payload: dict, root: Path) -> None:
         except (OSError, ValueError):
             count = 0
         if event in {'PermissionRequest', 'PreToolUse'}:
+            record_owner(flags, path.name)
             count += 1
         else:
             count -= 1
         if count <= 0:
             path.unlink(missing_ok=True)
+            (flags / ('.owner.' + path.name)).unlink(missing_ok=True)
         else:
             # Atomic publication: the watcher never sees a partial flag.
             temp = flags / ('.' + path.name)
