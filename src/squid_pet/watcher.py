@@ -1845,9 +1845,9 @@ class StateMachine:
                 target = working_target()
                 if target is not None:
                     self._working_focus_target = target
-                elif self._last_state != "working":
+                else:
                     self._working_focus_target = None
-                st.focus_target = target or self._working_focus_target
+                st.focus_target = target
                 st.message = "🛠️ running shell"
                 return st
             # 4a-prime: STICKY WORKING -- LLM-gen gap, recent work + still busy.

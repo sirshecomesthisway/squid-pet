@@ -121,7 +121,7 @@ def test_working_hold_preserves_owner_after_shell_quiets(monkeypatch):
         transcript_path = None
 
         def is_busy(self, _now):
-            return self.shell_active or self.streaming
+            return self.shell_active or self.file_active or self.streaming
 
         def is_celebrating(self, _now):
             return False
@@ -147,3 +147,44 @@ def test_working_hold_preserves_owner_after_shell_quiets(monkeypatch):
     second = machine.compute(notify=False)
     assert second.state == 'working'
     assert second.focus_target == {'agent': 'codex', 'owner': owner}
+
+
+def test_unattributed_file_activity_clears_finished_owner(monkeypatch):
+    """A later generic write must not keep routing clicks to an old shell."""
+    owner = {'pid': 456, 'created': 50}
+
+    class FakeCodex:
+        name = 'codex'
+        enabled = True
+        codex_running = True
+        shell_active = True
+        shell_owner = owner
+        file_active = False
+        streaming = False
+        transcript_path = None
+
+        def is_busy(self, _now):
+            return self.shell_active or self.file_active or self.streaming
+
+        def is_celebrating(self, _now):
+            return False
+
+    monkeypatch.setattr(watcher, 'macos_idle_seconds', lambda: 0.0)
+    monkeypatch.setattr(watcher, 'CLAUDE_AWAITING_INPUT_DIR', '/nonexistent')
+    monkeypatch.setattr(watcher, 'CLAUDE_FINISHED_DIR', '/nonexistent')
+    monkeypatch.setattr(watcher, 'CLAUDE_TASK_COMPLETE_DIR', '/nonexistent')
+    monkeypatch.setattr(watcher, 'CLAUDE_TURN_ACTIVE_DIR', '/nonexistent')
+    monkeypatch.setattr(watcher, 'claude_sessions_awaiting_input', lambda: [])
+    monkeypatch.setattr(watcher, 'codex_requests_awaiting_input', lambda: [])
+    monkeypatch.setattr(watcher.time, 'time', lambda: 1_000.0)
+    monkeypatch.setattr(codex_turns, 'active_turns', lambda _now: [])
+
+    detector = FakeCodex()
+    machine = watcher.StateMachine(detectors=[detector])
+    assert machine.compute(notify=False).focus_target == {'agent': 'codex', 'owner': owner}
+
+    detector.shell_active = False
+    detector.file_active = True
+    second = machine.compute(notify=False)
+    assert second.state == 'working'
+    assert second.focus_target is None
