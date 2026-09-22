@@ -69,19 +69,17 @@ def _codex_detector(shell_active):
     return type('FakeCodex', (), {'name': 'codex', 'shell_active': shell_active})()
 
 
-def test_codex_wait_clears_once_approved_command_runs(flags):
-    # Codex fires no hook when the human grants approval; the only evidence
-    # is the approved command actually executing (a live shell child under
-    # Codex). When that shows up, stop the wave instead of holding it for the
-    # whole command runtime.
+def test_codex_wait_survives_unrelated_command_activity(flags):
+    # A shell child can belong to another request/session. Wait for the
+    # matching completion hook rather than erase an unrelated pending wait.
     import os
     marker = flags / 'request-a'
     marker.touch()
     os.utime(marker, (time.time() - 5, time.time() - 5))  # past self-heal min age
     sm = machine()
     sm._codex_detector = _codex_detector(shell_active=True)
-    assert sm.compute(notify=False).state == 'working'
-    assert not marker.exists()
+    assert sm.compute(notify=False).state == 'approval_needed'
+    assert marker.exists()
 
 
 def test_codex_wait_persists_while_awaiting_approval(flags):

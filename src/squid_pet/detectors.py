@@ -166,6 +166,7 @@ class ClaudeCodeDetector:
                 self.project_dirs, self.FILE_ACTIVE_WINDOW_SEC, self._scan_now)
         )
         self._transcript_activity_cache: dict = {}
+        self._process_ids: frozenset[int] = frozenset()
         self._candidates: list = []
         self._candidates_at: float = 0.0
         self._last_scan_ts: float = 0.0
@@ -271,7 +272,8 @@ class ClaudeCodeDetector:
             mtime = stat.st_mtime
             if now - mtime < self.STREAMING_STALE_SEC:
                 mtime = self._transcript_activity_mtime(f, stat)
-            newest_mtime = max(newest_mtime, mtime)
+            if mtime <= now:
+                newest_mtime = max(newest_mtime, mtime)
         if newest_mtime == 0.0:
             return float("inf")
         return max(0.0, now - newest_mtime)
@@ -283,6 +285,10 @@ class ClaudeCodeDetector:
         # _lazy_defaults() guarantees these are resolved to real callables.
         assert self._find_processes is not None and self._aggregate_cpu is not None
         procs = self._find_processes()
+        process_ids = frozenset(p.pid for p in procs if hasattr(p, "pid"))
+        if process_ids != self._process_ids:
+            self._candidates = []  # a new/replaced session may have a new transcript
+            self._process_ids = process_ids
         self.claude_code_running = bool(procs)
         self.cpu_percent = round(
             self._aggregate_cpu(procs) if procs else 0.0, 1
@@ -293,7 +299,7 @@ class ClaudeCodeDetector:
         self._scan_now = now
         self.file_active = bool(self._recent_file_ages()) if procs else False
         self.transcript_age = self._newest_transcript_age(now)
-        self.streaming = self.transcript_age < self.STREAMING_STALE_SEC
+        self.streaming = bool(procs) and self.transcript_age < self.STREAMING_STALE_SEC
         self._last_scan_ts = now
 
     def is_busy(self, now: float) -> bool:
@@ -400,6 +406,7 @@ class CodexDetector:
             lambda: _recent_file_ages_for_tick(
                 self.project_dirs, self.FILE_ACTIVE_WINDOW_SEC, self._scan_now)
         )
+        self._process_ids: frozenset[int] = frozenset()
         self._candidates: list = []
         self._candidates_at: float = 0.0
         self._last_scan_ts: float = 0.0
@@ -445,7 +452,8 @@ class CodexDetector:
                 mtime = self._stat(str(f)).st_mtime
             except OSError:
                 continue
-            newest_mtime = max(newest_mtime, mtime)
+            if mtime <= now:
+                newest_mtime = max(newest_mtime, mtime)
         if newest_mtime == 0.0:
             return float("inf")
         return max(0.0, now - newest_mtime)
@@ -457,6 +465,10 @@ class CodexDetector:
         # _lazy_defaults() guarantees these are resolved to real callables.
         assert self._find_processes is not None and self._aggregate_cpu is not None
         procs = self._find_processes()
+        process_ids = frozenset(p.pid for p in procs if hasattr(p, "pid"))
+        if process_ids != self._process_ids:
+            self._candidates = []  # a new/replaced session may have a new transcript
+            self._process_ids = process_ids
         self.codex_running = bool(procs)
         self.cpu_percent = round(
             self._aggregate_cpu(procs) if procs else 0.0, 1
@@ -467,7 +479,7 @@ class CodexDetector:
         self._scan_now = now
         self.file_active = bool(self._recent_file_ages()) if procs else False
         self.transcript_age = self._newest_transcript_age(now)
-        self.streaming = self.transcript_age < self.STREAMING_STALE_SEC
+        self.streaming = bool(procs) and self.transcript_age < self.STREAMING_STALE_SEC
         self._last_scan_ts = now
 
     def is_busy(self, now: float) -> bool:
@@ -595,6 +607,10 @@ class GitDetector:
             head_age = now - self._mtime(head) if self._mtime(head) else float("inf")
             index_age = now - self._mtime(index) if self._mtime(index) else float("inf")
             refs_age = now - self._mtime(refs_heads) if self._mtime(refs_heads) else float("inf")
+            # Future metadata is clock skew, not evidence of activity now.
+            head_age = head_age if head_age >= 0 else float("inf")
+            refs_age = refs_age if refs_age >= 0 else float("inf")
+            index_age = index_age if index_age >= 0 else float("inf")
             if head_age < self.BUSY_WINDOW_SEC:
                 any_celeb = True
                 celeb_reason = f"HEAD touched in {git_dir.parent.name} ({head_age:.1f}s ago)"
@@ -779,7 +795,7 @@ def _scan_recent_file_ages(
                     m = stat_fn(os.path.join(dirpath, fn)).st_mtime
                 except OSError:
                     continue
-                if m >= cutoff:
+                if cutoff <= m <= now:
                     ages.append(now - m)
                     if len(ages) >= max_files:
                         return ages
@@ -935,7 +951,7 @@ class IDEDetector:
         across project_dirs. Capped at 200 files and depth 5 to stay cheap.
         Skips junk dirs."""
         return _recent_file_ages_for_tick(
-            self.project_dirs, window_sec, self._scan_now)
+            self.project_dirs, window_sec, self._scan_now or time.time())
 
     def _scan(self, now: float) -> None:
         # Same once-per-tick guard as ClaudeCodeDetector/CodexDetector.
@@ -1009,7 +1025,9 @@ def build_detectors(settings: dict | None = None) -> list:
     never actually run on this machine). A settings.json carrying a
     leftover trigger key for it is harmless -- unknown keys are ignored.
     """
-    s = (settings or {}).get("triggers", {}) if settings else {}
+    s = settings.get("triggers", {}) if isinstance(settings, dict) else {}
+    if not isinstance(s, dict):
+        s = {}
     project_dirs = s.get("project_dirs", DEFAULT_TRIGGERS["project_dirs"])
     ide_processes = s.get("ide_processes", DEFAULT_TRIGGERS["ide_processes"])
     detectors = [

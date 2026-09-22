@@ -672,7 +672,7 @@ def test_usage_limit_stall_falls_to_idle(monkeypatch, tmp_path):
     turn_dir = tmp_path / "claude_turn_active"
     sm = _claude_machine(monkeypatch, transcript_age_sec=300.0,
                          turn_active_dir=str(turn_dir))
-    _write_flag(turn_dir, "sess-1", 1_000_000.0 - 30.0)
+    _write_flag(turn_dir, "sess-1", 1_000_000.0 - 300.0)
 
     st = sm.compute()
     assert st.state == "idle", (
@@ -700,7 +700,7 @@ def test_turn_stall_sec_is_config_tunable(monkeypatch, tmp_path):
     turn_dir = tmp_path / "claude_turn_active"
     sm = _claude_machine(monkeypatch, transcript_age_sec=60.0,
                          turn_active_dir=str(turn_dir))
-    _write_flag(turn_dir, "sess-1", 1_000_000.0 - 30.0)
+    _write_flag(turn_dir, "sess-1", 1_000_000.0 - 60.0)
 
     # 60s silent > 30s configured stall -> idle
     st = sm.compute()

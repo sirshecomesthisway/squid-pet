@@ -37,6 +37,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import stat as stat_module
 import subprocess
 import time
 from collections.abc import Callable
@@ -514,19 +516,9 @@ CLAUDE_AWAITING_INPUT_DIR = os.path.join(
 )
 CLAUDE_AWAITING_INPUT_STALE_SEC = 7200.0  # 2h -- crashed-session disk cleanup only
 _CLAUDE_SESSION_SNOOZE_SEC = 120.0  # once seen & deferred this long, quiet down until it re-arms
-# Pink-2026-08-31: minimum flag age before self-heal (below) may reap it.
-# Real bug caught live during a demo: a flag written THIS tick (e.g. from
-# a permission_prompt Notification) could be self-healed away on the SAME
-# tick if the underlying cascade state already read working/thinking --
-# e.g. Claude Code still visibly streaming/active right as the prompt is
-# raised. Result: approval_needed never fired even once, not even for a
-# single tick -- the "your turn" wave and OS notification silently never
-# happened for a genuinely-pending, freshly-raised prompt. Self-heal's
-# actual job is clearing a flag that's been stuck while Pink is ACTIVELY
-# WATCHING ongoing work resume -- not reaping something raised a moment
-# ago -- so it must not act until a flag has survived a few real poll
-# ticks (POLL_INTERVAL_SEC == 1.0) untouched.
-SELF_HEAL_MIN_FLAG_AGE_SEC = 3.0
+# Activity in another session (or a parallel tool) cannot resolve a wait.
+# Keep direct signals until a lifecycle event clears them, they are snoozed,
+# or their crash-safety expiry is reached.
 _CLAUDE_SESSION_FLAG_FIRST_SEEN: dict[str, float] = {}
 
 
@@ -557,8 +549,13 @@ def _scan_session_flag_dir(
             continue
         path = os.path.join(dir_path, name)
         try:
-            age = now - os.stat(path).st_mtime
+            metadata = os.stat(path)
+            if not stat_module.S_ISREG(metadata.st_mode):
+                continue
+            age = now - metadata.st_mtime
         except OSError:
+            continue
+        if age < 0:
             continue
         if age > stale_sec:
             try:
@@ -586,6 +583,7 @@ def claude_sessions_awaiting_input() -> list[str]:
 
 CODEX_AWAITING_INPUT_DIR = os.path.expanduser("~/.squid-pet/codex_awaiting_input")
 _CODEX_SESSION_FLAG_FIRST_SEEN: dict[str, float] = {}
+_DIRECT_SIGNAL_VERSIONS: dict[tuple[str, str], tuple[int, int]] = {}
 
 
 def codex_requests_awaiting_input() -> list[str]:
@@ -595,7 +593,8 @@ def codex_requests_awaiting_input() -> list[str]:
 
 
 def filter_eligible_codex_requests(request_ids: list[str]) -> list[str]:
-    return _filter_eligible_direct_signals(request_ids, _CODEX_SESSION_FLAG_FIRST_SEEN)
+    return _filter_eligible_direct_signals(
+        request_ids, _CODEX_SESSION_FLAG_FIRST_SEEN, CODEX_AWAITING_INPUT_DIR)
 
 
 # ── "just finished" flag (Pink-2026-08-27f: real Stop-hook signal) ─────
@@ -856,14 +855,14 @@ def describe_waiting_sessions(session_ids: list[str]) -> str | None:
     return f"{' + '.join(labels)} need you"
 
 
-def claude_turn_in_flight(now: float | None = None) -> bool:
+def claude_turn_in_flight(now: float | None = None, *, fresh_sec: float | None = None) -> bool:
     """True iff any Claude Code session is between UserPromptSubmit and
     Stop -- i.e. actively working on a turn, whether or not it has written
     anything to disk yet."""
     return bool(_scan_session_flag_dir(
         CLAUDE_TURN_ACTIVE_DIR,
         CLAUDE_TURN_ACTIVE_STALE_SEC,
-        CLAUDE_TURN_ACTIVE_STALE_SEC,
+        fresh_sec if fresh_sec is not None else CLAUDE_TURN_ACTIVE_STALE_SEC,
     ))
 
 
@@ -900,10 +899,11 @@ def filter_eligible_claude_sessions(session_ids: list[str]) -> list[str]:
     Also maintains _CLAUDE_SESSION_FLAG_FIRST_SEEN: records birth time for
     any new flag, evicts entries whose flag has gone away.
     """
-    return _filter_eligible_direct_signals(session_ids, _CLAUDE_SESSION_FLAG_FIRST_SEEN)
+    return _filter_eligible_direct_signals(
+        session_ids, _CLAUDE_SESSION_FLAG_FIRST_SEEN, CLAUDE_AWAITING_INPUT_DIR)
 
 
-def _filter_eligible_direct_signals(session_ids, first_seen_times) -> list[str]:
+def _filter_eligible_direct_signals(session_ids, first_seen_times, directory: str) -> list[str]:
     now = time.time()
     live = set(session_ids)
 
@@ -911,8 +911,22 @@ def _filter_eligible_direct_signals(session_ids, first_seen_times) -> list[str]:
                 if s not in live]:
         del first_seen_times[sid]
 
+    for key in list(_DIRECT_SIGNAL_VERSIONS):
+        if key[0] == directory and key[1] not in live:
+            del _DIRECT_SIGNAL_VERSIONS[key]
     eligible: list[str] = []
     for sid in session_ids:
+        try:
+            metadata = os.stat(os.path.join(directory, sid))
+        except OSError:
+            pass  # callers may supply a snapshot whose file has since vanished
+        else:
+            key = (directory, sid)
+            version = (metadata.st_ino, metadata.st_mtime_ns)
+            previous = _DIRECT_SIGNAL_VERSIONS.get(key)
+            if previous is not None and previous != version:
+                first_seen_times.pop(sid, None)
+            _DIRECT_SIGNAL_VERSIONS[key] = version
         first_seen = first_seen_times.setdefault(sid, now)
         if now - first_seen > _CLAUDE_SESSION_SNOOZE_SEC:
             continue
@@ -1017,31 +1031,42 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
         for p in procs:
             try:
                 for ch in p.children(recursive=True):
+                    name = ""
                     try:
                         name = (ch.name() or "").lower()
+                        if re.fullmatch(r"python\d+(?:\.\d+)*", name):
+                            name = "python"
                         if name not in SHELL_CHILD_NAMES:
                             continue
-                        # Name matched: a tool is running, whatever we
-                        # end up being able to report about it.
-                        active = True
+                        status = getattr(ch, "status", None)
+                        if status is not None and status() == psutil.STATUS_ZOMBIE:
+                            continue
+                        # Do not latch work if argv proves the child has exited.
                         if name in SHELL_WRAPPER_NAMES:
                             # Remember the wrapper's cmdline as a fallback,
                             # but keep walking in case the real tool child
                             # is also alive (a cleaner, bare cmdline).
                             cmd = ch.cmdline()
+                            active = True
                             if cmd:
                                 wrapper_cmdline = cmd
                             continue
                         cmdline = ch.cmdline()
+                        active = True
                         if cmdline:
                             return True, cmdline
-                    except (psutil.NoSuchProcess, psutil.AccessDenied,
-                            SystemError):
+                    except psutil.AccessDenied:
+                        # A readable matching name still proves existence when
+                        # only argv access is denied.
+                        if name in SHELL_CHILD_NAMES:
+                            active = True
+                        continue
+                    except (psutil.NoSuchProcess, SystemError):
                         # SystemError: psutil's macOS cmdline path can
                         # fail at the C layer -- that child is
                         # unreadable, the walk is not.
                         continue
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            except (psutil.NoSuchProcess, psutil.AccessDenied, SystemError):
                 continue
     except Exception:
         # Keep what we already proved -- the old bool function returned
@@ -1231,12 +1256,9 @@ class StateMachine:
         # Approval-needed is layered on AFTER the cascade, from Claude Code's
         # and Codex's own hook-written flag files. It OVERRIDES whatever the
         # cascade picked -- it is the only state that REQUIRES Pink to act.
-        # Self-heal runs first, clearing flags a hook failed to clear (see
-        # each helper's docstring for the live bugs that motivated them).
+        # Aggregate activity cannot prove which permission/question resolved.
+        # Only the correlated hook lifecycle, snooze, or expiry may clear waits.
         awaiting_sessions_raw = claude_sessions_awaiting_input()
-        awaiting_sessions_raw = self._self_heal_stale_claude_flags(
-            st, now, awaiting_sessions_raw)
-        self._self_heal_stale_codex_flags(now)
         self._apply_approval_override(
             st, now, awaiting_sessions_raw, notify=notify)
         self._apply_force_state_override(st)
@@ -1262,111 +1284,6 @@ class StateMachine:
             st.agent_idle_seconds = 0.0
             self._agent_idle_since = 0.0
         self._last_state = st.state
-
-    def _self_heal_stale_claude_flags(
-        self, st: PetState, now: float, awaiting_sessions_raw: list
-    ) -> list:
-        """Clear a Claude Code awaiting-input flag that a hook failed to clear,
-        returning the (possibly re-scanned) awaiting list."""
-        # ── STALE-FLAG SELF-HEAL ─────────────────────────────────────
-        # Pink-2026-08-27, real bug caught via live use: Claude Code's
-        # Notification hook fires permission_prompt and we
-        # latch a flag file, but if Claude resumes work WITHOUT the user
-        # submitting a fresh top-level prompt (approval granted some
-        # other way, auto-mode proceeding on its own, a multi-step
-        # agentic task continuing unattended), UserPromptSubmit/
-        # SessionEnd never fires to clear it -- the flag (and the wave +
-        # OS notification) stays stuck showing "your turn" even while
-        # you're actively watching it work.
-        #
-        # Self-heal: our OWN independently-verified activity signal
-        # (st.state == working/thinking, from real shell/file/streaming
-        # evidence -- nothing to do with the hook) is proof any pending
-        # wait has been resolved, regardless of which mechanism resolved
-        # it. Coarse -- aggregate across all Claude Code processes, not
-        # per-session, since the hook payload carries no PID to
-        # disambiguate which session is the one now active -- but far
-        # better than trusting a hook event that may simply never fire.
-        #
-        # Pink-2026-08-30: that coarseness has a real failure mode with
-        # multiple concurrent Claude Code sessions -- caught live: session
-        # A asked for a decision and was genuinely waiting, but session B
-        # (a different window, actively being used) was "working", so
-        # self-heal cleared session A's flag before approval_needed ever
-        # got a chance to fire (attention_needed should take PRIME, not
-        # get silently eaten). With 2+ processes alive there's no way to
-        # tell whose activity resolved whose wait, so self-heal now only
-        # runs when at most one Claude Code process is alive -- the exact
-        # single-session case ("you're actively watching it work",
-        # singular) it was designed for.
-        #
-        # awaiting_sessions_raw is only re-scanned from disk (a second
-        # syscall) when self-heal actually had something to clean up --
-        # the common case (nothing awaiting, or not working/thinking)
-        # needs just the one scan above. The re-scan itself is NOT
-        # optional when self-heal does run: individual os.unlink calls
-        # below can silently fail (caught per-file), so re-deriving from
-        # disk -- rather than assuming the whole loop succeeded and
-        # setting the list to [] -- is what keeps the APPROVAL-NEEDED
-        # block below correct if some entries didn't actually clear.
-        if (st.state in ("working", "thinking") and awaiting_sessions_raw
-                and len(find_claude_code_processes()) <= 1):
-            try:
-                for sid in awaiting_sessions_raw:
-                    path = os.path.join(CLAUDE_AWAITING_INPUT_DIR, sid)
-                    try:
-                        if now - os.stat(path).st_mtime < SELF_HEAL_MIN_FLAG_AGE_SEC:
-                            continue  # too fresh -- let it be seen at least once
-                    except OSError:
-                        continue
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
-                    _CLAUDE_SESSION_FLAG_FIRST_SEEN.pop(sid, None)
-            except Exception:
-                pass
-            awaiting_sessions_raw = claude_sessions_awaiting_input()
-        return awaiting_sessions_raw
-
-    def _self_heal_stale_codex_flags(self, now: float) -> None:
-        """Clear a Codex awaiting-input flag once the approved command is
-        actually running (codex.shell_active). Codex fires no hook when the
-        human grants approval -- only at command completion -- so the flag
-        would otherwise wave for the whole runtime of the approved command."""
-        # ── CODEX APPROVAL SELF-HEAL ─────────────────────────────────
-        # Pink-2026-09-13, caught live: unlike Claude Code, Codex fires NO
-        # hook at the moment the human GRANTS an approval. Its lifecycle is
-        # PreToolUse (model proposes -- BEFORE the permission gate) ->
-        # PermissionRequest (gate opens, we raise the flag) -> [approve] ->
-        # PostToolUse (only when the command FINISHES). So codex_pet_hook can
-        # only clear the flag at command completion, which left the "your
-        # turn" wave up for the entire runtime of an approved command (a 20s
-        # sleep waved ~20s past the click; a long build, minutes).
-        #
-        # The one honest signal that approval was granted is the approved
-        # command actually RUNNING: a live shell child under Codex
-        # (codex.shell_active). It is False the whole time the user is still
-        # deciding -- nothing runs behind the permission gate -- so clearing
-        # on it cannot eat a genuinely-pending approval (no false "stopped
-        # waving too early"). Residual wave is bounded by Codex's own
-        # approve->exec setup latency (~seconds), NOT by command duration.
-        # Same freshness guard as the Claude self-heal: never reap a flag so
-        # fresh it has not been shown at least once.
-        codex = self._codex_detector
-        if codex is not None and getattr(codex, "shell_active", False):
-            for req in codex_requests_awaiting_input():
-                path = os.path.join(CODEX_AWAITING_INPUT_DIR, req)
-                try:
-                    if now - os.stat(path).st_mtime < SELF_HEAL_MIN_FLAG_AGE_SEC:
-                        continue  # too fresh -- let it be seen at least once
-                except OSError:
-                    continue
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-                _CODEX_SESSION_FLAG_FIRST_SEEN.pop(req, None)
 
     def _apply_approval_override(
         self, st: PetState, now: float, awaiting_sessions_raw: list,
@@ -1613,58 +1530,10 @@ class StateMachine:
             timestamp=now,
         )
 
-        # ── 1. SLEEPING ── the AGENTS have been quiet, and none of them
-        # is busy right now.
-        # Pink-2026-08-27g: sleeping used to override EVERYTHING
-        # unconditionally ("regardless of any other signal", including
-        # active agent work). A user caught this looking wrong live:
-        # squid showed sleeping while Claude Code was actively working
-        # in the background, because the user had stepped away from the
-        # keyboard for 5+ minutes (easy to happen mid-session). Sleeping
-        # is about USER presence; working/thinking are about AGENT
-        # activity -- when the agent is genuinely busy, that should win,
-        # so squid doesn't misleadingly "doze" through real work. Reuses
-        # the exact same merged signals branch 4 below uses to decide
-        # working/thinking, so this can never disagree with what the
-        # rest of the cascade would call "busy".
-        agent_actively_busy = working_evidence_merged or streaming_merged
-        # Pink-2026-09-04: sleeping used to require the HUMAN to be away
-        # (macOS HID idle >= 5 min). That is the wrong question for a pet
-        # that watches agents: Pink sitting at the keyboard writing docs
-        # while nothing has run for an hour kept her wide awake, and a
-        # run finishing thirty seconds ago while Pink was out for lunch
-        # put her to sleep. She now dozes on the agents' own quiet.
-        # The clock is the one compute() already maintains for
-        # agent_idle_seconds: when she last left an active state. It is 0.0
-        # until compute() has run once -- reading that as a timestamp
-        # would mean "quiet since 1970" and sleep on the first tick.
+        # Sleep is evaluated only after every activity branch below. Otherwise
+        # an old idle clock swallows a new turn, recap, Git event, or IDE edit.
         agent_quiet_for = (now - self._agent_idle_since) if self._agent_idle_since else 0.0
-        # Pink-2026-09-03: finishing is news whether or not the human is
-        # at the keyboard. Sleeping is about USER presence; a completed
-        # task is AGENT activity, and agent busy-ness already suppresses
-        # sleeping (see the note above). Celebration sat on the wrong
-        # side of that fence: this branch returns before the celebrating
-        # branch below is ever evaluated, so a task that finished while
-        # the user was away for 5+ minutes was swallowed outright -- the
-        # marker's freshness window (celebrate_hold_sec, 20s) expired
-        # while squid dozed, and the completion was never announced.
         claude_task_complete = claude_task_marked_complete_recently(now)
-        celebration_pending = (
-            claude_task_complete
-            or codex_celebrating
-            or now < self.celebrate_until
-        )
-        # A live awake hold (see __init__) outranks the quiet clock. It
-        # deliberately does NOT reset _agent_idle_since: the spec requires
-        # agent_idle_seconds to keep reflecting real agent activity, so when
-        # the hold lapses she drops back to sleeping in the same tick the
-        # frontend's own threshold does -- no second stretch, no drift.
-        if (agent_quiet_for >= IDLE_THRESHOLD_SEC and not agent_actively_busy
-                and not celebration_pending and now >= self.awake_hold_until):
-            st.state = "sleeping"
-            st.state_reason = f"agents quiet {int(agent_quiet_for // 60)}m"
-            st.message = f"💤 idle {int(agent_quiet_for // 60)}m"
-            return st
 
         # claude_finished_age (set above) can't by itself tell "finished
         # this turn, more coming" from "finished the whole task" -- Stop
@@ -1681,12 +1550,9 @@ class StateMachine:
         # explicit marker Claude itself writes (scripts/
         # squid_task_complete.py) only when it judges the whole task, not
         # just this turn, done -- see claude_task_marked_complete_recently.
-        claude_resumed_work = claude_shell_active or claude_file_active
+        claude_resumed_work = working_evidence_merged or codex_streaming
         claude_just_stopped = claude_finished_age is not None and not claude_resumed_work
         claude_grooving_now = claude_just_stopped
-        # claude_task_complete is computed above, before the sleeping
-        # gate that now consults it -- recomputing here would scan the
-        # marker directory a second time for the same answer.
 
         # ── TURN EDGES (Pink-2026-09-01) ─────────────────────────────
         # A turn opening clears the per-turn latches; a turn closing is
@@ -1767,7 +1633,9 @@ class StateMachine:
         # at the exact moment the work finished -- observed live as
         # CELEBRATING 16:00:25-16:00:45 (the commit) followed immediately
         # by GROOVING at 16:00:45 (the Stop), for one single response.
-        if (claude_grooving_now or other_grooving()) and not self._celebrated_this_turn:
+        if ((claude_grooving_now and not turn_in_flight) or other_grooving()) and (
+            not self._celebrated_this_turn and not working_evidence_merged
+        ):
             st.state = "grooving"
             st.state_reason = "claude grooving" if claude_grooving_now else "creative burst"
             st.message = "🤸 creative burst"
@@ -1841,7 +1709,12 @@ class StateMachine:
             # transcript silence, stop claiming she is thinking and fall
             # through to idle. transcript_age needs no transcript CONTENT --
             # mtime only, same privacy stance as the rest of the detector.
-            if turn_in_flight and claude_transcript_age <= _turn_stall:
+            # UserPromptSubmit is activity even before the first transcript
+            # write. Silence expires relative to that new turn as well.
+            if claude_running and turn_in_flight and (
+                claude_transcript_age <= _turn_stall
+                or claude_turn_in_flight(now, fresh_sec=_turn_stall)
+            ):
                 st.state = "thinking"
                 st.state_reason = "claude turn in flight"
                 st.message = "🤔 thinking"
@@ -1852,6 +1725,12 @@ class StateMachine:
             st.state = "thinking"
             st.state_reason = "non-agent detector busy"
             st.message = "🤔 working"
+            return st
+
+        if agent_quiet_for >= IDLE_THRESHOLD_SEC and now >= self.awake_hold_until:
+            st.state = "sleeping"
+            st.state_reason = f"agents quiet {int(agent_quiet_for // 60)}m"
+            st.message = f"💤 idle {int(agent_quiet_for // 60)}m"
             return st
 
         # ── 6. Default -- idle/watching ──
