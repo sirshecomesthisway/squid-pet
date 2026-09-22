@@ -46,7 +46,8 @@ The harness then checks:
   leaves watcher data unchanged over three seconds.
 - `squid start` after stop repeats the full health test, then final shutdown.
 
-Readiness uses bounded condition polling. Failed boots are not retried;
+Readiness uses bounded condition polling. Launch counts must match the expected lifecycle transitions (1, 2, 1),
+and window/doctor health is rechecked after each survival interval. Failed boots are not retried;
 there are no unconditional startup sleeps or continue-on-error health gates.
 A missing GUI domain fails with diagnostics rather than silently replacing
 native coverage with unit tests. Each run uploads artifacts, even on failure.

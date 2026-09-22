@@ -11,6 +11,7 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +39,19 @@ def fresh_state(state: dict, now: float, after: float, expected: str | None = No
 def sprite_window(entries: list[dict], pid: int, width: int, height: int) -> dict | None:
     return next((w for w in entries if w["pid"] == pid and w["onscreen"]
                  and w["alpha"] > 0 and w["width"] == width and w["height"] == height), None)
+
+
+def verify_launchd(text: str, pid: int, runs: int) -> None:
+    actual_pid = re.search(r"^\s*pid = (\d+)$", text, re.MULTILINE)
+    actual_runs = re.search(r"^\s*runs = (\d+)$", text, re.MULTILINE)
+    if actual_pid is None or int(actual_pid[1]) != pid:
+        raise RuntimeError(f"launchd does not own expected pid {pid}")
+    if actual_runs is None or int(actual_runs[1]) != runs:
+        raise RuntimeError(f"unexpected launch count (expected {runs}); possible crash/restart: {text}")
+
+
+def native_healthy(window: dict, returncode: int, doctor: dict) -> bool:
+    return bool(window.get("sprite") and returncode == 0 and doctor.get("healthy") is True)
 
 
 def wait_for(label: str, probe: Callable[[], tuple[bool, Any]], timeout: float = 30) -> Any:
@@ -135,7 +149,7 @@ class Smoke:
                               "--windows", str(pid))
         return json.loads(result.stdout)
 
-    def startup(self, after: float, old_pid: int = 0) -> int:
+    def startup(self, after: float, old_pid: int = 0, runs: int = 1) -> int:
         def ready():
             pid = self.pid()
             state = read_json(self.state_dir / "state.json")
@@ -145,16 +159,19 @@ class Smoke:
         pid = evidence["pid"]
         self.assert_alive(pid)
         loaded = self.command("launchctl", "print", self.domain).stdout
-        if f"pid = {pid}\n" not in loaded:
-            raise RuntimeError(f"launchd does not own expected pid {pid}")
+        verify_launchd(loaded, pid, runs)
         def native_ready():
             self.assert_alive(pid)
             win = self.windows(pid)
             doctor = self.command(str(self.cli), "doctor", "--json", check=False)
             data = json.loads(doctor.stdout)
-            return bool(win["sprite"] and doctor.returncode == 0 and data.get("healthy")), data
+            return native_healthy(win, doctor.returncode, data), {"window": win, "doctor": data}
         wait_for("native window and doctor", native_ready)
         self.health(pid)
+        healthy, evidence = native_ready()
+        if not healthy:
+            raise RuntimeError(f"native health lost during survival interval: {evidence}")
+        verify_launchd(self.command("launchctl", "print", self.domain).stdout, pid, runs)
         status = self.command(str(self.cli), "status").stdout
         if "RUNNING" not in status or "TICKING" not in status or f"pid {pid}" not in status:
             raise RuntimeError(f"status did not report this healthy process: {status}")
@@ -192,11 +209,19 @@ class Smoke:
         win = self.windows(pid)["sprite"]
         if not win:
             raise RuntimeError(f"no native sprite window in {state}")
+        self.screenshot(state, win)
+
+    def screenshot(self, state: str, win: dict) -> None:
         # Diagnostic snapshots only: animations/mood overlays are intentionally live.
         target = self.artifacts / f"{state}.png"
-        capture = self.command("/usr/sbin/screencapture", "-x", "-o", f"-l{win['id']}",
-                               str(target), check=False)
-        self.note("screenshot", state=state, captured=capture.returncode == 0 and target.exists(),
+        try:
+            capture = self.command("/usr/sbin/screencapture", "-x", "-o", f"-l{win['id']}",
+                                   str(target), check=False, timeout=10)
+            captured = capture.returncode == 0 and target.exists()
+            reason = "captured" if captured else f"screencapture exit {capture.returncode}"
+        except subprocess.TimeoutExpired:
+            captured, reason = False, "screencapture timed out"
+        self.note("screenshot", state=state, captured=captured, reason=reason,
                   window=win, path=target.name)
 
     def stopped(self, pid: int) -> None:
@@ -260,7 +285,7 @@ class Smoke:
         self.stage = "restart"
         after = time.time()
         self.command(str(self.cli), "restart")
-        new_pid = self.startup(after, pid)
+        new_pid = self.startup(after, pid, runs=2)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:

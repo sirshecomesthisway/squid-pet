@@ -65,3 +65,62 @@ def test_wait_does_not_retry_an_assertion_failure():
         raise RuntimeError("process died")
     with pytest.raises(RuntimeError, match="process died"):
         smoke.wait_for("health", failed, timeout=10)
+
+
+def test_launchd_cannot_hide_a_failed_cold_boot():
+    with pytest.raises(RuntimeError, match="launch count"):
+        smoke.verify_launchd("\tpid = 42\n\truns = 2\n\tlast exit code = 2\n", 42, 1)
+    smoke.verify_launchd("\tpid = 42\n\truns = 1\n", 42, 1)
+    smoke.verify_launchd("\tpid = 43\n\truns = 2\n", 43, 2)
+
+
+def test_launchd_missing_count_or_wrong_pid_fails_closed():
+    for text in ["\tpid = 42\n", "\truns = 1\n\tpid = 99\n"]:
+        with pytest.raises(RuntimeError):
+            smoke.verify_launchd(text, 42, 1)
+
+
+def test_vanished_native_window_fails_even_when_doctor_passes():
+    assert not smoke.native_healthy({"sprite": None}, 0, {"healthy": True})
+    assert smoke.native_healthy({"sprite": {"id": 7}}, 0, {"healthy": True})
+
+
+def test_diagnostic_screenshot_timeout_is_recorded(tmp_path, monkeypatch):
+    import subprocess
+    harness = smoke.Smoke(tmp_path, tmp_path, tmp_path)
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args, 10)
+    monkeypatch.setattr(harness, "command", timeout)
+    harness.screenshot("working", {"id": 7})
+    assert harness.events[-1]["captured"] is False
+    assert "timed out" in harness.events[-1]["reason"]
+
+
+def test_startup_rejects_window_lost_during_health_interval(tmp_path, monkeypatch):
+    import subprocess
+    harness = smoke.Smoke(tmp_path, tmp_path, tmp_path)
+    harness.state_dir = tmp_path
+    (tmp_path / "pid").write_text("42")
+    (tmp_path / "state.json").write_text('{"timestamp": 100}')
+    monkeypatch.setattr(smoke.time, "time", lambda: 101)
+    monkeypatch.setattr(harness, "assert_alive", lambda pid: None)
+    monkeypatch.setattr(harness, "health", lambda pid: None)
+    windows = iter([{"sprite": {"id": 7}}, {"sprite": None}])
+    monkeypatch.setattr(harness, "windows", lambda pid: next(windows))
+    def command(*args, **kwargs):
+        if args[0] == "launchctl":
+            return subprocess.CompletedProcess(args, 0, "\tpid = 42\n\truns = 1\n")
+        return subprocess.CompletedProcess(args, 0, '{"healthy": true}')
+    monkeypatch.setattr(harness, "command", command)
+    with pytest.raises(RuntimeError, match="native health lost"):
+        harness.startup(99)
+
+
+def test_health_rejects_a_stalled_watcher(tmp_path, monkeypatch):
+    harness = smoke.Smoke(tmp_path, tmp_path, tmp_path)
+    harness.state_dir = tmp_path
+    (tmp_path / "state.json").write_text('{"timestamp": 94}')
+    monkeypatch.setattr(smoke.time, "time", lambda: 100)
+    monkeypatch.setattr(harness, "assert_alive", lambda pid: None)
+    with pytest.raises(RuntimeError, match="stopped ticking"):
+        harness.health(42)
