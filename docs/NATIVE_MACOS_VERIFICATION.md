@@ -92,7 +92,7 @@ startup/lifecycle mechanics on its runner image, not those experiences.
 On 2026-09-22, commit `06933b7` passed two complete three-run matrices on
 macOS 15.7.9 / arm64 (Python 3.13.15): [native run and repeat attempt](https://github.com/sirshecomesthisway/squid-pet/actions/runs/35704914676).
 All six clean installs reached final shutdown; all 18 health intervals
-recorded 16 distinct watcher ticks. Launchd counts were verified as 1 → 2 → 1.
+recorded at least 16 distinct watcher ticks. Launchd counts were verified as 1 → 2 → 1.
 All 36 window captures were produced. The first matrix's images decoded as
 200×300 RGBA and showed the expected representative artwork on inspection;
 raw pixel hashes varied across runs, confirming that pixel gating is premature.
