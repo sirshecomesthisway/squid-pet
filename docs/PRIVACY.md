@@ -316,3 +316,20 @@ hosts need a future exact-tab adapter; Claude-only routing remains as before.
 A resolved wave with no remaining Claude or Codex request also opens nothing.
 Real multi-window Terminal focus and OS Automation permissions need a local
 Mac check; fixtures verify the selected identity and generated AppleScript.
+
+### Active-state click provenance
+
+Each state snapshot carries an in-memory `focus_target` describing the
+evidence that won that tick. For Codex shell work it contains only the owning
+process ID and creation time; for a silent Codex turn it uses the same
+process-bound turn marker, and transcript activity is attributed only when its
+opaque transcript-path hash matches exactly one live turn marker. Project-file
+writes and ambiguous shared transcript activity deliberately carry no target.
+
+`take_me_there` consumes that snapshot rather than rescanning all live agents
+after the click. Codex targets validate the process identity again and select
+a matching Terminal.app TTY tab; Claude targets retain the existing app/tab
+resolver for compatibility with Cursor, iTerm and other hosts. If provenance is absent, the owner has exited,
+the PID was reused, or the host cannot provide exact tab selection, it returns
+`none`; it never substitutes an unrelated Claude or Codex session. Generic
+Git/IDE celebration and unsupported failure states likewise have no target.

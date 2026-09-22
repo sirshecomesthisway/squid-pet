@@ -22,8 +22,8 @@ def owner_alive(data: dict) -> bool:
         return False
 
 
-def turn_in_flight(now: float) -> bool:
-    active = False
+def active_turns(now: float) -> list[dict]:
+    active: list[dict] = []
     try:
         for path in TURN_DIR.glob('[!.]*'):
             try:
@@ -36,7 +36,7 @@ def turn_in_flight(now: float) -> bool:
                 if isinstance(updated, bool) or not isinstance(updated, (int, float)) or not 0 <= now - updated <= STALE_SEC:
                     continue
                 if owner_alive(data):
-                    active = True
+                    active.append({**data, 'key': path.name})
                 else:
                     # A dead owner's marker can never become valid again.
                     path.unlink(missing_ok=True)
@@ -45,3 +45,7 @@ def turn_in_flight(now: float) -> bool:
     except OSError:
         pass
     return active
+
+
+def turn_in_flight(now: float) -> bool:
+    return bool(active_turns(now))

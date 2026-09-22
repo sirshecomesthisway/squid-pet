@@ -135,6 +135,7 @@ class PetState:
     # state fired this tick. Surfaced in `squid why` + optionally used
     # as the bubble.
     state_reason: str = ""
+    focus_target: dict | None = None  # provenance of this snapshot, never a guessed workspace
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -981,7 +982,7 @@ def count_currently_waving_sessions() -> int:
 # Live tool-activity detection
 # ────────────────────────────────────────────────────────────────────────
 
-def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
+def shell_child_activity(procs, *, owner_out: dict | None = None) -> tuple[bool, list[str] | None]:
     """One descendant-tree walk yielding BOTH tool-activity signals:
     ``(shell_active, cmdline)``.
 
@@ -1012,9 +1013,21 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
     immediate child and the tool is a grandchild. Best-effort throughout:
     any failure returns what was already proven rather than raising.
     """
+    if owner_out is not None:
+        owner_out.clear()
+
+    def record_owner(proc) -> None:
+        if owner_out is not None and proc is not None:
+            try:
+                owner_out.update(pid=proc.pid, created=proc.create_time())
+            except Exception:
+                owner_out.clear()
+
     if not procs:
         return False, None
     active = False
+    any_owner = None
+    wrapper_owner = None
     wrapper_cmdline = None  # fallback when no real tool grandchild is caught
     try:
         import psutil
@@ -1028,6 +1041,7 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
                         # Name matched: a tool is running, whatever we
                         # end up being able to report about it.
                         active = True
+                        any_owner = p
                         if name in SHELL_WRAPPER_NAMES:
                             # Remember the wrapper's cmdline as a fallback,
                             # but keep walking in case the real tool child
@@ -1035,9 +1049,11 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
                             cmd = ch.cmdline()
                             if cmd:
                                 wrapper_cmdline = cmd
+                                wrapper_owner = p
                             continue
                         cmdline = ch.cmdline()
                         if cmdline:
+                            record_owner(p)
                             return True, cmdline
                     except (psutil.NoSuchProcess, psutil.AccessDenied,
                             SystemError):
@@ -1051,7 +1067,9 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
         # Keep what we already proved -- the old bool function returned
         # True the instant it matched, so a broken process object later
         # in the list could never undo it.
+        record_owner(wrapper_owner or any_owner)
         return active, wrapper_cmdline
+    record_owner(wrapper_owner or any_owner)
     return active, wrapper_cmdline
 
 
@@ -1377,6 +1395,13 @@ class StateMachine:
             st.state = "approval_needed"
             st.message = _text
             st.state_reason = fired_reason
+            st.focus_target = {"agent": "claude"}
+            if codex_waits:
+                try:
+                    request = max(codex_waits, key=lambda name: os.stat(os.path.join(CODEX_AWAITING_INPUT_DIR, name)).st_mtime)
+                    st.focus_target = {"agent": "codex", "request": request}
+                except OSError:
+                    st.focus_target = None
             # Fire OS notification ONCE per idle cycle
             if not self._approval_alert_fired:
                 self._approval_alert_fired = True
@@ -1422,6 +1447,7 @@ class StateMachine:
                 _forced = _force_file.read_text().strip()
                 if _forced:
                     st.state = _forced
+                    st.focus_target = None
                     st.state_reason = "force_state override (" + _forced + ")"
         except Exception:
             pass
@@ -1502,8 +1528,30 @@ class StateMachine:
             codex_streaming = False
             codex_celebrating = False
 
-        from .codex_turns import turn_in_flight as codex_turn_in_flight
-        codex_turn_active = codex_running and codex_turn_in_flight(now)
+        from .codex_approvals import digest
+        from .codex_turns import active_turns
+        codex_turn_records = active_turns(now) if codex_running else []
+        codex_turn_active = bool(codex_turn_records)
+
+        def codex_target(record) -> dict | None:
+            if not record:
+                return None
+            return {"agent": "codex", "owner": {"pid": record['pid'], "created": record['created']}}
+
+        def streaming_target() -> dict | None:
+            if claude_streaming:
+                return {"agent": "claude"}
+            path = getattr(codex, 'transcript_path', None)
+            matches = [r for r in codex_turn_records if path and r.get('transcript_key') == digest(path)]
+            owners = {(r['pid'], r['created']) for r in matches}
+            return codex_target(matches[0]) if len(owners) == 1 else None
+
+        def working_target() -> dict | None:
+            detector = claude if claude_shell_active else codex if codex_shell_active else None
+            owner = getattr(detector, 'shell_owner', None)
+            if not owner:
+                return None
+            return {"agent": "claude" if claude_shell_active else "codex", "owner": dict(owner)}
 
         # Merged signals feeding branch 4 below.
         #
@@ -1723,6 +1771,7 @@ class StateMachine:
             st.state = "celebrating"
             if claude_task_complete:
                 st.state_reason = "claude celebrating"
+                st.focus_target = {"agent": "claude"}
             elif codex_celebrating:
                 st.state_reason = "codex celebrating"
             elif _other_celebrates and other_celebrating_name():
@@ -1750,6 +1799,7 @@ class StateMachine:
         if (claude_grooving_now or other_grooving()) and not self._celebrated_this_turn:
             st.state = "grooving"
             st.state_reason = "claude grooving" if claude_grooving_now else "creative burst"
+            st.focus_target = {"agent": "claude"} if claude_grooving_now else None
             st.message = "🤸 creative burst"
             return st
 
@@ -1763,6 +1813,7 @@ class StateMachine:
         if claude is not None and claude.enabled and claude_sessions_recapping():
             st.state = "thinking"
             st.state_reason = "claude recapping"
+            st.focus_target = {"agent": "claude"}
             st.message = "📝 recapping..."
             return st
 
@@ -1786,6 +1837,7 @@ class StateMachine:
                 self.working_hold_until = now + _work_hold
                 st.state = "working"
                 st.state_reason = _working_reason()
+                st.focus_target = working_target()
                 st.message = "🛠️ running shell"
                 return st
             # 4a-prime: STICKY WORKING -- LLM-gen gap, recent work + still busy.
@@ -1794,6 +1846,7 @@ class StateMachine:
             ):
                 st.state = "working"
                 st.state_reason = f"working hold ({int(self.working_hold_until - now)}s left)"
+                st.focus_target = streaming_target()
                 st.message = "✨ working"
                 return st
             # 4b. THINKING -- Claude Code's / Codex's transcript-write-
@@ -1801,11 +1854,13 @@ class StateMachine:
             if streaming_merged:
                 st.state = "thinking"
                 st.state_reason = _streaming_reason()
+                st.focus_target = streaming_target()
                 st.message = "🤔 thinking"
                 return st
             if codex_turn_active:
                 st.state = "thinking"
                 st.state_reason = "codex turn in flight"
+                st.focus_target = codex_target(max(codex_turn_records, key=lambda r: (r['updated'], r['key'])))
                 st.message = "🤔 thinking"
                 return st
             # 4c. THINKING (turn in flight) -- the hook bracket says Claude
@@ -1829,6 +1884,7 @@ class StateMachine:
             if turn_in_flight and claude_transcript_age <= _turn_stall:
                 st.state = "thinking"
                 st.state_reason = "claude turn in flight"
+                st.focus_target = {"agent": "claude"}
                 st.message = "🤔 thinking"
                 return st
 

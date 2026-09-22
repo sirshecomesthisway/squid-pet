@@ -77,7 +77,7 @@ def record_owner(flags: Path, name: str) -> None:
     temp.replace(path)
 
 
-def update_turn(root: Path, session: str, turn, event: str) -> None:
+def update_turn(root: Path, session: str, turn, event: str, transcript=None) -> None:
     directory = root / 'codex_turn_active'
     directory.mkdir(parents=True, exist_ok=True)
     prefix = digest(session) + '.'
@@ -94,7 +94,10 @@ def update_turn(root: Path, session: str, turn, event: str) -> None:
         owner = codex_owner()
         if owner is not None:
             temp = path.with_name('.' + path.name)
-            temp.write_text(json.dumps({**owner, 'updated': time.time()}))
+            data = {**owner, 'updated': time.time()}
+            if isinstance(transcript, str) and transcript:
+                data['transcript_key'] = digest(transcript)
+            temp.write_text(json.dumps(data))
             temp.replace(path)
 
 
@@ -117,7 +120,7 @@ def handle(payload: dict, root: Path) -> None:
     # Serialize concurrent hook processes, including cleanup vs a new request.
     with (flags / '.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        update_turn(root, session, turn, event)
+        update_turn(root, session, turn, event, payload.get('transcript_path'))
         prefix = digest(session) + '.'
         if event == 'UserPromptSubmit':
             # CLI async questions are answered through normal chat input.
