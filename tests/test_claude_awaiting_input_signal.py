@@ -184,7 +184,9 @@ def test_compute_fires_approval_needed_from_claude_session(tmp_claude_dir):
     # Pink-2026-08-26 regression: notification must name "Claude Code",
     # not the previously-hardcoded legacy agent (caught via live testing).
     # source_label defaults to "Claude Code" now that it's the only caller.
-    mock_notify.assert_called_once_with("your turn", "Glass")
+    pending = mock_notify.call_args.kwargs["still_pending"]
+    mock_notify.assert_called_once_with("your turn", "Glass", still_pending=pending)
+    assert pending()
 
 
 def test_compute_notify_false_suppresses_notification_but_still_reports_state(tmp_claude_dir):

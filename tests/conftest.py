@@ -9,3 +9,9 @@ def isolate_codex_wait_markers(tmp_path, monkeypatch):
     monkeypatch.setattr(watcher, 'CODEX_AWAITING_INPUT_DIR',
                         str(tmp_path / 'codex_awaiting_input'))
     monkeypatch.setattr(watcher, '_CODEX_SESSION_FLAG_FIRST_SEEN', {})
+
+
+@pytest.fixture(autouse=True)
+def isolate_codex_turns(tmp_path, monkeypatch):
+    from squid_pet import codex_turns
+    monkeypatch.setattr(codex_turns, 'TURN_DIR', tmp_path / 'codex_turn_active')

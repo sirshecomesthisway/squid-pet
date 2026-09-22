@@ -2,9 +2,9 @@
 """Advisory Codex hooks: signal human waits without making approval decisions.
 
 Install with install_codex_hooks.py, then review/trust through Codex /hooks.
-Only opaque request keys and reference counts are persisted. No prompt, command,
-answer, or tool output is logged. PermissionRequest lacks a tool_use_id, so it
-is paired with PostToolUse by session, turn, tool, and normalized input.
+Only opaque keys, counts, timestamps, and owning-process identity are persisted.
+No prompt, command, answer, or tool output is logged. PermissionRequest lacks
+a tool_use_id, so it is paired with PostToolUse by session, turn, tool, and input.
 """
 from __future__ import annotations
 
@@ -13,11 +13,79 @@ import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 
 def digest(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def record_permission(flags: Path, prefix: str, key: str) -> None:
+    """Count shell requests for decision reconciliation without persisting inputs.
+
+    Called under the same lock as the markers. Retain the cohort through tool
+    completion; reset once all its markers are gone so old decisions cannot
+    answer a new request in the same turn.
+    """
+    ledger = flags / ('.permissions.' + prefix.rstrip('.'))
+    try:
+        data = json.loads(ledger.read_text())
+        if (not isinstance(data, dict) or not isinstance(data.get('keys'), list)
+                or type(data.get('total')) is not int or type(data.get('since_ns')) is not int
+                or not any((flags / name).is_file() for name in data['keys']
+                           if isinstance(name, str) and name.startswith(prefix) and '/' not in name)):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    if not data:
+        data = {'since_ns': time.time_ns(), 'total': 0, 'keys': []}
+    data['total'] += 1
+    name = prefix + key
+    if name not in data['keys']:
+        data['keys'].append(name)
+    temp = ledger.with_name(ledger.name + '.tmp')
+    temp.write_text(json.dumps(data))
+    temp.replace(ledger)
+
+
+def codex_owner() -> dict | None:
+    """Find the actual agent ancestor, not the short-lived hook shell."""
+    try:
+        import psutil
+    except ImportError:
+        return None  # Approval hooks still work with a stdlib-only interpreter.
+    try:
+        for proc in psutil.Process().parents():
+            try:
+                if Path(proc.exe()).name in {'codex', 'codex-tui'}:
+                    return {'pid': proc.pid, 'created': proc.create_time()}
+            except (psutil.Error, OSError, SystemError):
+                continue
+    except (psutil.Error, OSError, SystemError):
+        pass
+    return None
+
+
+def update_turn(root: Path, session: str, turn, event: str) -> None:
+    directory = root / 'codex_turn_active'
+    directory.mkdir(parents=True, exist_ok=True)
+    prefix = digest(session) + '.'
+    if event == 'SessionEnd':
+        for path in directory.glob(prefix + '*'):
+            path.unlink(missing_ok=True)
+        return
+    if not isinstance(turn, str) or not turn:
+        return
+    path = directory / (prefix + digest(turn))
+    if event in {'Stop', 'Interrupt'}:
+        path.unlink(missing_ok=True)
+    elif event == 'UserPromptSubmit' or (event == 'PostToolUse' and path.exists()):
+        owner = codex_owner()
+        if owner is not None:
+            temp = path.with_name('.' + path.name)
+            temp.write_text(json.dumps({**owner, 'updated': time.time()}))
+            temp.replace(path)
 
 
 def handle(payload: dict, root: Path) -> None:
@@ -39,6 +107,7 @@ def handle(payload: dict, root: Path) -> None:
     # Serialize concurrent hook processes, including cleanup vs a new request.
     with (flags / '.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        update_turn(root, session, turn, event)
         prefix = digest(session) + '.'
         if event == 'UserPromptSubmit':
             # CLI async questions are answered through normal chat input.
@@ -66,6 +135,8 @@ def handle(payload: dict, root: Path) -> None:
         if event in {'Stop', 'Interrupt', 'SessionEnd'}:
             for path in flags.glob(prefix + '*'):
                 path.unlink(missing_ok=True)
+            for path in flags.glob('.permissions.' + prefix.rstrip('.') + '*'):
+                path.unlink(missing_ok=True)
             return
         if not isinstance(tool, str) or not tool:
             return
@@ -78,6 +149,8 @@ def handle(payload: dict, root: Path) -> None:
                 return
         key = digest([tool, tool_input])
         path = flags / (prefix + key)
+        if event == 'PermissionRequest' and tool == 'Bash':
+            record_permission(flags, prefix, key)
         try:
             count = int(path.read_text())
         except (OSError, ValueError):

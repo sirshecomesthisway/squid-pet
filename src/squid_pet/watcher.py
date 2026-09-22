@@ -590,8 +590,12 @@ _CODEX_SESSION_FLAG_FIRST_SEEN: dict[str, float] = {}
 
 def codex_requests_awaiting_input() -> list[str]:
     """Opaque per-request markers from Codex's advisory lifecycle hooks."""
-    return _scan_session_flag_dir(
+    from pathlib import Path
+
+    from .codex_approvals import filter_resolved_requests
+    names = _scan_session_flag_dir(
         CODEX_AWAITING_INPUT_DIR, CLAUDE_AWAITING_INPUT_STALE_SEC)
+    return filter_resolved_requests(Path(CODEX_AWAITING_INPUT_DIR), names)
 
 
 def filter_eligible_codex_requests(request_ids: list[str]) -> list[str]:
@@ -1236,7 +1240,6 @@ class StateMachine:
         awaiting_sessions_raw = claude_sessions_awaiting_input()
         awaiting_sessions_raw = self._self_heal_stale_claude_flags(
             st, now, awaiting_sessions_raw)
-        self._self_heal_stale_codex_flags(now)
         self._apply_approval_override(
             st, now, awaiting_sessions_raw, notify=notify)
         self._apply_force_state_override(st)
@@ -1329,45 +1332,6 @@ class StateMachine:
             awaiting_sessions_raw = claude_sessions_awaiting_input()
         return awaiting_sessions_raw
 
-    def _self_heal_stale_codex_flags(self, now: float) -> None:
-        """Clear a Codex awaiting-input flag once the approved command is
-        actually running (codex.shell_active). Codex fires no hook when the
-        human grants approval -- only at command completion -- so the flag
-        would otherwise wave for the whole runtime of the approved command."""
-        # ── CODEX APPROVAL SELF-HEAL ─────────────────────────────────
-        # Pink-2026-09-13, caught live: unlike Claude Code, Codex fires NO
-        # hook at the moment the human GRANTS an approval. Its lifecycle is
-        # PreToolUse (model proposes -- BEFORE the permission gate) ->
-        # PermissionRequest (gate opens, we raise the flag) -> [approve] ->
-        # PostToolUse (only when the command FINISHES). So codex_pet_hook can
-        # only clear the flag at command completion, which left the "your
-        # turn" wave up for the entire runtime of an approved command (a 20s
-        # sleep waved ~20s past the click; a long build, minutes).
-        #
-        # The one honest signal that approval was granted is the approved
-        # command actually RUNNING: a live shell child under Codex
-        # (codex.shell_active). It is False the whole time the user is still
-        # deciding -- nothing runs behind the permission gate -- so clearing
-        # on it cannot eat a genuinely-pending approval (no false "stopped
-        # waving too early"). Residual wave is bounded by Codex's own
-        # approve->exec setup latency (~seconds), NOT by command duration.
-        # Same freshness guard as the Claude self-heal: never reap a flag so
-        # fresh it has not been shown at least once.
-        codex = self._codex_detector
-        if codex is not None and getattr(codex, "shell_active", False):
-            for req in codex_requests_awaiting_input():
-                path = os.path.join(CODEX_AWAITING_INPUT_DIR, req)
-                try:
-                    if now - os.stat(path).st_mtime < SELF_HEAL_MIN_FLAG_AGE_SEC:
-                        continue  # too fresh -- let it be seen at least once
-                except OSError:
-                    continue
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-                _CODEX_SESSION_FLAG_FIRST_SEEN.pop(req, None)
-
     def _apply_approval_override(
         self, st: PetState, now: float, awaiting_sessions_raw: list,
         *, notify: bool,
@@ -1420,16 +1384,29 @@ class StateMachine:
                 _sound_label = _sound if _sound else "off"
                 log.info("approval alert fired (%s, sound=%s)", fired_reason, _sound_label)
                 if notify:
+                    token = object()
+                    self._approval_notification_token = token
+                    claude_episode = set(awaiting_sessions)
+                    codex_episode = set(codex_waits)
+
+                    def still_pending() -> bool:
+                        # Re-read direct signals before dispatch, not a stale state snapshot.
+                        return (self._approval_notification_token is token and bool(
+                            claude_episode.intersection(claude_sessions_awaiting_input())
+                            or codex_episode.intersection(codex_requests_awaiting_input())))
+
                     if codex_waits:
                         source = "Claude Code and Codex" if awaiting_sessions else "Codex"
-                        _fire_approval_notification(_text, _sound, source_label=source)
+                        _fire_approval_notification(_text, _sound, source_label=source,
+                                                    still_pending=still_pending)
                     else:
-                        _fire_approval_notification(_text, _sound)
+                        _fire_approval_notification(_text, _sound, still_pending=still_pending)
         else:
             # No alert is fired this tick. Reset the OS-notification latch
             # so the next genuine alert (after Pink replies + new response)
             # gets a fresh ping.
             self._approval_alert_fired = False
+            self._approval_notification_token = None
 
     def _apply_force_state_override(self, st: PetState) -> None:
         # ── FORCE-STATE OVERRIDE (test/demo) ─────────────────────────
@@ -1524,6 +1501,9 @@ class StateMachine:
             codex_file_active = False
             codex_streaming = False
             codex_celebrating = False
+
+        from .codex_turns import turn_in_flight as codex_turn_in_flight
+        codex_turn_active = codex_running and codex_turn_in_flight(now)
 
         # Merged signals feeding branch 4 below.
         #
@@ -1627,7 +1607,7 @@ class StateMachine:
         # the exact same merged signals branch 4 below uses to decide
         # working/thinking, so this can never disagree with what the
         # rest of the cascade would call "busy".
-        agent_actively_busy = working_evidence_merged or streaming_merged
+        agent_actively_busy = working_evidence_merged or streaming_merged or codex_turn_active
         # Pink-2026-09-04: sleeping used to require the HUMAN to be away
         # (macOS HID idle >= 5 min). That is the wrong question for a pet
         # that watches agents: Pink sitting at the keyboard writing docs
@@ -1823,6 +1803,11 @@ class StateMachine:
                 st.state_reason = _streaming_reason()
                 st.message = "🤔 thinking"
                 return st
+            if codex_turn_active:
+                st.state = "thinking"
+                st.state_reason = "codex turn in flight"
+                st.message = "🤔 thinking"
+                return st
             # 4c. THINKING (turn in flight) -- the hook bracket says Claude
             # is mid-turn even though nothing has been written recently.
             # This is the "thinking some more" case: a long reasoning
@@ -1877,10 +1862,15 @@ def _applescript_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _fire_approval_notification(text: str, sound: str, source_label: str = "Claude Code") -> None:
+def _fire_approval_notification(
+    text: str, sound: str, source_label: str = "Claude Code", *,
+    still_pending: Callable[[], bool] | None = None,
+) -> None:
     """Fire a macOS notification banner in a background thread.
 
-    Runs in ~50ms so we do not block the watcher loop. Silent on failure
+    Revalidates the originating wait before dispatch and fallback. macOS owns
+    banner delivery after submission; AppleScript cannot retract that queue.
+    Runs off the watcher loop. Silent on failure
     (notification is supplementary; the bubble is the primary signal).
 
     source_label names which agent is actually waiting (Claude Code or Codex); kept
@@ -1905,7 +1895,15 @@ def _fire_approval_notification(text: str, sound: str, source_label: str = "Clau
     import subprocess
     import threading
 
+    def valid() -> bool:
+        try:
+            return still_pending is None or still_pending()
+        except Exception:
+            return False  # Never send an alert we cannot establish is current.
+
     def _go():
+        if not valid():
+            return
         title = "Squid"
         body = source_label + ": " + text
         notifier = shutil.which("terminal-notifier")
@@ -1921,11 +1919,15 @@ def _fire_approval_notification(text: str, sound: str, source_label: str = "Clau
             if bundle_id:
                 cmd += ["-activate", bundle_id]
             try:
+                if not valid():
+                    return
                 subprocess.run(cmd, timeout=3, capture_output=True)
                 return
             except Exception as e:
                 log.warning("terminal-notifier failed, falling back to osascript: %s", e)
         try:
+            if not valid():
+                return
             body_escaped = _applescript_escape(body)
             sound_clause = (
                 ' sound name "' + _applescript_escape(sound) + '"' if sound else ""

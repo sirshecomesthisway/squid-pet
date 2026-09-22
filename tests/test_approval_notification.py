@@ -156,3 +156,47 @@ def test_fire_approval_notification_falls_back_if_terminal_notifier_errors():
         time.sleep(0.2)
 
     assert mock_run.call_args_list[-1][0][0][0] == "osascript"
+
+
+def test_queued_notification_is_skipped_after_approval():
+    queued = []
+
+    class DeferredThread:
+        def __init__(self, *, target, daemon):
+            queued.append(target)
+
+        def start(self):
+            pass
+
+    pending = [True]
+    with patch('threading.Thread', DeferredThread), patch('subprocess.run') as run:
+        _fire_approval_notification('your turn', 'Glass', still_pending=lambda: pending[0])
+        pending[0] = False
+        queued.pop()()
+    run.assert_not_called()
+
+
+def test_notifier_failure_does_not_send_stale_applescript_fallback():
+    queued = []
+
+    class DeferredThread:
+        def __init__(self, *, target, daemon):
+            queued.append(target)
+
+        def start(self):
+            pass
+
+    pending = [True]
+
+    def failed(cmd, **kwargs):
+        pending[0] = False  # The user answered while the notifier was starting.
+        raise OSError('notifier failed')
+
+    with patch('threading.Thread', DeferredThread), \
+         patch('shutil.which', return_value='/bin/terminal-notifier'), \
+         patch('subprocess.run', side_effect=failed) as run:
+        _fire_approval_notification('your turn', '', source_label='Codex',
+                                    still_pending=lambda: pending[0])
+        queued.pop()()
+    assert run.call_count == 1
+    assert run.call_args.args[0][0] == '/bin/terminal-notifier'
