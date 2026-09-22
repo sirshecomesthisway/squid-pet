@@ -163,7 +163,7 @@ class Smoke:
         def native_ready():
             self.assert_alive(pid)
             win = self.windows(pid)
-            doctor = self.command(str(self.cli), "doctor", "--json", check=False)
+            doctor = self.command(str(self.cli), "doctor", "--doctor-json", check=False)
             data = json.loads(doctor.stdout)
             return native_healthy(win, doctor.returncode, data), {"window": win, "doctor": data}
         wait_for("native window and doctor", native_ready)

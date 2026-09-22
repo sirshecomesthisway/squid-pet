@@ -34,7 +34,7 @@ The harness then checks:
 - Real dependency installation and Cocoa/Quartz/WebKit imports.
 - Plist syntax and actual LaunchAgent bootstrap in the GUI domain.
 - Matching launchd/PID-file identity, fresh watcher state, visible native
-  sprite window, all six `squid doctor --json` checks, and `squid status`
+  sprite window, all six `squid doctor --doctor-json` checks, and `squid status`
   reporting RUNNING/TICKING for that PID.
 - The same process surviving 15 seconds (beyond the 10-second startup
   watchdog), continuously fresh state, and at least ten distinct ticks.
@@ -89,5 +89,7 @@ startup/lifecycle mechanics on its runner image, not those experiences.
 
 ## Validation record
 
-Hosted runs and any observed limitations are recorded in the PR. No product
-behavior has been changed by this harness.
+Hosted runs and any observed limitations are recorded in the PR. The native run exposed a logging bug: `StreamHandler()` used stderr while
+doctor reads stdout. A regression test reproduces the missing markers; the
+minimal fix explicitly selects `sys.stdout`, matching the existing logging
+contract. App rendering, detection, and lifecycle behavior remain unchanged.
