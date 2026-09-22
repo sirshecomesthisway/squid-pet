@@ -1,0 +1,56 @@
+name: Native macOS smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-smoke:
+    # Separate fresh VMs reveal cold-start failures; no retry-on-failure masking.
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3]
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The installer seed repository needs the candidate commit ancestry.
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
+      - name: Install harness Python
+        run: uv python install 3.13
+      - name: Native installer and lifecycle smoke
+        run: >-
+          uv run --no-project --python 3.13 python tools/native_smoke.py
+          --scratch "$RUNNER_TEMP/squid-native"
+          --artifacts "$GITHUB_WORKSPACE/native-artifacts"
+      - name: Summarize native verification
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f native-artifacts/summary.md ]]; then
+            cat native-artifacts/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Native smoke did not produce a summary; inspect setup/runner logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload native evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-macos-${{ matrix.attempt }}-${{ github.run_attempt }}
+          path: native-artifacts/
+          if-no-files-found: warn
+          retention-days: 14

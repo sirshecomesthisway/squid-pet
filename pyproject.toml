@@ -66,4 +66,5 @@ files = [
     "src/squid_pet/routine.py",
     "src/squid_pet/doctor.py",
     "tools/verify_sprites.py",
+    "tools/native_smoke.py",
 ]

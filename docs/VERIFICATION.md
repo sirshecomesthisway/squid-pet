@@ -52,6 +52,13 @@ The verifier is read-only: it does not repair, recolor, or rewrite assets.
 Pixel checks cannot judge visual quality, alignment, animation timing, or
 whether a visible sprite is the intended drawing.
 
+## Native smoke verification
+
+The separate [native macOS loop](NATIVE_MACOS_VERIFICATION.md) exercises the
+real installer, LaunchAgent, application window, doctor/status, forced watcher
+states, and shutdown/restart on disposable hosted runners. See that document
+for the exact gates, artifacts and visual-verification limitations.
+
 ## Manual macOS verification still required
 
 CI and unit tests do not replace a logged-in macOS desktop session. Before a
