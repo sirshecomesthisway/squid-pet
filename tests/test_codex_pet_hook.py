@@ -99,6 +99,33 @@ def test_user_reply_clears_only_own_async_questions(tmp_path, reply_turn):
     assert len(before) == 5
     remaining = set(send(tmp_path, 'UserPromptSubmit', turn=reply_turn))
     expected_removed = {p for p in before
-                        if p.name.startswith(module.digest('session-a') + '.async.')}
-    assert len(expected_removed) == 2
+                        if p.name.startswith(module.digest('session-a') + '.')
+                        and ('.async.' in p.name or reply_turn is not None)}
+    assert len(expected_removed) == (2 if reply_turn is None else 3)
     assert remaining == before - expected_removed
+
+
+def test_new_main_turn_clears_old_approval_cohort(tmp_path):
+    send(tmp_path, 'PermissionRequest', session='s', turn='old-turn')
+    assert len(list((tmp_path / 'codex_awaiting_input').glob('.permissions.*'))) == 1
+    send(tmp_path, 'UserPromptSubmit', session='s', turn='new-turn')
+    assert not list((tmp_path / 'codex_awaiting_input').glob('[!.]*'))
+    assert not list((tmp_path / 'codex_awaiting_input').glob('.permissions.*'))
+
+
+def test_new_main_turn_preserves_its_current_approval_cohort(tmp_path):
+    send(tmp_path, 'PermissionRequest', session='s', turn='current-turn')
+    send(tmp_path, 'UserPromptSubmit', session='s', turn='current-turn')
+    assert len(list((tmp_path / 'codex_awaiting_input').glob('[!.]*'))) == 1
+    assert len(list((tmp_path / 'codex_awaiting_input').glob('.permissions.*'))) == 1
+    assert send(tmp_path, 'PostToolUse', session='s', turn='current-turn') == []
+    assert not list((tmp_path / 'codex_awaiting_input').glob('.permissions.*'))
+
+
+def test_missing_prompt_turn_does_not_clear_approval_cohort(tmp_path):
+    send(tmp_path, 'PermissionRequest', session='s', turn='old-turn')
+    send(tmp_path, 'UserPromptSubmit', session='s', turn=None)
+    assert len(list((tmp_path / 'codex_awaiting_input').glob('[!.]*'))) == 1
+    assert len(list((tmp_path / 'codex_awaiting_input').glob('.permissions.*'))) == 1
+    assert send(tmp_path, 'PostToolUse', session='s', turn='old-turn') == []
+    assert not list((tmp_path / 'codex_awaiting_input').glob('.permissions.*'))

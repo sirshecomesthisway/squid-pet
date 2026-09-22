@@ -664,7 +664,7 @@ class PetApi:
         # "Take me to the window that's waiting" -- see acknowledge_approval.
         # Bound here (not imported at call time) so tests constructing
         # PetApi via __new__ simply never have it.
-        from .focus import focus_for_state as _focus
+        from .focus import focus_for_snapshot as _focus
         self._focus_fn = _focus
         self._sprint_fast_transition: bool = False  # frontend uses 0.2s CSS transition when True
         # Stroll mode: "edges" (hug border) or "anywhere" (free roam).
@@ -1419,12 +1419,13 @@ class PetApi:
         never raise a real window.
         """
         with self._lock:
-            state = self._latest.state
+            snapshot = self._latest
+            state = snapshot.state
         focus_fn = getattr(self, "_focus_fn", None)
         if focus_fn is None:
             return {"status": "skipped", "state": state}
         try:
-            status = focus_fn(state)
+            status = focus_fn(snapshot)
         except Exception as e:
             # A failed window raise must never break the gesture; the
             # poke and heart already happened.

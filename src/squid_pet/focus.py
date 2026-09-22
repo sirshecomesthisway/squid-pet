@@ -140,24 +140,28 @@ def _escape_applescript(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def build_terminal_focus_script(tty: str) -> str:
+def build_terminal_focus_script(tty: str, *, require_match: bool = False) -> str:
     """AppleScript raising the Terminal tab whose tty matches, and saying
     which it managed. Pure string building so the interesting part is
     testable without driving a real window."""
     t = _escape_applescript(tty)
+    activate_before = "" if require_match else "    activate\n"
+    activate_match = "                activate\n" if require_match else ""
+    unmatched = "none" if require_match else "app-only"
     return (
         'tell application "Terminal"\n'
-        "    activate\n"
+        f"{activate_before}"
         "    repeat with w in windows\n"
         "        repeat with tb in tabs of w\n"
         f'            if (tty of tb as text) is "{t}" then\n'
+        f"{activate_match}"
         "                set index of w to 1\n"
         "                set selected tab of w to tb\n"
         '                return "matched"\n'
         "            end if\n"
         "        end repeat\n"
         "    end repeat\n"
-        '    return "app-only"\n'
+        f'    return "{unmatched}"\n'
         "end tell\n"
     )
 
@@ -167,14 +171,85 @@ def build_app_activate_script(bundle_id: str) -> str:
     return f'tell application id "{_escape_applescript(bundle_id)}" to activate\n'
 
 
-def focus_for_state(state: str,
-                    run: Optional[Callable[[str], Optional[str]]] = None) -> str:
-    """Bring the window responsible for `state` to the front.
+def _focus_process_owner(owner: dict, run=None, still_current=None) -> str:
+    """Activate only an exact live process's Terminal tab."""
+    import psutil
 
-    Returns "matched" (that tab is now front), "app-only" (right app,
-    unknown tab), "none" (no terminal identified) or "resting" (nothing to
-    open -- idle, drowsy, sleeping, or any state we have no signal for).
-    """
+    from . import codex_turns, watcher
+    try:
+        if not isinstance(owner, dict) or not codex_turns.owner_alive(owner):
+            return "none"
+        proc = psutil.Process(owner['pid'])
+        if proc.create_time() != owner.get('created'):
+            return "none"
+        tty = proc.terminal()
+        if not tty:
+            return "none"
+        cur = proc
+        bundle = None
+        for _ in range(10):
+            if cur is None:
+                break
+            bundle = (watcher._TERMINAL_APP_BUNDLE_IDS.get(cur.name())
+                      or watcher._bundle_id_from_exe_path(cur.exe()))
+            if bundle:
+                break
+            cur = cur.parent()
+        # No exact-tab integration for other hosts yet. Raising their default
+        # window could send the user to another inactive session again.
+        if bundle != TERMINAL_APP_BUNDLE_ID:
+            return "none"
+        if not codex_turns.owner_alive(owner) or (still_current is not None and not still_current()):
+            return "none"
+        script = build_terminal_focus_script(tty, require_match=True)
+        runner = run if run is not None else _run_osascript
+        result = runner(script)
+        return "matched" if result and result.strip() == "matched" else "none"
+    except (OSError, ValueError, TypeError, KeyError, psutil.Error):
+        return "none"
+
+
+def _focus_codex_approval(requests: list[str], run=None) -> str:
+    """Resolve the exact requesting process; never borrow a Claude session."""
+    import json
+    from pathlib import Path
+
+    from . import codex_turns, watcher
+    directory = Path(watcher.CODEX_AWAITING_INPUT_DIR)
+    try:
+        request = max(requests, key=lambda name: (directory / name).stat().st_mtime)
+        owner_path = directory / ('.owner.' + request)
+        if not owner_path.exists():
+            owner_path = codex_turns.TURN_DIR / '.'.join(request.split('.')[:2])
+        if owner_path.stat().st_size > 4096:
+            return "none"
+        owner = json.loads(owner_path.read_text())
+        return _focus_process_owner(owner, run,
+            still_current=lambda: request in watcher.codex_requests_awaiting_input())
+    except (OSError, ValueError, TypeError):
+        return "none"
+
+
+def focus_for_snapshot(snapshot, run=None) -> str:
+    """Navigate using the source that won this state, never a new global guess."""
+    if snapshot.state in {'idle', 'sleeping', 'drowsy', 'stretch'}:
+        return "resting"
+    target = snapshot.focus_target
+    if not target:
+        return "none"
+    if target.get('agent') == 'codex' and target.get('request'):
+        return _focus_codex_approval([target['request']], run)
+    if target.get('agent') == 'codex' and target.get('owner'):
+        return _focus_process_owner(target['owner'], run)
+    if target.get('agent') == 'claude':
+        # Resolve only Claude's signal directory. The snapshot may predate a
+        # new Codex request, which must not steal a Claude-origin click.
+        return _focus_claude_state(snapshot.state, run)
+    return "none"
+
+
+def _focus_claude_state(state: str,
+                        run: Optional[Callable[[str], Optional[str]]] = None) -> str:
     signal_dir = STATE_SIGNAL_DIRS.get(state)
     if signal_dir is None:
         return "resting"
@@ -187,11 +262,26 @@ def focus_for_state(state: str,
         except Exception:
             tty = None
     if tty is None:
-        # The flag may have aged out of its freshness window while the
-        # sprite still shows the state. Raising the right app still beats
-        # doing nothing.
         tty = _any_claude_tty()
     return _raise(tty, run)
+
+
+def focus_for_state(state: str,
+                    run: Optional[Callable[[str], Optional[str]]] = None) -> str:
+    """Bring the window responsible for `state` to the front.
+
+    Returns "matched" (that tab is now front), "app-only" (right app,
+    unknown tab), "none" (no terminal identified) or "resting" (nothing to
+    open -- idle, drowsy, sleeping, or any state we have no signal for).
+    """
+    if state == "approval_needed":
+        from . import watcher
+        requests = watcher.codex_requests_awaiting_input()
+        if requests:
+            return _focus_codex_approval(requests, run)
+        if not watcher.claude_sessions_awaiting_input():
+            return "none"  # The displayed wave may outlive the actual request.
+    return _focus_claude_state(state, run)
 
 
 def _any_claude_tty() -> Optional[str]:
@@ -234,6 +324,10 @@ def focus_waiting_session(run: Optional[Callable[[str], Optional[str]]] = None) 
     (right app, unknown tab), or "none". `run` is injectable so tests never
     raise a real window.
     """
+    from . import watcher
+    requests = watcher.codex_requests_awaiting_input()
+    if requests:
+        return _focus_codex_approval(requests, run)
     runner = run if run is not None else _run_osascript
     try:
         from .watcher import find_terminal_app_bundle_for_claude_code

@@ -61,7 +61,7 @@ class Detector(Protocol):
 # ----------------------------------------------------------------------
 # Shared shell-activity signal
 # ----------------------------------------------------------------------
-def _shell_signals(procs, active_fn, cmdline_fn) -> tuple[bool, list[str] | None]:
+def _shell_signals(procs, active_fn, cmdline_fn, owner_out=None) -> tuple[bool, list[str] | None]:
     """(shell_active, shell_cmdline) for one agent's processes.
 
     CPU fix 2 (2026-09-03): production now reads both signals from a
@@ -77,11 +77,13 @@ def _shell_signals(procs, active_fn, cmdline_fn) -> tuple[bool, list[str] | None
     called exactly as before (cmdline only consulted when active, so a
     stale command can never be reported).
     """
+    if owner_out is not None:
+        owner_out.clear()
     if not procs:
         return False, None
     if active_fn is None and cmdline_fn is None:
         from . import watcher as _w
-        return _w.shell_child_activity(procs)
+        return _w.shell_child_activity(procs, owner_out=owner_out)
     from . import watcher as _w
     if not (active_fn or _w.has_active_shell_children)(procs):
         return False, None
@@ -171,9 +173,11 @@ class ClaudeCodeDetector:
         self._last_scan_ts: float = 0.0
         self.cpu_percent: float = 0.0
         self.claude_code_running: bool = False
+        self.shell_owner: dict = {}
         self.shell_active: bool = False
         self.shell_cmdline: list[str] | None = None
         self.file_active: bool = False
+        self.transcript_path: str | None = None
         self.transcript_age: float = float("inf")
         self.streaming: bool = False
 
@@ -257,6 +261,7 @@ class ClaudeCodeDetector:
 
     def _newest_transcript_age(self, now: float) -> float:
         newest_mtime = 0.0
+        self.transcript_path = None
         candidates = self._discover(now)
         candidate_keys = {str(f) for f in candidates}
         self._transcript_activity_cache = {
@@ -271,7 +276,9 @@ class ClaudeCodeDetector:
             mtime = stat.st_mtime
             if now - mtime < self.STREAMING_STALE_SEC:
                 mtime = self._transcript_activity_mtime(f, stat)
-            newest_mtime = max(newest_mtime, mtime)
+            if mtime > newest_mtime:
+                newest_mtime = mtime
+                self.transcript_path = str(f)
         if newest_mtime == 0.0:
             return float("inf")
         return max(0.0, now - newest_mtime)
@@ -288,7 +295,7 @@ class ClaudeCodeDetector:
             self._aggregate_cpu(procs) if procs else 0.0, 1
         )
         self.shell_active, self.shell_cmdline = _shell_signals(
-            procs, self._has_active_shell_children, self._shell_cmdline_fn
+            procs, self._has_active_shell_children, self._shell_cmdline_fn, self.shell_owner
         )
         self._scan_now = now
         self.file_active = bool(self._recent_file_ages()) if procs else False
@@ -405,9 +412,11 @@ class CodexDetector:
         self._last_scan_ts: float = 0.0
         self.cpu_percent: float = 0.0
         self.codex_running: bool = False
+        self.shell_owner: dict = {}
         self.shell_active: bool = False
         self.shell_cmdline: list[str] | None = None
         self.file_active: bool = False
+        self.transcript_path: str | None = None
         self.transcript_age: float = float("inf")
         self.streaming: bool = False
 
@@ -440,12 +449,15 @@ class CodexDetector:
 
     def _newest_transcript_age(self, now: float) -> float:
         newest_mtime = 0.0
+        self.transcript_path = None
         for f in self._discover(now):
             try:
                 mtime = self._stat(str(f)).st_mtime
             except OSError:
                 continue
-            newest_mtime = max(newest_mtime, mtime)
+            if mtime > newest_mtime:
+                newest_mtime = mtime
+                self.transcript_path = str(f)
         if newest_mtime == 0.0:
             return float("inf")
         return max(0.0, now - newest_mtime)
@@ -462,7 +474,7 @@ class CodexDetector:
             self._aggregate_cpu(procs) if procs else 0.0, 1
         )
         self.shell_active, self.shell_cmdline = _shell_signals(
-            procs, self._has_active_shell_children, self._shell_cmdline_fn
+            procs, self._has_active_shell_children, self._shell_cmdline_fn, self.shell_owner
         )
         self._scan_now = now
         self.file_active = bool(self._recent_file_ages()) if procs else False

@@ -135,6 +135,7 @@ class PetState:
     # state fired this tick. Surfaced in `squid why` + optionally used
     # as the bubble.
     state_reason: str = ""
+    focus_target: dict | None = None  # provenance of this snapshot, never a guessed workspace
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -590,8 +591,12 @@ _CODEX_SESSION_FLAG_FIRST_SEEN: dict[str, float] = {}
 
 def codex_requests_awaiting_input() -> list[str]:
     """Opaque per-request markers from Codex's advisory lifecycle hooks."""
-    return _scan_session_flag_dir(
+    from pathlib import Path
+
+    from .codex_approvals import filter_resolved_requests
+    names = _scan_session_flag_dir(
         CODEX_AWAITING_INPUT_DIR, CLAUDE_AWAITING_INPUT_STALE_SEC)
+    return filter_resolved_requests(Path(CODEX_AWAITING_INPUT_DIR), names)
 
 
 def filter_eligible_codex_requests(request_ids: list[str]) -> list[str]:
@@ -977,7 +982,7 @@ def count_currently_waving_sessions() -> int:
 # Live tool-activity detection
 # ────────────────────────────────────────────────────────────────────────
 
-def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
+def shell_child_activity(procs, *, owner_out: dict | None = None) -> tuple[bool, list[str] | None]:
     """One descendant-tree walk yielding BOTH tool-activity signals:
     ``(shell_active, cmdline)``.
 
@@ -1008,9 +1013,21 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
     immediate child and the tool is a grandchild. Best-effort throughout:
     any failure returns what was already proven rather than raising.
     """
+    if owner_out is not None:
+        owner_out.clear()
+
+    def record_owner(proc) -> None:
+        if owner_out is not None and proc is not None:
+            try:
+                owner_out.update(pid=proc.pid, created=proc.create_time())
+            except Exception:
+                owner_out.clear()
+
     if not procs:
         return False, None
     active = False
+    any_owner = None
+    wrapper_owner = None
     wrapper_cmdline = None  # fallback when no real tool grandchild is caught
     try:
         import psutil
@@ -1024,6 +1041,7 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
                         # Name matched: a tool is running, whatever we
                         # end up being able to report about it.
                         active = True
+                        any_owner = p
                         if name in SHELL_WRAPPER_NAMES:
                             # Remember the wrapper's cmdline as a fallback,
                             # but keep walking in case the real tool child
@@ -1031,9 +1049,11 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
                             cmd = ch.cmdline()
                             if cmd:
                                 wrapper_cmdline = cmd
+                                wrapper_owner = p
                             continue
                         cmdline = ch.cmdline()
                         if cmdline:
+                            record_owner(p)
                             return True, cmdline
                     except (psutil.NoSuchProcess, psutil.AccessDenied,
                             SystemError):
@@ -1047,7 +1067,9 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
         # Keep what we already proved -- the old bool function returned
         # True the instant it matched, so a broken process object later
         # in the list could never undo it.
+        record_owner(wrapper_owner or any_owner)
         return active, wrapper_cmdline
+    record_owner(wrapper_owner or any_owner)
     return active, wrapper_cmdline
 
 
@@ -1174,6 +1196,11 @@ class StateMachine:
         # Hold "working" for working_hold_sec between tool calls
         # so Squid does not flicker to "thinking" in LLM-gen gaps.
         self.working_hold_until = 0.0
+        # Keep the exact owner that caused the working stretch available
+        # through the short hold after its shell child exits. Without this,
+        # a double-click during that generation gap can lose provenance and
+        # return no destination even though the agent is still active.
+        self._working_focus_target: dict | None = None
         # Pink-2026-09-04: awake hold. A wake -- poke, sprint, or the
         # 15-min periodic auto-wake -- used to live entirely in PetApi
         # (wake_trigger_seq + user_wake_until), which only the frontend
@@ -1236,7 +1263,6 @@ class StateMachine:
         awaiting_sessions_raw = claude_sessions_awaiting_input()
         awaiting_sessions_raw = self._self_heal_stale_claude_flags(
             st, now, awaiting_sessions_raw)
-        self._self_heal_stale_codex_flags(now)
         self._apply_approval_override(
             st, now, awaiting_sessions_raw, notify=notify)
         self._apply_force_state_override(st)
@@ -1329,45 +1355,6 @@ class StateMachine:
             awaiting_sessions_raw = claude_sessions_awaiting_input()
         return awaiting_sessions_raw
 
-    def _self_heal_stale_codex_flags(self, now: float) -> None:
-        """Clear a Codex awaiting-input flag once the approved command is
-        actually running (codex.shell_active). Codex fires no hook when the
-        human grants approval -- only at command completion -- so the flag
-        would otherwise wave for the whole runtime of the approved command."""
-        # ── CODEX APPROVAL SELF-HEAL ─────────────────────────────────
-        # Pink-2026-09-13, caught live: unlike Claude Code, Codex fires NO
-        # hook at the moment the human GRANTS an approval. Its lifecycle is
-        # PreToolUse (model proposes -- BEFORE the permission gate) ->
-        # PermissionRequest (gate opens, we raise the flag) -> [approve] ->
-        # PostToolUse (only when the command FINISHES). So codex_pet_hook can
-        # only clear the flag at command completion, which left the "your
-        # turn" wave up for the entire runtime of an approved command (a 20s
-        # sleep waved ~20s past the click; a long build, minutes).
-        #
-        # The one honest signal that approval was granted is the approved
-        # command actually RUNNING: a live shell child under Codex
-        # (codex.shell_active). It is False the whole time the user is still
-        # deciding -- nothing runs behind the permission gate -- so clearing
-        # on it cannot eat a genuinely-pending approval (no false "stopped
-        # waving too early"). Residual wave is bounded by Codex's own
-        # approve->exec setup latency (~seconds), NOT by command duration.
-        # Same freshness guard as the Claude self-heal: never reap a flag so
-        # fresh it has not been shown at least once.
-        codex = self._codex_detector
-        if codex is not None and getattr(codex, "shell_active", False):
-            for req in codex_requests_awaiting_input():
-                path = os.path.join(CODEX_AWAITING_INPUT_DIR, req)
-                try:
-                    if now - os.stat(path).st_mtime < SELF_HEAL_MIN_FLAG_AGE_SEC:
-                        continue  # too fresh -- let it be seen at least once
-                except OSError:
-                    continue
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-                _CODEX_SESSION_FLAG_FIRST_SEEN.pop(req, None)
-
     def _apply_approval_override(
         self, st: PetState, now: float, awaiting_sessions_raw: list,
         *, notify: bool,
@@ -1413,6 +1400,13 @@ class StateMachine:
             st.state = "approval_needed"
             st.message = _text
             st.state_reason = fired_reason
+            st.focus_target = {"agent": "claude"}
+            if codex_waits:
+                try:
+                    request = max(codex_waits, key=lambda name: os.stat(os.path.join(CODEX_AWAITING_INPUT_DIR, name)).st_mtime)
+                    st.focus_target = {"agent": "codex", "request": request}
+                except OSError:
+                    st.focus_target = None
             # Fire OS notification ONCE per idle cycle
             if not self._approval_alert_fired:
                 self._approval_alert_fired = True
@@ -1420,16 +1414,29 @@ class StateMachine:
                 _sound_label = _sound if _sound else "off"
                 log.info("approval alert fired (%s, sound=%s)", fired_reason, _sound_label)
                 if notify:
+                    token = object()
+                    self._approval_notification_token = token
+                    claude_episode = set(awaiting_sessions)
+                    codex_episode = set(codex_waits)
+
+                    def still_pending() -> bool:
+                        # Re-read direct signals before dispatch, not a stale state snapshot.
+                        return (self._approval_notification_token is token and bool(
+                            claude_episode.intersection(claude_sessions_awaiting_input())
+                            or codex_episode.intersection(codex_requests_awaiting_input())))
+
                     if codex_waits:
                         source = "Claude Code and Codex" if awaiting_sessions else "Codex"
-                        _fire_approval_notification(_text, _sound, source_label=source)
+                        _fire_approval_notification(_text, _sound, source_label=source,
+                                                    still_pending=still_pending)
                     else:
-                        _fire_approval_notification(_text, _sound)
+                        _fire_approval_notification(_text, _sound, still_pending=still_pending)
         else:
             # No alert is fired this tick. Reset the OS-notification latch
             # so the next genuine alert (after Pink replies + new response)
             # gets a fresh ping.
             self._approval_alert_fired = False
+            self._approval_notification_token = None
 
     def _apply_force_state_override(self, st: PetState) -> None:
         # ── FORCE-STATE OVERRIDE (test/demo) ─────────────────────────
@@ -1445,6 +1452,7 @@ class StateMachine:
                 _forced = _force_file.read_text().strip()
                 if _forced:
                     st.state = _forced
+                    st.focus_target = None
                     st.state_reason = "force_state override (" + _forced + ")"
         except Exception:
             pass
@@ -1524,6 +1532,31 @@ class StateMachine:
             codex_file_active = False
             codex_streaming = False
             codex_celebrating = False
+
+        from .codex_approvals import digest
+        from .codex_turns import active_turns
+        codex_turn_records = active_turns(now) if codex_running else []
+        codex_turn_active = bool(codex_turn_records)
+
+        def codex_target(record) -> dict | None:
+            if not record:
+                return None
+            return {"agent": "codex", "owner": {"pid": record['pid'], "created": record['created']}}
+
+        def streaming_target() -> dict | None:
+            if claude_streaming:
+                return {"agent": "claude"}
+            path = getattr(codex, 'transcript_path', None)
+            matches = [r for r in codex_turn_records if path and r.get('transcript_key') == digest(path)]
+            owners = {(r['pid'], r['created']) for r in matches}
+            return codex_target(matches[0]) if len(owners) == 1 else None
+
+        def working_target() -> dict | None:
+            detector = claude if claude_shell_active else codex if codex_shell_active else None
+            owner = getattr(detector, 'shell_owner', None)
+            if not owner:
+                return None
+            return {"agent": "claude" if claude_shell_active else "codex", "owner": dict(owner)}
 
         # Merged signals feeding branch 4 below.
         #
@@ -1627,7 +1660,7 @@ class StateMachine:
         # the exact same merged signals branch 4 below uses to decide
         # working/thinking, so this can never disagree with what the
         # rest of the cascade would call "busy".
-        agent_actively_busy = working_evidence_merged or streaming_merged
+        agent_actively_busy = working_evidence_merged or streaming_merged or codex_turn_active
         # Pink-2026-09-04: sleeping used to require the HUMAN to be away
         # (macOS HID idle >= 5 min). That is the wrong question for a pet
         # that watches agents: Pink sitting at the keyboard writing docs
@@ -1743,6 +1776,7 @@ class StateMachine:
             st.state = "celebrating"
             if claude_task_complete:
                 st.state_reason = "claude celebrating"
+                st.focus_target = {"agent": "claude"}
             elif codex_celebrating:
                 st.state_reason = "codex celebrating"
             elif _other_celebrates and other_celebrating_name():
@@ -1770,6 +1804,7 @@ class StateMachine:
         if (claude_grooving_now or other_grooving()) and not self._celebrated_this_turn:
             st.state = "grooving"
             st.state_reason = "claude grooving" if claude_grooving_now else "creative burst"
+            st.focus_target = {"agent": "claude"} if claude_grooving_now else None
             st.message = "🤸 creative burst"
             return st
 
@@ -1783,6 +1818,7 @@ class StateMachine:
         if claude is not None and claude.enabled and claude_sessions_recapping():
             st.state = "thinking"
             st.state_reason = "claude recapping"
+            st.focus_target = {"agent": "claude"}
             st.message = "📝 recapping..."
             return st
 
@@ -1806,6 +1842,12 @@ class StateMachine:
                 self.working_hold_until = now + _work_hold
                 st.state = "working"
                 st.state_reason = _working_reason()
+                target = working_target()
+                if target is not None:
+                    self._working_focus_target = target
+                else:
+                    self._working_focus_target = None
+                st.focus_target = target
                 st.message = "🛠️ running shell"
                 return st
             # 4a-prime: STICKY WORKING -- LLM-gen gap, recent work + still busy.
@@ -1814,6 +1856,12 @@ class StateMachine:
             ):
                 st.state = "working"
                 st.state_reason = f"working hold ({int(self.working_hold_until - now)}s left)"
+                target = streaming_target()
+                if target is not None:
+                    self._working_focus_target = target
+                elif self._last_state != "working":
+                    self._working_focus_target = None
+                st.focus_target = target or self._working_focus_target
                 st.message = "✨ working"
                 return st
             # 4b. THINKING -- Claude Code's / Codex's transcript-write-
@@ -1821,6 +1869,13 @@ class StateMachine:
             if streaming_merged:
                 st.state = "thinking"
                 st.state_reason = _streaming_reason()
+                st.focus_target = streaming_target()
+                st.message = "🤔 thinking"
+                return st
+            if codex_turn_active:
+                st.state = "thinking"
+                st.state_reason = "codex turn in flight"
+                st.focus_target = codex_target(max(codex_turn_records, key=lambda r: (r['updated'], r['key'])))
                 st.message = "🤔 thinking"
                 return st
             # 4c. THINKING (turn in flight) -- the hook bracket says Claude
@@ -1844,6 +1899,7 @@ class StateMachine:
             if turn_in_flight and claude_transcript_age <= _turn_stall:
                 st.state = "thinking"
                 st.state_reason = "claude turn in flight"
+                st.focus_target = {"agent": "claude"}
                 st.message = "🤔 thinking"
                 return st
 
@@ -1877,10 +1933,15 @@ def _applescript_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _fire_approval_notification(text: str, sound: str, source_label: str = "Claude Code") -> None:
+def _fire_approval_notification(
+    text: str, sound: str, source_label: str = "Claude Code", *,
+    still_pending: Callable[[], bool] | None = None,
+) -> None:
     """Fire a macOS notification banner in a background thread.
 
-    Runs in ~50ms so we do not block the watcher loop. Silent on failure
+    Revalidates the originating wait before dispatch and fallback. macOS owns
+    banner delivery after submission; AppleScript cannot retract that queue.
+    Runs off the watcher loop. Silent on failure
     (notification is supplementary; the bubble is the primary signal).
 
     source_label names which agent is actually waiting (Claude Code or Codex); kept
@@ -1905,7 +1966,15 @@ def _fire_approval_notification(text: str, sound: str, source_label: str = "Clau
     import subprocess
     import threading
 
+    def valid() -> bool:
+        try:
+            return still_pending is None or still_pending()
+        except Exception:
+            return False  # Never send an alert we cannot establish is current.
+
     def _go():
+        if not valid():
+            return
         title = "Squid"
         body = source_label + ": " + text
         notifier = shutil.which("terminal-notifier")
@@ -1921,11 +1990,15 @@ def _fire_approval_notification(text: str, sound: str, source_label: str = "Clau
             if bundle_id:
                 cmd += ["-activate", bundle_id]
             try:
+                if not valid():
+                    return
                 subprocess.run(cmd, timeout=3, capture_output=True)
                 return
             except Exception as e:
                 log.warning("terminal-notifier failed, falling back to osascript: %s", e)
         try:
+            if not valid():
+                return
             body_escaped = _applescript_escape(body)
             sound_clause = (
                 ' sound name "' + _applescript_escape(sound) + '"' if sound else ""

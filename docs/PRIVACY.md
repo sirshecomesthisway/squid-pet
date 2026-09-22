@@ -102,10 +102,28 @@ command before hashing; other tool inputs are hashed as JSON. Inputs can
 contain command or question text, but none is logged or retained. The script
 never reads the transcript, credentials, or files named by tool arguments.
 
-Only SHA-256 request identifiers and reference counts are persisted in
-`~/.squid-pet/codex_awaiting_input/`, plus a lock for concurrent hook processes.
-Squid scans marker names/mtimes to show approval_needed; terminal/turn events
-remove them and stale markers expire. The script emits no approval decision
+Only SHA-256 request identifiers, reference counts, and permission-cohort
+creation timestamps are persisted in `~/.squid-pet/codex_awaiting_input/`,
+plus a lock for concurrent hook processes. Hidden `.permissions.*` files
+count shell approval requests per session and turn. Squid reads the bounded
+`ExecApproval` metadata prefix from `$CODEX_HOME/logs_2.sqlite` read-only
+(default `~/.codex/logs_2.sqlite`): session/turn/request IDs, decision category,
+and timestamp. The SQL projection truncates before policy/command payloads;
+no tool output, transcript, prompt, or command content is fetched.
+
+When all shell requests in that cohort have received decisions, Squid stops
+waving on the next watcher tick, without waiting for commands to finish.
+Other sessions/turns and input questions remain separate. Marker files stay
+until completion to preserve concurrent request counts; terminal/turn events
+remove them and stale markers expire. No generic shell activity clears a wait.
+Missing/locked databases, unknown formats, incomplete log scans, and older
+markers without cohort data conservatively retain completion-based behavior.
+This adapter is verified against Codex 0.153.4's local log format, which is
+not a stable public API. Non-shell approvals retain the hook-based fallback;
+subagent hooks whose session IDs differ from decision-log IDs also fall back.
+The frontend's polling interval adds to the normal ~1s watcher latency.
+Auto-approved requests that emit no decision record can keep a mixed cohort
+visible until its completion hooks arrive. The script emits no approval decision
 or model instructions and sends nothing over the network.
 
 The explicit setup command `scripts/install_codex_hooks.py` merges hook
@@ -243,3 +261,75 @@ line at the bottom of `--why` will tell you which signal fired.
 ## Questions?
 
 Open an issue at https://github.com/sirshecomesthisway/squid-pet/issues.
+
+
+### Codex silent-turn tracking
+
+`UserPromptSubmit` records an opaque session/turn hash in
+`~/.squid-pet/codex_turn_active/`. Each marker contains only the owning Codex
+process ID, process creation time, and last lifecycle update timestamp.
+The hook walks process ancestors and reads executable paths to find Codex;
+it does not read ancestor command arguments. `PostToolUse` refreshes existing
+markers; it cannot reopen a finished turn. `Stop` and `Interrupt` clear only
+the matching turn; `SessionEnd` clears that session. A live marker supplies
+`thinking` when shell/file/transcript activity is silent, below approval and
+actual tool activity in priority, and prevents inactivity sleep.
+
+Markers require a live matching process identity and expire after one hour
+without a lifecycle update. PID reuse cannot revive them. Unavailable psutil,
+inaccessible ancestry, or missing turn IDs disables this backstop while leaving
+approval hooks operational. The documented Codex UserPromptSubmit payload has
+a turn_id, but older/other hosts may differ. Hooks installed partway through a
+turn cannot reconstruct its opening event; tracking starts with the next
+UserPromptSubmit. A lost Stop while its owner stays alive can retain thinking
+until the one-hour expiry; very long silent reasoning can exceed that bound.
+Real UI approval latency, session/subagent lifecycle delivery, and hook
+continuations after Stop remain local-Mac validation cases.
+
+
+### Notification delivery
+
+Queued approval notifications re-read the originating request/session markers
+(and Codex decision metadata) immediately before dispatch, including before an
+AppleScript fallback after a notifier error. A new approval episode cannot
+revive the previous episode's queued notification. macOS controls delivery
+once a notification has been submitted: AppleScript provides no request ID
+with which Squid can retract its already-submitted banner. OS notification
+queueing, Focus settings and audible/banner timing still need a real Mac check.
+
+
+### Codex approval click targeting
+
+Pending Codex requests now have an opaque `.owner.<request-hash>` companion
+containing only the owning PID and process creation time. Completion removes it
+with the final reference; turn/session cleanup removes matching companions.
+Click targeting validates that identity, reads its live controlling TTY and
+walks its executable/app ancestry. It does not store window titles or terminal
+contents. Requests created before this update can use their exact turn marker
+as identity evidence; there is no fallback to an arbitrary agent process.
+
+While Codex requests are pending, approval double-clicks target the newest
+Codex request. Terminal.app must expose an exact matching TTY tab before Squid
+activates/selects anything. Unknown/exited owners, missing tabs and unsupported
+hosts return `none` rather than activating an unrelated window. Other terminal
+hosts need a future exact-tab adapter; Claude-only routing remains as before.
+A resolved wave with no remaining Claude or Codex request also opens nothing.
+Real multi-window Terminal focus and OS Automation permissions need a local
+Mac check; fixtures verify the selected identity and generated AppleScript.
+
+### Active-state click provenance
+
+Each state snapshot carries an in-memory `focus_target` describing the
+evidence that won that tick. For Codex shell work it contains only the owning
+process ID and creation time; for a silent Codex turn it uses the same
+process-bound turn marker, and transcript activity is attributed only when its
+opaque transcript-path hash matches exactly one live turn marker. Project-file
+writes and ambiguous shared transcript activity deliberately carry no target.
+
+`take_me_there` consumes that snapshot rather than rescanning all live agents
+after the click. Codex targets validate the process identity again and select
+a matching Terminal.app TTY tab; Claude targets retain the existing app/tab
+resolver for compatibility with Cursor, iTerm and other hosts. If provenance is absent, the owner has exited,
+the PID was reused, or the host cannot provide exact tab selection, it returns
+`none`; it never substitutes an unrelated Claude or Codex session. Generic
+Git/IDE celebration and unsupported failure states likewise have no target.
