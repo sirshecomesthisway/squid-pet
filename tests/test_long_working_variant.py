@@ -2,16 +2,16 @@
 `working` state (feat/pancake-flip-long-working).
 
 The variant is NOT a new backend state: it's a flag (get_state()['long_working'])
-that flips True once the CURRENT continuous working stretch has lasted at least
+that flips True once accumulated agent-work time has lasted at least
 config.long_working_threshold_sec(). The frontend uses it to swap the static
-working sprite for the 20-frame pancake-flip animation; everything else about
-`working` (detection, bubbles, transitions) is unchanged.
+working sprite for the 20-frame pancake-flip animation; thinking and tool
+activity contribute to the accumulated total, while approval waits pause it.
 
 These tests pin the duration-tracking rules:
   - below threshold  -> long_working False (normal working art)
   - past threshold    -> long_working True  (pancake variant)
-  - leaving working   -> timer resets; the next stretch counts from zero
-  - a "still working" reannounce refresh must NOT reset the timer
+  - approval_needed   -> accumulated total is held, not advanced
+  - a quiet new session -> timer resets; the next session counts from zero
 
 Reuses the __new__ + manual-attribute + MagicMock-observer fixture pattern from
 test_working_reannounce.py: PetApi's real __init__ builds a window/menu/watcher
@@ -45,7 +45,6 @@ def _make_api():
     api._pending_bubble_priority = 0
     api._last_working_bubble_at = 0.0
     api._last_working_bubble_text = ""
-    api._working_since = None
     # Attributes get_state() reads (fixture bypasses __init__).
     api._frontend_mood = ""
     api._last_wake_at = 0.0
@@ -70,9 +69,7 @@ def _short_threshold():
 def test_below_threshold_is_not_long_working():
     api = _make_api()
     with _short_threshold():
-        api.update(PetState(state="working", timestamp=1000.0))
-        # 10s into the stretch -- nowhere near THRESHOLD.
-        api.update(PetState(state="working", timestamp=1010.0))
+        api.update(PetState(state="working", timestamp=1010.0, work_seconds=10.0))
         assert api._is_long_working() is False
         assert api.get_state()["long_working"] is False
 
@@ -80,8 +77,8 @@ def test_below_threshold_is_not_long_working():
 def test_past_threshold_is_long_working():
     api = _make_api()
     with _short_threshold():
-        api.update(PetState(state="working", timestamp=1000.0))
-        api.update(PetState(state="working", timestamp=1000.0 + THRESHOLD + 1))
+        api.update(PetState(state="working", timestamp=1000.0,
+                            work_seconds=THRESHOLD + 1))
         assert api._is_long_working() is True
         assert api.get_state()["long_working"] is True
 
@@ -90,21 +87,20 @@ def test_exactly_at_threshold_is_long_working():
     """Boundary: elapsed == threshold counts as long-working (>=)."""
     api = _make_api()
     with _short_threshold():
-        api.update(PetState(state="working", timestamp=1000.0))
-        api.update(PetState(state="working", timestamp=1000.0 + THRESHOLD))
+        api.update(PetState(state="working", timestamp=1000.0,
+                            work_seconds=THRESHOLD))
         assert api._is_long_working() is True
 
 
 def test_leaving_working_resets_the_timer():
     api = _make_api()
     with _short_threshold():
-        api.update(PetState(state="working", timestamp=1000.0))
-        api.update(PetState(state="working", timestamp=1000.0 + THRESHOLD + 1))
+        api.update(PetState(state="working", timestamp=1000.0,
+                            work_seconds=THRESHOLD + 1))
         assert api._is_long_working() is True
 
         # Leave working -> the stretch is over, the clock must clear.
         api.update(PetState(state="idle", timestamp=5000.0))
-        assert api._working_since is None
         assert api._is_long_working() is False
         assert api.get_state()["long_working"] is False
 
@@ -112,42 +108,70 @@ def test_leaving_working_resets_the_timer():
 def test_next_working_stretch_counts_from_zero():
     api = _make_api()
     with _short_threshold():
-        api.update(PetState(state="working", timestamp=1000.0))
-        api.update(PetState(state="working", timestamp=1000.0 + THRESHOLD + 1))
-        api.update(PetState(state="thinking", timestamp=5000.0))
+        api.update(PetState(state="working", timestamp=1000.0,
+                            work_seconds=THRESHOLD + 1))
+        api.update(PetState(state="thinking", timestamp=5000.0,
+                            work_seconds=THRESHOLD + 1))
 
         # A brand-new working stretch starts counting from its own entry,
         # NOT from the earlier long stretch.
-        api.update(PetState(state="working", timestamp=6000.0))
-        api.update(PetState(state="working", timestamp=6010.0))  # only 10s in
+        api.update(PetState(state="working", timestamp=6000.0, work_seconds=10.0))
         assert api._is_long_working() is False
 
 
 def test_reannounce_refresh_does_not_reset_the_timer():
     """A 'still working' reannounce (same state across ticks, no transition)
-    must not reset _working_since -- otherwise a chatty stretch would never
-    reach the threshold. The reannounce path fires on the same-state branch
-    of update(); this walks several such ticks and confirms the start stamp
-    is untouched and the variant still trips once enough real time passes."""
+    not affect the work clock. The reannounce path fires on the same-state
+    branch of update(); this walks several ticks while the backend supplies
+    the same accumulated total."""
     api = _make_api()
     # Make on_still_working return a fresh line each call so the reannounce
     # path actually does work (publishes bubbles) across these ticks.
     lines = iter(f"still working {i}" for i in range(100))
     api._observer.on_still_working.side_effect = lambda _cmd: next(lines)
     with _short_threshold():
-        api.update(PetState(state="working", timestamp=1000.0))
-        assert api._working_since == 1000.0
+        api.update(PetState(state="working", timestamp=1000.0, work_seconds=0.0))
 
         # Many same-state ticks well past the reannounce cadence -- each one
         # is a reannounce refresh, none is a transition. Ends one tick past
         # the threshold (1000 + THRESHOLD + 1) so the variant should trip.
         for t in range(1015, 1000 + int(THRESHOLD) + 2, 15):
-            api.update(PetState(state="working", timestamp=float(t)))
-        api.update(PetState(state="working", timestamp=1000.0 + THRESHOLD + 1))
+            api.update(PetState(state="working", timestamp=float(t),
+                                work_seconds=float(t - 1000)))
+        api.update(PetState(state="working", timestamp=1000.0 + THRESHOLD + 1,
+                            work_seconds=THRESHOLD + 1))
 
-        # The start stamp survived every reannounce...
-        assert api._working_since == 1000.0
-        # ...and the accumulated wall-time still trips the variant.
+        # The accumulated wall-time still trips the variant.
+        assert api._is_long_working() is True
+
+
+def test_accumulated_work_seconds_cross_state_boundaries():
+    """Thinking time contributes to the pancake threshold."""
+    api = _make_api()
+    with _short_threshold():
+        api.update(PetState(state="working", timestamp=1000.0,
+                            work_seconds=90.0))
+        api.update(PetState(state="thinking", timestamp=1001.0,
+                            work_seconds=THRESHOLD + 1))
+        api.update(PetState(state="working", timestamp=1002.0,
+                            work_seconds=THRESHOLD + 1))
+        assert api._is_long_working() is True
+
+
+def test_approval_pause_keeps_accumulated_work_without_advancing_it():
+    """An approval display pauses the total and resumes at the same total."""
+    api = _make_api()
+    with _short_threshold():
+        api.update(PetState(state="working", timestamp=1000.0,
+                            work_seconds=90.0))
+        api.update(PetState(state="approval_needed", timestamp=2000.0,
+                            work_seconds=90.0))
+        assert api._is_long_working() is False
+        api.update(PetState(state="thinking", timestamp=2001.0,
+                            work_seconds=90.0))
+        assert api._is_long_working() is False
+        api.update(PetState(state="working", timestamp=2002.0,
+                            work_seconds=THRESHOLD + 1))
         assert api._is_long_working() is True
 
 

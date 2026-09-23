@@ -196,9 +196,9 @@ class WanderController:
         is_drag_active: Callable[[], bool],    # returns True if ugging
         get_window_origin: Callable[[], tuple[float, float] | None],
         set_window_origin: Callable[[float, float], None],
-        get_visible_frame: Callable[[], tuple[float, float, float, float]],
+        get_visible_frame: Callable[[], tuple[float, float, float, float] | None],
         set_sub_state: Callable[[str], None],
-        set_edge: Callable[[str], None] = None,
+        set_edge: Callable[[str], None] | None = None,
     ):
         self._get_state = get_state
         self._is_drag_active = is_drag_active

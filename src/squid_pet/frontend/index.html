@@ -1121,7 +1121,7 @@
     // ─────── OBSERVER bubble (observer-mode 2026-06-13) ───────
     // State machine for the speech bubble:
     //   _bubbleText      -- text currently being displayed (or null if none)
-    //   _bubbleHoldT     -- timeout id for the 2500ms "stay visible" phase
+    //   _bubbleHoldT     -- timeout id for the 5000ms "stay visible" phase
     //   _bubbleFadeT     -- timeout id for the 400ms fade-out animation
     //   _bubbleClearing  -- true while fade-out animation is playing
     //
@@ -1133,6 +1133,7 @@
     let _bubbleHoldT = null;
     let _bubbleFadeT = null;
     let _bubbleClearing = false;
+    const BUBBLE_HOLD_MS = 5000;
 
     function _ackBubbleToBackend() {
       try {
@@ -1224,11 +1225,11 @@
       el.classList.add("show-in");
       _bubbleText = text;
 
-      // Hold for 2500ms then begin fade
+      // Hold for 5000ms then begin fade
       _bubbleHoldT = setTimeout(() => {
         _bubbleHoldT = null;
         _hideBubble(el);
-      }, 2500);
+      }, BUBBLE_HOLD_MS);
     }
 
     function maybeShowBubble(text) {
