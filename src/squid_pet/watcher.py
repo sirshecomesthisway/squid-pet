@@ -128,6 +128,7 @@ class PetState:
     claude_code_running: bool = False
     codex_running: bool = False
     timestamp: float = 0.0
+    work_seconds: float = 0.0  # accumulated agent-work wall-clock seconds
     message: str = ""             # short caption shown under the pet
     concern_reason: str = ""      # short headline of why concerned (for tooltip)
     concern_severity: str = ""    # "transient" (network) or "hard" (code crash)
@@ -1201,6 +1202,12 @@ class StateMachine:
         # a double-click during that generation gap can lose provenance and
         # return no destination even though the agent is still active.
         self._working_focus_target: dict | None = None
+        self._work_seconds: float = 0.0
+        self._work_clock_last_at: float | None = None
+        self._work_session_open: bool = False
+        self._work_clock_billable: bool = False
+        self._work_signal_agents: frozenset[str] = frozenset()
+        self._approval_pending_agents: frozenset[str] = frozenset()
         # Pink-2026-09-04: awake hold. A wake -- poke, sprint, or the
         # 15-min periodic auto-wake -- used to live entirely in PetApi
         # (wake_trigger_seq + user_wake_until), which only the frontend
@@ -1266,6 +1273,7 @@ class StateMachine:
         self._apply_approval_override(
             st, now, awaiting_sessions_raw, notify=notify)
         self._apply_force_state_override(st)
+        self._update_work_clock(st, now)
         return st
 
     # ── compute() helpers (extracted for readability + unit testing) ──
@@ -1288,6 +1296,39 @@ class StateMachine:
             st.agent_idle_seconds = 0.0
             self._agent_idle_since = 0.0
         self._last_state = st.state
+
+    def _update_work_clock(self, st: PetState, now: float) -> None:
+        """Accumulate active Claude/Codex wall time, pausing for approval.
+
+        The previous sample owns the interval that just elapsed. This avoids
+        charging an approval wait when the next sample sees that approval has
+        cleared, and also avoids losing the work interval when a wait starts.
+        Raw pending approval markers pause only their own agent, so a second
+        concurrent agent can continue contributing time.
+        """
+        previous = self._work_clock_last_at
+        self._work_clock_last_at = now
+        pending = self._approval_pending_agents
+        billable = bool(self._work_signal_agents - pending)
+        if previous is None:
+            self._work_session_open = billable
+            self._work_clock_billable = billable
+            st.work_seconds = self._work_seconds
+            return
+        delta = max(0.0, now - previous)
+        if self._work_clock_billable and self._work_session_open:
+            self._work_seconds += delta
+        if billable:
+            self._work_session_open = True
+        elif pending and self._work_session_open:
+            # Preserve the accumulated session while an approval is pending,
+            # even after its agent's active-turn signal goes quiet.
+            pass
+        else:
+            self._work_session_open = False
+            self._work_seconds = 0.0
+        self._work_clock_billable = billable
+        st.work_seconds = round(self._work_seconds, 3)
 
     def _self_heal_stale_claude_flags(
         self, st: PetState, now: float, awaiting_sessions_raw: list
@@ -1378,13 +1419,24 @@ class StateMachine:
         except Exception:
             _enabled, _sound, _text = True, "Glass", "your turn"
 
+        # Pause accounting from the raw hook markers, independently of the
+        # notification eligibility/snooze policy below. A user may dismiss
+        # the wave while the underlying permission request is still pending.
+        codex_waits_raw = codex_requests_awaiting_input()
+        pending_agents = set()
+        if awaiting_sessions_raw:
+            pending_agents.add("claude")
+        if codex_waits_raw:
+            pending_agents.add("codex")
+        self._approval_pending_agents = frozenset(pending_agents)
+
         # Pink-2026-08-26: no engagement gate needed (see
         # filter_eligible_claude_sessions's docstring for why).
         awaiting_sessions = filter_eligible_claude_sessions(
             awaiting_sessions_raw if _enabled else []
         )
         codex_waits = filter_eligible_codex_requests(
-            codex_requests_awaiting_input() if _enabled else [])
+            codex_waits_raw if _enabled else [])
         fired_reason: str | None = None
         if awaiting_sessions:
             fired_reason = ("awaiting_input flag from Claude Code session(s) "
@@ -1537,6 +1589,21 @@ class StateMachine:
         from .codex_turns import active_turns
         codex_turn_records = active_turns(now) if codex_running else []
         codex_turn_active = bool(codex_turn_records)
+        turn_in_flight = claude_turn_in_flight(now)
+        try:
+            from . import config as _work_cfg
+            _turn_stall = float(_work_cfg.get(
+                "turn_stall_sec", TURN_STALL_SEC_DEFAULT))
+        except Exception:
+            _turn_stall = TURN_STALL_SEC_DEFAULT
+        # A turn marker is useful evidence only while its owning detector is
+        # enabled/running and its transcript heartbeat is still inside the
+        # same stall boundary used by the visible thinking branch. This keeps
+        # usage-limit and exited-session markers from accruing work forever.
+        claude_turn_active = bool(
+            claude is not None and claude.enabled and claude_running
+            and turn_in_flight and claude_transcript_age <= _turn_stall
+        )
 
         def codex_target(record) -> dict | None:
             if not record:
@@ -1572,6 +1639,16 @@ class StateMachine:
             or claude_file_active or codex_file_active
         )
         streaming_merged = claude_streaming or codex_streaming
+        work_signal_agents: set[str] = set()
+        if (claude is not None and claude.enabled and claude_running
+                and (claude_shell_active or claude_file_active or claude_streaming
+                     or claude_turn_active)):
+            work_signal_agents.add("claude")
+        if (codex is not None and codex.enabled and codex_running
+                and (codex_shell_active or codex_file_active or codex_streaming
+                     or codex_turn_active)):
+            work_signal_agents.add("codex")
+        self._work_signal_agents = frozenset(work_signal_agents)
 
         def _working_reason() -> str:
             """Which agent's hard evidence (shell/file) earns credit in
@@ -1660,7 +1737,7 @@ class StateMachine:
         # the exact same merged signals branch 4 below uses to decide
         # working/thinking, so this can never disagree with what the
         # rest of the cascade would call "busy".
-        agent_actively_busy = working_evidence_merged or streaming_merged or codex_turn_active
+        agent_actively_busy = bool(self._work_signal_agents)
         # Pink-2026-09-04: sleeping used to require the HUMAN to be away
         # (macOS HID idle >= 5 min). That is the wrong question for a pet
         # that watches agents: Pink sitting at the keyboard writing docs
@@ -1726,7 +1803,6 @@ class StateMachine:
         # when anything held for the boundary is released. Doing this here,
         # before any branch runs, means every branch below sees a
         # consistent view of "which turn are we in".
-        turn_in_flight = claude_turn_in_flight(now)
         try:
             from . import config as _cfg2
             _celebrate_hold = float(_cfg2.get(
@@ -1830,10 +1906,8 @@ class StateMachine:
             try:
                 from . import config as _cfg
                 _work_hold = float(_cfg.get('working_hold_sec', 25))
-                _turn_stall = float(_cfg.get('turn_stall_sec', TURN_STALL_SEC_DEFAULT))
             except Exception:
                 _work_hold = 25.0
-                _turn_stall = TURN_STALL_SEC_DEFAULT
             # 4a. WORKING -- actively running tool / shell command, or a
             # project file was just written (catches in-process
             # Edit/Write/apply_patch calls that never spawn a
@@ -1896,7 +1970,7 @@ class StateMachine:
             # transcript silence, stop claiming she is thinking and fall
             # through to idle. transcript_age needs no transcript CONTENT --
             # mtime only, same privacy stance as the rest of the detector.
-            if turn_in_flight and claude_transcript_age <= _turn_stall:
+            if claude_turn_active:
                 st.state = "thinking"
                 st.state_reason = "claude turn in flight"
                 st.focus_target = {"agent": "claude"}
