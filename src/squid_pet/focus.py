@@ -67,25 +67,114 @@ def _signal_dirs() -> dict:
         # terminal, same session->tty->tab chain as the others. Keyed by the
         # claude_failed flag the StopFailure hook writes. (A Codex-sourced
         # concern has no per-session flag dir, so take_me_there falls through
-        # to "resting" there -- acknowledge_concern still calms it.)
+        # to "resting" there -- acknowledge_concern still calms it. That is
+        # only true because _state_fresh_sec bounds the lookup: see below.)
         "concerned":       w.CLAUDE_FAILED_DIR,
     }
 
 
 STATE_SIGNAL_DIRS = _signal_dirs()
 
+# States where we refuse to guess a window: if the responsible session cannot
+# be identified, take-me-there does nothing rather than raising a Claude tab
+# on spec.
+#
+# `concerned` qualifies because Codex raises it too and a Codex failure leaves
+# no per-session flag anywhere, so "nothing fresh" can mean "no Claude session
+# was involved at all" -- blind-raising a Claude window is then not imprecise,
+# it is the wrong window, the exact bug this module exists to prevent. The
+# watcher's _apply_failure_override prefers Claude over Codex, so a Codex-
+# sourced concern really does imply no fresh Claude flag.
+#
+# DELIBERATELY NOT exhaustive. `working`, `thinking` and `celebrating` are
+# multi-source too (working_evidence_merged/streaming_merged OR in
+# codex_shell_active/codex_file_active/codex_streaming; celebrating fires on
+# codex_celebrating or a Git commit), and `approval_needed` is effectively
+# bounded by the 120s _CLAUDE_SESSION_SNOOZE_SEC rather than by staleness --
+# so all of them can in principle raise the wrong window the same way. They
+# are left out on purpose: the blind fallback there is Pink's documented
+# choice ("better to raise the right app than to do nothing at all"), and
+# flipping it is a UX call, not a bug fix. Widening this set means revisiting
+# that test, deliberately.
+_MULTI_SOURCE_STATES = frozenset({"concerned"})
 
-def _freshest_in(dir_path: str) -> Optional[str]:
+# Slack for the ONE clock that actually feeds this decision. take_me_there
+# reads PetApi._latest.state, which the watcher thread refreshes every
+# POLL_INTERVAL_SEC -- the frontend's own poll never enters it. So the state we
+# are handed is at most one tick stale, and two ticks of grace covers that.
+#
+# Kept deliberately tight: every second of grace is a second in which focus
+# accepts a flag the watcher has already rejected, which re-opens the
+# cross-source hijack this bound exists to close. An earlier revision used a
+# flat 5s reasoned from the on-screen sprite lag -- the wrong clock, and 4s
+# wider than the real one needs.
+_FRESHNESS_GRACE_SEC = 2 * 1.0  # 2 * watcher.POLL_INTERVAL_SEC (import-cycle-safe)
+
+
+def _state_fresh_sec(state: str) -> Optional[float]:
+    """How recent a flag must be to still count as the cause of `state`.
+
+    Take-me-there must follow the SAME signal that produced the face, so
+    these mirror the fresh windows the watcher itself used when it decided
+    the state -- they are not an independent policy, and deliberately not
+    new magic numbers.
+
+    Pink-2026-09-19: without this, focus read the flag dirs with no freshness
+    rule at all while the watcher honoured one, so the two could disagree.
+    The flag dirs are only *deleted* on their stale sweep (2h), far longer
+    than any "still counts" window, which produced the exact wrong-window
+    class this module exists to fix. Worked example: a Claude session fails
+    at T. At T+400s the flag is no longer fresh so she stops looking
+    concerned, but ~/.squid-pet/claude_failed/<sid> is still on disk. At
+    T+600s Codex fails, so she is concerned again -- from a Codex signal.
+    Double-clicking used to read that stale *Claude* flag and raise the wrong
+    session's tab. Bounded, the lookup finds nothing fresh, returns None, and
+    focus_for_state falls through to "resting" -- which is what the
+    STATE_SIGNAL_DIRS docstring above always claimed happened.
+
+    SCOPE IS DELIBERATELY `concerned` ONLY, and None (no window) everywhere
+    else. `working`, `thinking`, `celebrating` and `grooving` carry the same
+    latent bug -- their flags outlive their "still counts" window by up to the
+    2h sweep, and every one of them can also be raised by Codex or a Git
+    commit with no Claude flag at all -- but bounding them is not a freshness
+    change. It collides with a deliberate, tested UX choice: when no session
+    can be named she should still raise *a* window rather than do nothing
+    (test_an_active_state_with_no_flag_still_raises_the_app). Bounding them
+    without settling that first only converts a wrong-window raise into a less
+    precise one, so it is left as a known gap on the PR rather than
+    half-fixed here. See _MULTI_SOURCE_STATES.
+    """
+    from . import watcher as w
+    if state == "concerned":
+        # Plus a grace margin, because the face LAGS the flag: the watcher
+        # re-evaluates on a POLL_INTERVAL_SEC tick and the frontend then polls
+        # state.json, so she is still visibly concerned for a second or two
+        # after the flag ages out. Bounding at exactly the watcher's window
+        # would make a double-click in that gap do nothing at all -- strictly
+        # worse than the old fallback. The cross-source case this bound exists
+        # for is minutes wide, so a few seconds of slack costs it nothing.
+        return w.CLAUDE_FAILED_FRESH_SEC + _FRESHNESS_GRACE_SEC
+    return None
+
+
+def _freshest_in(dir_path: str, fresh_sec: Optional[float] = None) -> Optional[str]:
     """Newest flag filename (a session id) in a signal directory.
 
     Freshest rather than first: whichever session most recently caused the
     state is the one you are reacting to.
+
+    When fresh_sec is given, entries older than that are ignored -- excluded
+    from consideration, never deleted; pruning belongs to the watcher's stale
+    sweep, and this module must stay read-only so a double-click can never
+    destroy state the watcher is still reasoning about.
     """
     import os
+    import time
     try:
         names = os.listdir(dir_path)
     except OSError:
         return None
+    now = time.time()
     best: tuple[float, str] | None = None
     for name in names:
         if name.startswith("."):
@@ -93,6 +182,8 @@ def _freshest_in(dir_path: str) -> Optional[str]:
         try:
             mtime = os.stat(os.path.join(dir_path, name)).st_mtime
         except OSError:
+            continue
+        if fresh_sec is not None and (now - mtime) > fresh_sec:
             continue
         if best is None or mtime > best[0]:
             best = (mtime, name)
@@ -260,7 +351,11 @@ def _focus_claude_state(state: str,
     signal_dir = STATE_SIGNAL_DIRS.get(state)
     if signal_dir is None:
         return "resting"
-    sid = _freshest_in(signal_dir)
+    # Unbounded for every state but `concerned` (see _state_fresh_sec), so
+    # this stays exactly the pre-existing lookup everywhere else: no
+    # behaviour change, and no second pass that could only ever return the
+    # same answer.
+    sid = _freshest_in(signal_dir, _state_fresh_sec(state))
     tty = None
     bundle = None
     if sid:
@@ -277,7 +372,31 @@ def _focus_claude_state(state: str,
         except Exception:
             tty = None
             bundle = None
+    if sid is None and state in _MULTI_SOURCE_STATES:
+        # NOTHING fresh named a session, so for a multi-source state there is
+        # no evidence a Claude session was involved at all -- the face can
+        # only have come from the other source. Blind-raising a Claude window
+        # here is not imprecise, it is the wrong window.
+        #
+        # Deliberately narrower than "tty is None": a sid that resolves but
+        # whose PROCESS has since exited is a different case -- a Claude
+        # session demonstrably did just fail, we simply cannot find its tab,
+        # and raising the right app is a reasonable best effort there. That
+        # case is this feature author's documented choice, pinned by
+        # test_take_me_there_falls_back_to_session_blind_bundle_when_unresolved.
+        return "resting"
     if tty is None:
+        # PRE-EXISTING, and it really is a guess: _any_claude_tty() returns
+        # whichever live claude turns up first, and bundle stays None so
+        # _raise blind-resolves the app too. With another session alive this
+        # selects ITS tab and reports "matched" -- confidently taking you to an
+        # unrelated healthy session. Untouched here because it is the feature
+        # author's documented choice ("better to raise the right app than to do
+        # nothing at all", pinned by
+        # test_take_me_there_falls_back_to_session_blind_bundle_when_unresolved
+        # and test_an_active_state_with_no_flag_still_raises_the_app), and
+        # narrowing it is the same guess-vs-nothing product call this change
+        # deliberately does not make. Listed as a known gap on the PR.
         tty = _any_claude_tty()
     return _raise(tty, run, bundle=bundle)
 

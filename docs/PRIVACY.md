@@ -62,7 +62,9 @@ can't affect it (or vice versa) -- it's wired up and torn down entirely
 through `~/.claude/settings.json`.
 
 To fill `claude_session_tty/` the hook runs `ps -Ao pid=,ppid=,tty=` once
-per event and walks the parent chain up to its own `claude` process to read
+per turn (on `UserPromptSubmit` only -- a session's terminal cannot change
+without a new prompt) and walks the parent chain up to its own `claude`
+process to read
 that session's terminal (Claude Code spawns hooks without a controlling
 terminal of their own). It requests only three process-table columns --
 pid, parent pid, and tty -- never command lines, arguments, environments, or

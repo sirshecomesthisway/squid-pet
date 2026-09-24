@@ -277,21 +277,61 @@ def _own_controlling_tty() -> str | None:
     return None
 
 
+# Set when a tty lookup could not be carried out at all (the `ps` snapshot
+# failed or timed out), as opposed to running fine and finding no terminal.
+# The two look identical to callers of _controlling_tty() -- both give None --
+# but they must NOT be treated the same: "no terminal" is a fact we can act
+# on, "could not find out" is not. Module-level is safe here because the hook
+# is a single-shot process: one event, one lookup, then exit.
+_TTY_LOOKUP_FAILED = False
+
+
 def _ancestor_tty_via_ps() -> str | None:
     """First ancestor process (starting from this hook) that has a real
     controlling terminal, via a single `ps` snapshot walked in memory.
 
-    One subprocess call, not one per hop -- this runs on every hook event,
-    so it stays cheap. Any failure yields None (best-effort)."""
+    One subprocess call, not one per hop. Since Pink-2026-09-19 this runs once
+    per turn (see _record_session_tty), not on every event. Any failure yields
+    None and sets _TTY_LOOKUP_FAILED (best-effort)."""
+    global _TTY_LOOKUP_FAILED
     import subprocess
     try:
-        out = subprocess.run(
+        r = subprocess.run(
             ["ps", "-Ao", "pid=,ppid=,tty="],
             capture_output=True, text=True, timeout=3,
-        ).stdout
+        )
     except Exception:
+        _TTY_LOOKUP_FAILED = True
         return None
-    return _first_ancestor_tty(out, os.getpid())
+    # Parse FIRST: `ps` exits nonzero merely because it could not read some
+    # unrelated process, while still printing a perfectly usable table. Only
+    # if the walk found nothing do we ask whether the run itself was sound --
+    # a bad run means "could not find out", not "no ancestor has a terminal",
+    # and the caller must keep any existing entry rather than delete it on the
+    # strength of an unusable snapshot.
+    me = os.getpid()
+    tty = _first_ancestor_tty(r.stdout, me)
+    if tty is None and (
+        r.returncode != 0
+        or not r.stdout.strip()
+        # Our OWN pid is always running, so its absence means the snapshot is
+        # filtered/partial (sandboxed or shimmed `ps`), not that the walk
+        # legitimately reached the top without finding a terminal. Without
+        # this the caller would delete a valid entry over an unusable table.
+        or not _pid_in_snapshot(r.stdout, me)
+    ):
+        _TTY_LOOKUP_FAILED = True
+    return tty
+
+
+def _pid_in_snapshot(ps_output: str, pid: int) -> bool:
+    """Whether `pid` appears as a pid (first column) in a ps snapshot."""
+    want = str(pid)
+    for line in ps_output.splitlines():
+        parts = line.split()
+        if parts and parts[0] == want:
+            return True
+    return False
 
 
 def _first_ancestor_tty(ps_output: str, start_pid: int) -> str | None:
@@ -325,20 +365,80 @@ def _first_ancestor_tty(ps_output: str, start_pid: int) -> str | None:
     return None
 
 
-def _record_session_tty(session_id: str) -> None:
-    """Best-effort: remember which terminal this session lives in, refreshed
-    on every event so it tracks a session that moves hosts. Never fails the
-    hook; a missing tty simply leaves no entry."""
+def _record_session_tty(session_id: str, event: str) -> None:
+    """Best-effort: remember which terminal this session lives in. Never fails
+    the hook; a missing tty simply leaves no entry (the reader falls back to
+    the cwd guess).
+
+    Pink-2026-09-19 -- resolved ONLY on _TURN_OPEN_EVENTS. This used to run on
+    every event. Claude Code spawns hooks with no controlling terminal
+    (verified live: the hook process shows `tty ??`), so _own_controlling_tty()
+    always fails and _ancestor_tty_via_ps() runs, forking `ps -Ao` over every
+    process on the machine -- measured at 73-140ms. PostToolUse fires after
+    every tool call and hooks BLOCK the turn, so a 30-tool turn was paying 2+
+    seconds for a value that had not changed.
+
+    Once per turn is both sufficient and necessary:
+      - sufficient, because a session's tty is fixed for the life of its
+        process, and the one way a session_id legitimately moves hosts
+        (`claude --resume` in another tab) cannot happen without submitting a
+        prompt first;
+      - necessary, because anything cheaper would have to trust a cached
+        value across a resume.
+
+    Deliberately NOT "skip when an entry already exists": that variant still
+    paid the full cost on every event for any session where no ancestor has a
+    terminal at all (`claude -p`, CI, a detached spawn), since the lookup fails
+    and no file is ever written -- precisely the population the change is
+    supposed to relieve. The cost of this rule is that a hook installed
+    mid-session has no entry until that session's next prompt; one turn of
+    cwd-guess fallback is a fair price.
+    """
+    if event not in _TURN_OPEN_EVENTS:
+        return
     tty = _controlling_tty()
+    path = os.path.join(TTY_DIR, session_id)
     if not tty:
+        if _TTY_LOOKUP_FAILED:
+            # We could not find out -- `ps` failed or timed out on a loaded
+            # machine. Keep whatever we had: it is probably still correct, and
+            # this is now the only refresh point, so destroying a valid entry
+            # over a transient hiccup would strand the whole turn on the cwd
+            # guess (wrong window whenever two sessions share a directory in
+            # different hosts -- exactly what this registry prevents).
+            return
+        # Lookup ran and found no terminal: a fact. Drop any existing entry
+        # rather than keep a value we just decided needed refreshing -- after
+        # a `claude --resume` into a different tab, a stale tty sends "take me
+        # there" to a confidently wrong window, while no entry merely falls
+        # back to the cwd guess.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
         return
     if not _ensure_dir(TTY_DIR, "tty"):
         return
+    # tmp + rename so a reader never sees a half-written entry, and a failed
+    # write cannot truncate a good entry into a zero-byte one. The pid in the
+    # tmp name keeps that true even if two hooks for the same session ever
+    # overlap (they should not now that this is turn-open only, but a shared
+    # tmp name would make the rename actively unsafe if they did).
+    tmp = f"{path}.{os.getpid()}.tmp"
     try:
-        with open(os.path.join(TTY_DIR, session_id), "w") as f:
+        with open(tmp, "w") as f:
             f.write(tty)
+        os.replace(tmp, path)
     except Exception as e:
         _log(f"TTY {session_id} WRITE_FAILED {e!r}")
+        try:
+            # Nothing ever sweeps TTY_DIR, so clean up after ourselves. This
+            # covers a failed write, not a kill between open() and replace() --
+            # such an orphan is inert (the dir is only ever read by exact
+            # session id, never listed) but would sit there indefinitely.
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def _ensure_dir(path: str, event: str) -> bool:
@@ -369,7 +469,7 @@ def main() -> int:
     # Record this session's terminal before dispatching, so every signal a
     # session can raise ("take me there") is resolvable to the exact tab/app
     # it fired from, not guessed by cwd. Cleared on SessionEnd below.
-    _record_session_tty(session_id)
+    _record_session_tty(session_id, event)
 
     if event == "Notification":
         ntype = payload.get("notification_type", "")
