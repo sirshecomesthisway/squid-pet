@@ -281,6 +281,199 @@ def test_post_tool_use_only_clears_its_own_session(home):
         "another session's genuinely-pending wave must survive")
 
 
+# ── subagent (Task-tool helper) events must not touch parent state ──────
+# Review finding 2: a subagent's PreToolUse/PostToolUse carry the PARENT
+# session_id plus an agent_id. Because PostToolUse is a remove-on-event, a
+# helper's tool call used to clear the parent's awaiting-input flag while the
+# parent was still blocked on the user (e.g. an AskUserQuestion), dropping the
+# wave. A helper event (agent_id present) must leave the parent's flag alone.
+def test_helper_post_tool_use_does_not_clear_awaiting_flag(home):
+    """The parent is blocked on the user; a background helper's PostToolUse
+    (carrying agent_id) must NOT clear the parent's awaiting-input flag."""
+    # Parent blocks on an AskUserQuestion.
+    _run({"session_id": "sess-h1", "hook_event_name": "PreToolUse",
+          "tool_name": "AskUserQuestion"}, home)
+    assert _flag_path(home, "sess-h1").exists()
+
+    # A background subagent tool call fires PostToolUse under the SAME parent
+    # session_id, but with an agent_id -- it must not clear the wave.
+    r = _run({"session_id": "sess-h1", "hook_event_name": "PostToolUse",
+              "tool_name": "Bash", "agent_id": "a0e33328136f521e9",
+              "agent_type": "general-purpose"}, home)
+    assert r.returncode == 0, r.stderr
+    assert _flag_path(home, "sess-h1").exists(), (
+        "a helper's PostToolUse must not clear the parent's pending wave")
+
+
+def test_main_thread_post_tool_use_still_clears_awaiting_flag(home):
+    """The main thread answering the question fires PostToolUse with NO
+    agent_id -- that must still clear the flag (unchanged behaviour)."""
+    _run({"session_id": "sess-h2", "hook_event_name": "PreToolUse",
+          "tool_name": "AskUserQuestion"}, home)
+    assert _flag_path(home, "sess-h2").exists()
+
+    r = _run({"session_id": "sess-h2", "hook_event_name": "PostToolUse",
+              "tool_name": "AskUserQuestion"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _flag_path(home, "sess-h2").exists()
+
+
+def test_helper_post_tool_use_tagged_in_log(home):
+    """The skip is tagged in the log so helper events are distinguishable
+    (content-blind: no tool payload logged)."""
+    _run({"session_id": "sess-h3", "hook_event_name": "PreToolUse",
+          "tool_name": "AskUserQuestion"}, home)
+    _run({"session_id": "sess-h3", "hook_event_name": "PostToolUse",
+          "tool_name": "Bash", "agent_id": "a0e33328136f521e9",
+          "tool_input": {"command": "rm -rf /secret/path"}}, home)
+    log_text = (home / "claude_hook.log").read_text()
+    assert "HELPER" in log_text
+    assert "secret" not in log_text
+
+
+# ── helper PreToolUse must not raise the parent's wave (finding 1) ──────
+# A plan-mode subagent fires PreToolUse ExitPlanMode carrying the PARENT
+# session_id + agent_id. Its later PostToolUse is HELPER_SKIPped, so if the
+# PreToolUse were allowed to write claude_awaiting_input/<parent sid> the false
+# wave would never clear. A helper PreToolUse must write nothing. (AskUserQuestion
+# can't happen in a subagent; ExitPlanMode can.)
+def test_helper_pre_tool_use_exit_plan_mode_writes_nothing(home):
+    r = _run({"session_id": "sess-p1", "hook_event_name": "PreToolUse",
+              "tool_name": "ExitPlanMode", "agent_id": "a0e33328136f521e9",
+              "agent_type": "general-purpose"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _flag_path(home, "sess-p1").exists(), (
+        "a helper's PreToolUse must not raise the parent's wave")
+
+
+def test_main_thread_pre_tool_use_exit_plan_mode_still_writes(home):
+    """The main thread (no agent_id) entering plan mode still waves."""
+    r = _run({"session_id": "sess-p2", "hook_event_name": "PreToolUse",
+              "tool_name": "ExitPlanMode"}, home)
+    assert r.returncode == 0, r.stderr
+    assert _flag_path(home, "sess-p2").exists()
+
+
+def test_main_thread_pre_tool_use_ask_user_question_still_writes(home):
+    """The main thread (no agent_id) asking a question still waves."""
+    r = _run({"session_id": "sess-p3", "hook_event_name": "PreToolUse",
+              "tool_name": "AskUserQuestion"}, home)
+    assert r.returncode == 0, r.stderr
+    assert _flag_path(home, "sess-p3").exists()
+
+
+def test_helper_pre_tool_use_tagged_helper_skip_in_log(home):
+    r = _run({"session_id": "sess-p4", "hook_event_name": "PreToolUse",
+              "tool_name": "ExitPlanMode", "agent_id": "a0e33328136f521e9"}, home)
+    assert r.returncode == 0, r.stderr
+    log_text = (home / "claude_hook.log").read_text()
+    assert "PreToolUse sess-p4 HELPER_SKIP" in log_text
+
+
+def test_helper_notification_permission_prompt_still_waves(home):
+    """A helper's permission_prompt is a genuine 'blocked on the user' moment
+    (Claude Code surfaces background-helper prompts in the main session), so the
+    Notification branch must NOT be gated on agent_id -- it still writes."""
+    r = _run({"session_id": "sess-p5", "hook_event_name": "Notification",
+              "notification_type": "permission_prompt",
+              "agent_id": "a0e33328136f521e9"}, home)
+    assert r.returncode == 0, r.stderr
+    assert _flag_path(home, "sess-p5").exists()
+
+
+# ── defence-in-depth: a helper event mutates NO parent state (finding A) ──
+# Round-2 finding: a helper (agent_id) event was skipped only in the FIRST
+# dispatch chain, then fell through into the second (Stop/StopFailure/PreCompact/
+# PostCompact + clear-failed) and third (turn open/close) chains. An agent_id
+# Stop would still write claude_finished/<parent> and close claude_turn_active/
+# <parent>; StopFailure would write claude_failed; UserPromptSubmit would open a
+# turn and clear failed; PreCompact/PostCompact would touch recapping. A helper
+# shares the PARENT session_id, so none of these may fire. (Live: subagents send
+# SubagentStop not Stop, but helper StopFailure/compaction are unverified -- this
+# is cheap defence in depth.)
+_HELPER_MUTATING_EVENTS = [
+    "Stop", "StopFailure", "UserPromptSubmit", "PreCompact", "PostCompact",
+    "SessionEnd",
+]
+
+
+def _seed_parent_flags(home: Path, sid: str) -> None:
+    for sub, content in (
+        ("claude_awaiting_input", "permission_prompt"),
+        ("claude_turn_active", "turn"),
+        ("claude_failed", "overloaded_error"),
+        ("claude_recapping", "manual"),
+    ):
+        d = home / sub
+        d.mkdir(parents=True, exist_ok=True)
+        (d / sid).write_text(content)
+
+
+def _snapshot_parent_flags(home: Path, sid: str) -> dict:
+    snap = {}
+    for sub in ("claude_awaiting_input", "claude_turn_active", "claude_failed",
+                "claude_recapping", "claude_finished"):
+        p = home / sub / sid
+        snap[sub] = p.read_text() if p.exists() else None
+    return snap
+
+
+@pytest.mark.parametrize("event", _HELPER_MUTATING_EVENTS)
+def test_helper_event_mutates_no_parent_state(home, event):
+    _seed_parent_flags(home, "sess-hx")
+    before = _snapshot_parent_flags(home, "sess-hx")
+    r = _run({"session_id": "sess-hx", "hook_event_name": event,
+              "agent_id": "a0e33328136f521e9", "agent_type": "general-purpose",
+              "error_type": "overloaded_error", "trigger": "manual"}, home)
+    assert r.returncode == 0, r.stderr
+    after = _snapshot_parent_flags(home, "sess-hx")
+    assert after == before, f"{event} with agent_id mutated parent state"
+    # claude_finished must never be created off a helper event.
+    assert after["claude_finished"] is None
+    # ...and it is logged content-blind as a helper skip.
+    log_text = (home / "claude_hook.log").read_text()
+    assert f"{event} sess-hx HELPER_SKIP" in log_text
+
+
+@pytest.mark.parametrize("event", _HELPER_MUTATING_EVENTS)
+def test_same_events_without_agent_id_still_mutate(home, event):
+    """Control: identical events with NO agent_id behave exactly as before --
+    the gate is agent_id, not the event name."""
+    _seed_parent_flags(home, "sess-mx")
+    r = _run({"session_id": "sess-mx", "hook_event_name": event,
+              "error_type": "overloaded_error", "trigger": "manual"}, home)
+    assert r.returncode == 0, r.stderr
+    after = _snapshot_parent_flags(home, "sess-mx")
+    if event == "Stop":
+        assert after["claude_finished"] == "stop"          # written
+        assert after["claude_turn_active"] is None          # turn closed
+    elif event == "StopFailure":
+        assert after["claude_failed"] == "overloaded_error"  # written
+        assert after["claude_turn_active"] is None           # turn closed
+    elif event == "UserPromptSubmit":
+        assert after["claude_turn_active"] == "turn"         # (re)opened
+        assert after["claude_failed"] is None                # cleared
+        assert after["claude_awaiting_input"] is None        # remove-on-event
+    elif event == "PreCompact":
+        assert after["claude_recapping"] == "manual"         # written
+    elif event == "PostCompact":
+        assert after["claude_recapping"] is None             # removed
+    elif event == "SessionEnd":
+        assert after["claude_turn_active"] is None           # closed
+        assert after["claude_recapping"] is None             # cleared
+        assert after["claude_failed"] is None                # cleared
+
+
+def test_helper_notification_permission_prompt_still_waves_after_gate(home):
+    """The one ungated helper path: a permission_prompt (even a background
+    helper's, which Claude Code surfaces in the main session) still writes."""
+    r = _run({"session_id": "sess-nh", "hook_event_name": "Notification",
+              "notification_type": "permission_prompt",
+              "agent_id": "a0e33328136f521e9"}, home)
+    assert r.returncode == 0, r.stderr
+    assert _flag_path(home, "sess-nh").exists()
+
+
 def test_multiple_stop_sessions_are_independent(home):
     _run({"session_id": "sess-A", "hook_event_name": "Stop"}, home)
     _run({"session_id": "sess-B", "hook_event_name": "Stop"}, home)

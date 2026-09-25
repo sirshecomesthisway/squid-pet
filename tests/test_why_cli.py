@@ -7,14 +7,27 @@ parseable output containing the expected sections.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 PROJECT = Path(__file__).parent.parent
 
+# Hermeticity (2026-09-24): the subprocess builds watcher's flag-dir constants
+# from expanduser("~") at import time, so it otherwise reads the developer's
+# real ~/.squid-pet (a live approval_needed flag there made these `squid why`
+# runs non-deterministic and could stall). Point HOME at an empty throwaway dir
+# so every ~/.squid-pet and ~/.claude read resolves to nothing -- the smoke
+# assertions below only care about structural sections, which are state-blind.
+_ISOLATED_HOME = tempfile.mkdtemp(prefix="squid-why-home-")
+
 
 def _run(*flags) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env["HOME"] = _ISOLATED_HOME
+    env["SQUID_PET_HOME"] = str(Path(_ISOLATED_HOME) / ".squid-pet")
     return subprocess.run(
         # Exercise the real module entry point, isolating only the OS idle
         # call: Quartz can block indefinitely without WindowServer access.
@@ -24,7 +37,7 @@ def _run(*flags) -> subprocess.CompletedProcess:
          "import runpy; runpy.run_module('squid_pet', run_name='__main__')",
          *flags],
         capture_output=True, text=True, timeout=15,
-        cwd=str(PROJECT),
+        cwd=str(PROJECT), env=env,
     )
 
 

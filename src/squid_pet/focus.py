@@ -342,8 +342,34 @@ def focus_for_snapshot(snapshot, run=None) -> str:
     if target.get('agent') == 'claude':
         # Resolve only Claude's signal directory. The snapshot may predate a
         # new Codex request, which must not steal a Claude-origin click.
-        return _focus_claude_state(snapshot.state, run, session=target.get('session'))
+        return _focus_claude_state(snapshot.state, run,
+                                   session=target.get('session'),
+                                   owner=target.get('owner'))
     return "none"
+
+
+def _claude_owner_proc(owner):
+    """The exact live process an owner dict names, or None.
+
+    finding 2 (2026-09-24): mirrors the guard _focus_process_owner uses (a
+    creation-time check defeats a recycled pid), but RETURNS the process so the
+    Claude tty/bundle chain -- which is bundle-aware and raises non-Terminal
+    hosts too -- can resolve it, rather than the Codex path's Terminal-only
+    exact-tab raise. The owner is the shell-owning process; a helper's Bash is a
+    child of the parent claude, so its parent chain reaches the right host app.
+    """
+    import psutil
+
+    from . import codex_turns
+    try:
+        if not isinstance(owner, dict) or not codex_turns.owner_alive(owner):
+            return None
+        proc = psutil.Process(owner['pid'])
+        if proc.create_time() != owner.get('created'):
+            return None
+        return proc
+    except (OSError, ValueError, TypeError, KeyError, psutil.Error):
+        return None
 
 
 def _named_if_fresh(dir_path: str, name: str,
@@ -364,7 +390,8 @@ def _named_if_fresh(dir_path: str, name: str,
 
 def _focus_claude_state(state: str,
                         run: Optional[Callable[[str], Optional[str]]] = None,
-                        session: Optional[str] = None) -> str:
+                        session: Optional[str] = None,
+                        owner: Optional[dict] = None) -> str:
     signal_dir = STATE_SIGNAL_DIRS.get(state)
     if signal_dir is None:
         return "resting"
@@ -377,38 +404,79 @@ def _focus_claude_state(state: str,
     # honour THAT session while its flag is still fresh -- a later failure in
     # another session must not move the click to its newer flag. If that
     # session's flag has since gone (replied/aged out), fall back to freshest.
-    sid = _named_if_fresh(signal_dir, session, fresh_sec) if session else None
-    if sid is None:
-        sid = _freshest_in(signal_dir, fresh_sec)
+    # A2 (2026-09-24): for working/thinking the snapshot threads the
+    # AUTHORITATIVE owning session id straight from the live transcript that won
+    # the state (for a subagent transcript, its parent session -- see
+    # detectors.claude_session_id_from_transcript). Prefer that directly, before
+    # the turn-active dir and before any blind fallback:
+    #   * it is exact -- the tty the hook stamped, resolved by claude_session_proc;
+    #   * it survives the parent's Stop clearing CLAUDE_TURN_ACTIVE_DIR, which is
+    #     the background-helper case (dir empty, we would otherwise blind-raise
+    #     SOME claude window -- the wrong one when several sessions run).
+    # When the turn-active dir still names this same session the answer is
+    # identical, so the normal in-turn precedence is unchanged. Scoped to
+    # working/thinking so `concerned` keeps its cross-source freshness guard
+    # (its session comes from a flag dir, not a transcript path). Content-blind:
+    # the id came from a path, never transcript content.
     tty = None
     bundle = None
-    if sid:
-        try:
-            from .watcher import _terminal_app_bundle_for_proc, claude_session_proc
-            # Resolve BOTH the tab (tty) and the app (bundle) through the one
-            # session that caused the state. Resolving the app separately, as
-            # _raise's session-blind fallback does, can name a different
-            # session's host when several run in different apps -- the
-            # Pink-2026-09-16 bug where a failed Cursor turn sent the
-            # concerned double-click to a Terminal window instead.
-            #
-            # Pink-2026-09-24: resolve the session's PROCESS once and derive
-            # both facts from it. claude_session_tty() and
-            # find_terminal_app_bundle_for_session() each re-ran
-            # claude_session_proc() independently, so a session that moved (or
-            # a process list that changed between the two lookups) could give a
-            # tty and a bundle that name different sessions.
-            proc = claude_session_proc(sid)
-            if proc is not None:
-                try:
-                    tty = proc.terminal()
-                except Exception:
-                    tty = None
+    owner_resolved = False
+    # finding 2 (2026-09-24): for a working/thinking target the shell OWNER is
+    # the authoritative source -- the exact process running the tool subprocess
+    # (working_target's shell_owner). Resolve its tab/app directly, BEFORE the
+    # named session, the turn-active dir, or the blind fallback. This mirrors
+    # the session resolution just below (proc -> tty + bundle, bundle-aware so
+    # non-Terminal hosts are still raised) rather than _focus_process_owner's
+    # Terminal-only exact-tab path. Only when the owner cannot be resolved
+    # (process gone) do we fall through to the session/freshest/blind chain.
+    if owner and state in ("working", "thinking"):
+        from .watcher import _terminal_app_bundle_for_proc
+        proc = _claude_owner_proc(owner)
+        if proc is not None:
+            owner_resolved = True
+            try:
+                tty = proc.terminal()
+            except Exception:
+                tty = None
+            try:
                 bundle = _terminal_app_bundle_for_proc(proc)
-        except Exception:
-            tty = None
-            bundle = None
-    if sid is None and state in _MULTI_SOURCE_STATES:
+            except Exception:
+                bundle = None
+    sid: Optional[str] = None
+    if not owner_resolved:
+        if session is not None and state in ("working", "thinking"):
+            sid = session
+        else:
+            sid = _named_if_fresh(signal_dir, session, fresh_sec) if session else None
+            if sid is None:
+                sid = _freshest_in(signal_dir, fresh_sec)
+        if sid:
+            try:
+                from .watcher import _terminal_app_bundle_for_proc, claude_session_proc
+                # Resolve BOTH the tab (tty) and the app (bundle) through the one
+                # session that caused the state. Resolving the app separately, as
+                # _raise's session-blind fallback does, can name a different
+                # session's host when several run in different apps -- the
+                # Pink-2026-09-16 bug where a failed Cursor turn sent the
+                # concerned double-click to a Terminal window instead.
+                #
+                # Pink-2026-09-24: resolve the session's PROCESS once and derive
+                # both facts from it. claude_session_tty() and
+                # find_terminal_app_bundle_for_session() each re-ran
+                # claude_session_proc() independently, so a session that moved (or
+                # a process list that changed between the two lookups) could give a
+                # tty and a bundle that name different sessions.
+                proc = claude_session_proc(sid)
+                if proc is not None:
+                    try:
+                        tty = proc.terminal()
+                    except Exception:
+                        tty = None
+                    bundle = _terminal_app_bundle_for_proc(proc)
+            except Exception:
+                tty = None
+                bundle = None
+    if not owner_resolved and sid is None and state in _MULTI_SOURCE_STATES:
         # NOTHING fresh named a session, so for a multi-source state there is
         # no evidence a Claude session was involved at all -- the face can
         # only have come from the other source. Blind-raising a Claude window

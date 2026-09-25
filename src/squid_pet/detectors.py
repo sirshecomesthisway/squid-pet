@@ -35,6 +35,7 @@ generic fallback.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import time
@@ -96,6 +97,65 @@ def _shell_signals(procs, active_fn, cmdline_fn, owner_out=None) -> tuple[bool, 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 
+def _default_claude_transcript_glob(root: Path):
+    """Discover both a session's own transcript AND its subagents' transcripts.
+
+    Layout (confirmed live, Claude Code 2.1.282):
+      <enc>/<session_id>.jsonl                       -- the main-thread transcript
+      <enc>/<session_id>/subagents/agent-<id>.jsonl  -- one per Task-tool helper
+
+    A subagent (foreground or background) keeps writing its own transcript while
+    the parent's stays quiet, so globbing only the parent (``*/*.jsonl``) made
+    Squid read idle whenever a long/background helper was the only thing working
+    (2026-09-24 bug). Including the subagents pattern lets transcript_age /
+    streaming reflect helper activity through the SAME cascade as the main agent
+    -- no new state or signal. Content-blind as ever: the discovery only yields
+    paths; the tail read (record type/timestamp only) is unchanged.
+
+    ``agent-*.jsonl`` deliberately excludes the sibling ``agent-<id>.meta.json``.
+    Discovery is cached (DISCOVERY_CACHE_SEC), so the extra glob costs only once
+    per minute; measured ~1.6ms -> ~4.8ms per discovery against the real
+    ~/.claude/projects tree here, i.e. ~0.05ms amortized per 1 Hz tick.
+    """
+    return itertools.chain(
+        root.glob("*/*.jsonl"),
+        root.glob("*/*/subagents/agent-*.jsonl"),
+    )
+
+
+def claude_session_id_from_transcript(path: str | None) -> str | None:
+    """The owning (parent) session id for a transcript path, or None.
+
+    A main-thread transcript is ``<enc>/<session_id>.jsonl`` -- the stem is the
+    id. A subagent transcript is ``<enc>/<session_id>/subagents/agent-<id>.jsonl``
+    -- the OWNING session is the ``<session_id>`` directory two levels up, which
+    is exactly the id the hook stamped a tty for (a background helper keeps the
+    parent session's process/terminal). Threading this through the focus target
+    lets "take me there" resolve the right tab even after the parent's Stop
+    cleared the turn-active flag. Content-blind: only the path structure is read.
+    """
+    if not path:
+        return None
+    p = Path(path)
+    if p.parent.name == "subagents":
+        return p.parent.parent.name
+    return p.stem
+
+
+def _default_active_claude_sessions() -> set:
+    """Session ids of in-flight Claude turns, from the claude_turn_active hook
+    flag dir. Lazy watcher import (never at module load -- the detector must not
+    depend on watcher being importable at import time; the same lazy pattern
+    _shell_signals/_lazy_defaults use). A missing/unreadable dir yields the
+    empty set. Path-only: filenames are session ids, no content is read."""
+    from . import watcher as _w
+    try:
+        return {n for n in os.listdir(_w.CLAUDE_TURN_ACTIVE_DIR)
+                if not n.startswith(".")}
+    except OSError:
+        return set()
+
+
 class ClaudeCodeDetector:
     """Detect Claude Code CLI activity, giving engineers whose daily
     driver is Claude Code a working/thinking/celebrating distinction
@@ -112,11 +172,15 @@ class ClaudeCodeDetector:
         gap shell_active misses -- verified against a real bug report
         (2026-08-14): Squid stayed "thinking" while Claude was actively
         editing files because only shell_active/streaming existed then.
-      streaming -- the youngest ~/.claude/projects/*/*.jsonl transcript
-        was written within STREAMING_STALE_SEC. Backstops both signals
-        above (transcript is touched on any turn, tool or plain text),
-        at the cost of coarser granularity -- this is what maps to
-        "thinking" when neither shell_active nor file_active fire.
+      streaming -- the youngest transcript under ~/.claude/projects was
+        written within STREAMING_STALE_SEC. Both the session's own
+        transcript (*/*.jsonl) AND its subagents' transcripts
+        (*/*/subagents/agent-*.jsonl) count, so a long or background
+        Task-tool helper keeps her out of idle -- see
+        _default_claude_transcript_glob. Backstops both signals above
+        (transcript is touched on any turn, tool or plain text), at the
+        cost of coarser granularity -- this is what maps to "thinking"
+        when neither shell_active nor file_active fire.
 
     A bounded transcript tail is read for record types/timestamps to exclude
     background artifact ledger writes; message text is not used. See
@@ -143,6 +207,7 @@ class ClaudeCodeDetector:
         stat_fn: Callable | None = None,
         project_dirs: Iterable[str] | None = None,
         recent_file_ages_fn: Callable | None = None,
+        active_sessions_fn: Callable | None = None,
     ) -> None:
         self.enabled = enabled
         self._find_processes = find_processes_fn
@@ -154,7 +219,7 @@ class ClaudeCodeDetector:
         # defaults independently, lazily, at first use in _scan().
         self._shell_cmdline_fn = shell_cmdline_fn
         self._projects_dir = Path(projects_dir) if projects_dir else CLAUDE_PROJECTS_DIR
-        self._glob = glob_fn or (lambda root: root.glob("*/*.jsonl"))
+        self._glob = glob_fn or _default_claude_transcript_glob
         self._stat = stat_fn or os.stat
         raw_dirs = list(project_dirs) if project_dirs is not None else [str(Path.home() / "Projects")]
         self.project_dirs = [Path(d).expanduser() for d in raw_dirs]
@@ -170,6 +235,20 @@ class ClaudeCodeDetector:
         self._transcript_activity_cache: dict = {}
         self._candidates: list = []
         self._candidates_at: float = 0.0
+        # {subagents/ dir -> last-seen dir mtime}: lets the cheap per-tick
+        # rescan (finding 3) tell an unchanged dir from one a new helper
+        # transcript just bumped, without redoing the full two-level glob.
+        self._subagent_dir_mtimes: dict = {}
+        # Session ids of in-flight turns (default: the claude_turn_active hook
+        # flag dir). One listdir of a tiny dir per tick lets _discover notice a
+        # session that appeared since the last full glob -- e.g. a >15min-idle
+        # parent the user just resumed, invisible to the candidate-scoped
+        # subagent top-up (finding B). Injectable so tests stay hermetic.
+        self._active_sessions_fn = active_sessions_fn
+        # Sessions we have already forced a rediscovery for this cache cycle, so
+        # a persistently-flagged session with no on-disk transcript (a stale
+        # turn_active flag) can never force a full glob every tick.
+        self._rediscovery_triggered_for: set = set()
         self._last_scan_ts: float = 0.0
         self.cpu_percent: float = 0.0
         self.claude_code_running: bool = False
@@ -191,7 +270,16 @@ class ClaudeCodeDetector:
             # merged single-walk path in _shell_signals().
 
     def _discover(self, now: float) -> list:
-        if self._candidates and (now - self._candidates_at) < self.DISCOVERY_CACHE_SEC:
+        if (self._candidates and (now - self._candidates_at) < self.DISCOVERY_CACHE_SEC
+                and not self._active_session_needs_rediscovery()):
+            # Cheap per-tick top-up (finding 3): a subagent started AFTER this
+            # discovery would otherwise stay invisible for up to
+            # DISCOVERY_CACHE_SEC -- after the parent's Stop + 20s groove beat
+            # that reads as idle for ~40s while a helper works. A new file bumps
+            # its subagents/ dir mtime, so we stat only the cached parents'
+            # subagents/ dirs and rescan just the ones that changed -- never the
+            # full two-level glob. A missing dir is the common case and cheap.
+            self._discover_new_subagents(now)
             return self._candidates
         found = []
         try:
@@ -206,7 +294,91 @@ class ClaudeCodeDetector:
             pass
         self._candidates = found
         self._candidates_at = now
+        # Seed the dir-mtime baseline so the first incremental tick after a full
+        # discovery sees the already-known subagents/ dirs as unchanged (no
+        # redundant rescan of files the glob just found).
+        self._subagent_dir_mtimes = {}
+        for sub_dir in self._subagent_dirs_for_candidates():
+            try:
+                self._subagent_dir_mtimes[str(sub_dir)] = self._stat(str(sub_dir)).st_mtime
+            except OSError:
+                pass
         return self._candidates
+
+    def _active_session_needs_rediscovery(self) -> bool:
+        """True when a live turn names a session not yet among the candidates.
+
+        finding B: the candidate-scoped subagent top-up cannot see a helper of a
+        parent that was too old to be a candidate at the last full glob (or
+        whose subagents/ dir did not exist yet). A claude_turn_active/<sid> flag
+        naming such a session is the cheap signal (one listdir of a tiny dir) to
+        force ONE full rediscovery now instead of waiting up to
+        DISCOVERY_CACHE_SEC. The _rediscovery_triggered_for guard makes it at
+        most one glob per newly-seen session, so a stale flag with no on-disk
+        transcript can never force a full glob every tick. The scheduled 60s
+        rediscovery still covers a turn that outlives the cache window.
+        """
+        fn = self._active_sessions_fn or _default_active_claude_sessions
+        try:
+            active = fn()
+        except Exception:
+            return False
+        # Forget sessions whose turn has since closed -- keeps the guard bounded
+        # to live turns and lets a session that resumes later trigger again.
+        self._rediscovery_triggered_for &= active
+        if not active:
+            return False
+        known = {claude_session_id_from_transcript(str(f)) for f in self._candidates}
+        unknown = active - known - self._rediscovery_triggered_for
+        if not unknown:
+            return False
+        self._rediscovery_triggered_for |= unknown
+        return True
+
+    def _subagent_dirs_for_candidates(self) -> set:
+        """The subagents/ dirs to watch, derived from the cached candidates.
+
+        A parent transcript ``<enc>/<sid>.jsonl`` owns ``<enc>/<sid>/subagents``;
+        an already-discovered subagent transcript names its own dir directly (so
+        a session whose parent transcript aged out of the cache but whose helper
+        is still a candidate keeps being watched). Path-only, content-blind.
+        """
+        dirs = set()
+        for f in self._candidates:
+            if f.parent.name == "subagents":
+                dirs.add(f.parent)
+            elif f.suffix == ".jsonl":
+                dirs.add(f.parent / f.stem / "subagents")
+        return dirs
+
+    def _discover_new_subagents(self, now: float) -> None:
+        known = {str(f) for f in self._candidates}
+        for sub_dir in self._subagent_dirs_for_candidates():
+            key = str(sub_dir)
+            try:
+                dir_mtime = self._stat(key).st_mtime
+            except OSError:
+                # A missing subagents/ dir is common and cheap; forget any
+                # stale mtime so a later recreate registers as a change.
+                self._subagent_dir_mtimes.pop(key, None)
+                continue
+            if self._subagent_dir_mtimes.get(key) == dir_mtime:
+                continue  # unchanged since last look -- no new file
+            self._subagent_dir_mtimes[key] = dir_mtime
+            try:
+                for f in sub_dir.glob("agent-*.jsonl"):
+                    fkey = str(f)
+                    if fkey in known:
+                        continue
+                    try:
+                        mtime = self._stat(fkey).st_mtime
+                    except OSError:
+                        continue
+                    if (now - mtime) <= self.CANDIDATE_MAX_AGE_SEC:
+                        self._candidates.append(f)
+                        known.add(fkey)
+            except OSError:
+                pass
 
     def _transcript_activity_mtime(self, path, stat) -> float:
         """Ignore background ledger appends without reading entire transcripts.

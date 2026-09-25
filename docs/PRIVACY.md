@@ -90,7 +90,7 @@ the right app to the front on click instead of a generic/unhelpful target.
 | CPU% of that process | diagnostic only (`squid why`) — not used to decide state |
 | Non-shell descendant processes of `claude` (shared tool-name allowlist, also used by CodexDetector) | detects a live tool call (e.g. a Bash-tool command) → "working" |
 | File mtimes under `project_dirs` (default `~/Projects`), same scan as IDEDetector | detects a very recent write (in-process tools like Edit/Write don't spawn a subprocess, so this catches what shell-child detection misses) → "working" |
-| `~/.claude/projects/*/*.jsonl` mtime plus up to 64 KiB of tail record types/timestamps | detects a recent transcript write → "thinking" (proxy for the LLM generating or a tool call resolving) |
+| `~/.claude/projects/*/*.jsonl` and `~/.claude/projects/*/*/subagents/agent-*.jsonl` mtime plus up to 64 KiB of tail record types/timestamps | detects a recent transcript write → "thinking" (proxy for the LLM generating or a tool call resolving). The subagent pattern lets a Task-tool helper's own transcript keep her out of idle while it works; same content-blind tail read, never the `.meta.json` sidecar |
 
 Transcript tails are read only when recently modified, and cached until
 mtime/size changes. Background `artifact-autoreact-ledger` records do not
