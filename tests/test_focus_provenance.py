@@ -89,11 +89,16 @@ def test_unknown_concern_or_generic_celebration_never_opens_claude():
 
 def test_claude_snapshot_does_not_switch_to_new_codex_wait(monkeypatch):
     from squid_pet import watcher
+
+    class _FakeProc:
+        def terminal(self):
+            return '/dev/ttysCLAUDE'
+
     state = watcher.PetState(state='approval_needed', focus_target={'agent': 'claude'})
-    monkeypatch.setattr(focus, '_freshest_in', lambda _: 'claude-session')
-    monkeypatch.setattr(watcher, 'claude_session_tty', lambda _: '/dev/ttysCLAUDE')
-    monkeypatch.setattr(watcher, 'find_terminal_app_bundle_for_claude_code',
-                        lambda: focus.TERMINAL_APP_BUNDLE_ID)
+    monkeypatch.setattr(focus, '_freshest_in', lambda _dir, _fresh=None: 'claude-session')
+    monkeypatch.setattr(watcher, 'claude_session_proc', lambda _sid: _FakeProc())
+    monkeypatch.setattr(watcher, '_terminal_app_bundle_for_proc',
+                        lambda _proc: focus.TERMINAL_APP_BUNDLE_ID)
     monkeypatch.setattr(watcher, 'codex_requests_awaiting_input',
                         lambda: ['new-codex-request'])
     seen = []

@@ -1470,6 +1470,16 @@ document.addEventListener("dblclick", async (e) => {
           if (ack?.bubble) maybeShowBubble(ack.bubble);
           console.log("[squid] dblclick ACK (calmed approval wave)");
         }
+        // Pink-2026-09-16: dblclick while she's showing the concerned/warning
+        // face is "I saw the error" -- calm the worried face. Same shape as
+        // the approval ACK above; take_me_there below still raises the errored
+        // session's terminal in this same gesture. No-ops at any other state.
+        if (currentState === "concerned"
+            && window.pywebview?.api?.acknowledge_concern) {
+          const ack = await window.pywebview.api.acknowledge_concern();
+          if (ack?.bubble) maybeShowBubble(ack.bubble);
+          console.log("[squid] dblclick ACK (calmed concern)");
+        }
         // Pink-2026-09-01: dblclick also takes you to the window behind
         // whatever she's showing -- working, thinking, waving, celebrating,
         // grooving. The backend answers "resting" for idle/drowsy/sleeping,

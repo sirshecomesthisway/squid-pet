@@ -1367,6 +1367,51 @@ class PetApi:
         timer.start()
         return {"status": "calmed", "bubble": bubble}
 
+    def acknowledge_concern(self) -> dict:
+        """JS-exposed: dblclick while state=="concerned" is "I saw the error"
+        -- calm the worried face. Mirrors acknowledge_approval: the same
+        dblclick's take_me_there() raises the errored session's terminal, so
+        this does only the calm. No-ops (status "not-concerned") at any other
+        state, leaving the plain poke+heart untouched.
+
+        Calms by SNOOZING the concerned override (watcher.dismiss_concern),
+        not by deleting the failed flag -- take_me_there, which runs right
+        after this in the same gesture, still needs that flag to resolve the
+        session (same reason acknowledge_approval snoozes rather than deletes
+        the awaiting flag). Covers a Codex-sourced concern too, which has no
+        flag to delete. Returns the bubble on the RPC response so it shows
+        immediately instead of racing the ~1s poll -- see the dblclick
+        handler in index.html.
+
+        Pink-2026-09-24: the dismiss is DEFERRED by ACKNOWLEDGE_DISMISS_DELAY_SEC
+        via a background timer, matching acknowledge_approval -- the bubble
+        appears instantly but the worried face settles a beat later, reading as
+        her having noticed rather than a hard cut. take_me_there in the same
+        gesture cannot lose the race here regardless of the delay: it navigates
+        off the state SNAPSHOT (focus_for_snapshot reads snapshot.focus_target
+        and the on-disk failed flag), and dismiss_concern only snoozes the
+        override for future compute() ticks -- it mutates neither self._latest
+        nor the flag file, so the session stays resolvable."""
+        with self._lock:
+            current_state = self._latest.state
+        if current_state != "concerned":
+            return {"status": "not-concerned", "bubble": None}
+        bubble = self._observer.on_interaction("like")
+        if bubble is not None:
+            self._set_pending_bubble(bubble, BUBBLE_PRIO_STATE)
+
+        def _dismiss() -> None:
+            from . import watcher as _w
+            try:
+                _w.dismiss_concern()
+            except Exception as e:
+                log.warning(f"dismiss_concern failed: {e}")
+
+        timer = threading.Timer(ACKNOWLEDGE_DISMISS_DELAY_SEC, _dismiss)
+        timer.daemon = True
+        timer.start()
+        return {"status": "calmed", "bubble": bubble}
+
     def take_me_there(self) -> dict:
         """JS-exposed: dblclick -> raise the window responsible for whatever
         she is currently showing.

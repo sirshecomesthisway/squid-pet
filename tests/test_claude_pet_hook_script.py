@@ -51,6 +51,10 @@ def _recap_path(home: Path, session_id: str) -> Path:
     return home / "claude_recapping" / session_id
 
 
+def _failed_path(home: Path, session_id: str) -> Path:
+    return home / "claude_failed" / session_id
+
+
 def test_script_exists_and_is_executable():
     assert SCRIPT.exists(), f"missing {SCRIPT}"
     assert os.access(SCRIPT, os.X_OK), f"{SCRIPT} is not executable"
@@ -487,3 +491,581 @@ def test_turn_active_flag_holds_no_prompt_content(home):
           "prompt": "something private the user typed"}, home)
     assert "private" not in _turn_active_path(home, "sess-t6").read_text()
 
+
+# ── StopFailure (Pink-2026-09-16: the real "turn failed on an API error"
+# signal that drives the concerned/warning sprite -- see
+# watcher.claude_freshest_failure()). Claude Code fires StopFailure, NOT
+# Stop, when a turn ends due to an API error (usage/rate limit, overload,
+# auth, billing, ...), carrying a machine-readable error_type. This is the
+# only inference-free way to know she is blocked by an error rather than
+# just quiet. ────────────────────────────────────────────────────────────
+def test_stop_failure_writes_failed_flag_with_error_type(home):
+    r = _run({"session_id": "sess-f1", "hook_event_name": "StopFailure",
+              "error_type": "rate_limit"}, home)
+    assert r.returncode == 0, r.stderr
+    fp = _failed_path(home, "sess-f1")
+    assert fp.exists()
+    assert fp.read_text() == "rate_limit"
+
+
+def test_stop_failure_missing_error_type_defaults_unknown(home):
+    """A StopFailure with no error_type still means the turn failed -- record
+    it as 'unknown' rather than dropping the signal."""
+    r = _run({"session_id": "sess-f2", "hook_event_name": "StopFailure"}, home)
+    assert r.returncode == 0, r.stderr
+    assert _failed_path(home, "sess-f2").read_text() == "unknown"
+
+
+def test_stop_failure_closes_the_turn_bracket(home):
+    """A failed turn is an ended turn: StopFailure must clear claude_turn_active
+    so the stall/thinking path can't keep painting 'thinking' over the error."""
+    _run({"session_id": "sess-f3", "hook_event_name": "UserPromptSubmit"}, home)
+    assert _turn_active_path(home, "sess-f3").exists()
+
+    r = _run({"session_id": "sess-f3", "hook_event_name": "StopFailure",
+              "error_type": "overloaded"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _turn_active_path(home, "sess-f3").exists()
+
+
+def test_stop_failure_clears_a_stuck_awaiting_input_flag(home):
+    """Pink-2026-09-24 (review #4): a turn that fails on an API error while a
+    permission prompt is up must clear the wave. Without this, 'your turn' kept
+    waving until the 2h sweep and -- approval taking prime over concerned --
+    masked the concerned sprite the whole time."""
+    _run({"session_id": "sess-f9", "hook_event_name": "Notification",
+          "notification_type": "permission_prompt"}, home)
+    assert _flag_path(home, "sess-f9").exists()
+
+    r = _run({"session_id": "sess-f9", "hook_event_name": "StopFailure",
+              "error_type": "rate_limit"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _flag_path(home, "sess-f9").exists()
+    # The failure signal itself must still land -- clearing is additive.
+    assert _failed_path(home, "sess-f9").read_text() == "rate_limit"
+
+
+def test_stop_failure_closes_the_turn_even_when_failed_dir_is_unwritable(home):
+    """Pink-2026-09-24 (review #9): the failed-flag write must not gate the
+    turn-close. If claude_failed/ can't be created, the turn still ENDED --
+    turn_in_flight must not stick, or the stall path keeps painting 'thinking'
+    over the error."""
+    _run({"session_id": "sess-f10", "hook_event_name": "UserPromptSubmit"}, home)
+    assert _turn_active_path(home, "sess-f10").exists()
+
+    # A regular file sits where claude_failed/ would go, so os.makedirs raises.
+    (home / "claude_failed").write_text("not a directory")
+
+    r = _run({"session_id": "sess-f10", "hook_event_name": "StopFailure",
+              "error_type": "overloaded"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _turn_active_path(home, "sess-f10").exists(), (
+        "turn stayed in flight after a StopFailure whose flag write failed")
+    assert (home / "claude_failed").is_file()  # untouched, and no crash
+
+
+def test_stop_failure_does_not_write_finished_flag(home):
+    """A failed turn is not a completion -- it must never look like a Stop and
+    trigger the celebrate/groove path."""
+    r = _run({"session_id": "sess-f4", "hook_event_name": "StopFailure",
+              "error_type": "server_error"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _finished_path(home, "sess-f4").exists()
+
+
+def test_stop_failure_is_content_blind(home):
+    """Only the error_type CATEGORY is recorded, never any message text --
+    same privacy contract as every other flag here."""
+    r = _run({"session_id": "sess-f5", "hook_event_name": "StopFailure",
+              "error_type": "rate_limit",
+              "last_assistant_message": "some potentially sensitive text",
+              "message": "another sensitive detail"}, home)
+    assert r.returncode == 0, r.stderr
+    body = _failed_path(home, "sess-f5").read_text()
+    assert "sensitive" not in body
+    assert body == "rate_limit"
+
+
+def test_user_prompt_submit_clears_failed_flag(home):
+    """Retrying (a new prompt) means the user has reacted to the error -- the
+    concerned state should stand down."""
+    _run({"session_id": "sess-f6", "hook_event_name": "StopFailure",
+          "error_type": "rate_limit"}, home)
+    assert _failed_path(home, "sess-f6").exists()
+
+    r = _run({"session_id": "sess-f6", "hook_event_name": "UserPromptSubmit"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _failed_path(home, "sess-f6").exists()
+
+
+def test_session_end_clears_failed_flag(home):
+    """Crash safety: a session that ends must not leave a stuck failure flag."""
+    _run({"session_id": "sess-f7", "hook_event_name": "StopFailure",
+          "error_type": "billing_error"}, home)
+    assert _failed_path(home, "sess-f7").exists()
+
+    r = _run({"session_id": "sess-f7", "hook_event_name": "SessionEnd"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _failed_path(home, "sess-f7").exists()
+
+
+def test_stop_failure_is_not_logged_as_unknown_event(home):
+    """StopFailure is a HANDLED event -- it must not also appear as
+    UNKNOWN_EVENT in claude_hook.log, which is exactly the log someone reads
+    when a concerned flag looks stuck."""
+    _run({"session_id": "sess-f8", "hook_event_name": "StopFailure",
+          "error_type": "rate_limit"}, home)
+    log = (home / "claude_hook.log").read_text()
+    assert "StopFailure sess-f8 WRITE" in log
+    assert "UNKNOWN_EVENT" not in log
+
+
+# ── session -> tty registry (Pink-2026-09-16 wrong-window fix) ──────────
+# The hook records the session's controlling terminal so "take me there"
+# can raise the exact tab/app that fired a signal, instead of guessing by
+# cwd (ambiguous when two sessions share a directory). The recording itself
+# depends on the process having a controlling tty, which a pytest subprocess
+# may not -- so recording is unit-tested by importing the module, while the
+# SessionEnd cleanup (which must run regardless) is tested end-to-end.
+import importlib.util as _ilu
+import tempfile as _tempfile
+
+_FALLBACK_HOME: Path | None = None
+
+
+def _shared_fallback_home() -> Path:
+    """One throwaway SQUID_PET_HOME for the whole run, for the handful of
+    unit tests that take no tmp_path. Shared rather than per-call: mkdtemp on
+    every _load_hook_module() left an orphan dir under /var/folders for each
+    of the ~18 call sites, every run, and they are genuinely written to (the
+    hook binds LOG_PATH inside them). Python removes it at exit."""
+    global _FALLBACK_HOME
+    if _FALLBACK_HOME is None:
+        _FALLBACK_HOME = Path(
+            _tempfile.TemporaryDirectory(prefix="squid-hook-test-").name)
+        _FALLBACK_HOME.mkdir(parents=True, exist_ok=True)
+    return _FALLBACK_HOME
+
+
+def _load_hook_module(tmp_path: Path | None = None):
+    """Import the hook script for unit-level tests.
+
+    SQUID_PET_HOME is pointed at a throwaway dir BEFORE exec_module, because
+    the script binds LOG_PATH (and the flag dirs) at import time. Without it
+    any test that reaches a `_log(...)` call appends to the developer's real
+    ~/.squid-pet/claude_hook.log -- a file the running watcher reads -- which
+    contradicts this module's own docstring. Verified: an earlier revision of
+    the write-failure test wrote 13 lines into the real log.
+    """
+    home = tmp_path if tmp_path is not None else _shared_fallback_home()
+    prev = os.environ.get("SQUID_PET_HOME")
+    os.environ["SQUID_PET_HOME"] = str(home)
+    try:
+        spec = _ilu.spec_from_file_location("claude_pet_hook", SCRIPT)
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        if prev is None:
+            os.environ.pop("SQUID_PET_HOME", None)
+        else:
+            os.environ["SQUID_PET_HOME"] = prev
+    return mod
+
+
+def _tty_path(home: Path, session_id: str) -> Path:
+    return home / "claude_session_tty" / session_id
+
+
+def test_ancestor_walk_finds_the_claude_tty_when_the_hook_has_none():
+    """The real Claude Code runtime: the hook process has no controlling
+    terminal (tty ??), but its `claude` parent does. The walk must climb
+    past the terminal-less hook to the ancestor that owns the tty -- this
+    is what makes the whole fix work in production, where the hook's own
+    /dev/tty is unavailable."""
+    mod = _load_hook_module()
+    # pid 500 = hook (no tty), 400 = claude (ttys008), 300 = login shell
+    ps_output = (
+        "500 400 ??\n"
+        "400 300 ttys008\n"
+        "300   1 ttys008\n"
+        "999   1 ttys000\n"   # an unrelated session -- must be ignored
+    )
+    assert mod._first_ancestor_tty(ps_output, 500) == "/dev/ttys008"
+
+
+def test_ancestor_walk_returns_none_when_no_ancestor_has_a_tty():
+    """A truly headless run (no terminal anywhere up the chain) yields None,
+    and the reader falls back to the cwd guess."""
+    mod = _load_hook_module()
+    ps_output = "500 400 ??\n400 300 ??\n300 1 ??\n"
+    assert mod._first_ancestor_tty(ps_output, 500) is None
+
+
+def test_records_the_controlling_tty_when_there_is_one(tmp_path, monkeypatch):
+    mod = _load_hook_module()
+    monkeypatch.setattr(mod, "TTY_DIR", str(tmp_path / "tty"))
+    monkeypatch.setattr(mod, "_controlling_tty", lambda: "/dev/ttys008")
+    mod._record_session_tty("sess-cursor", "UserPromptSubmit")
+    assert (tmp_path / "tty" / "sess-cursor").read_text() == "/dev/ttys008"
+
+
+def test_records_nothing_when_there_is_no_tty(tmp_path, monkeypatch):
+    """A detached/headless spawn has no controlling terminal -- leave no
+    entry (the reader falls back to cwd) rather than crashing the hook."""
+    mod = _load_hook_module()
+    monkeypatch.setattr(mod, "TTY_DIR", str(tmp_path / "tty"))
+    monkeypatch.setattr(mod, "_controlling_tty", lambda: None)
+    mod._record_session_tty("sess-x", "UserPromptSubmit")
+    assert not (tmp_path / "tty" / "sess-x").exists()
+
+
+def test_session_end_clears_the_tty_registry_entry(home):
+    """A recorded tty must not outlive its session (it would misdirect a
+    later same-tty session). SessionEnd removes it; it runs whether or not
+    the ending process still has a tty."""
+    (home / "claude_session_tty").mkdir(parents=True)
+    _tty_path(home, "sess-gone").write_text("/dev/ttys008")
+
+    r = _run({"session_id": "sess-gone", "hook_event_name": "SessionEnd"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _tty_path(home, "sess-gone").exists()
+
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Pink-2026-09-19: _record_session_tty used to re-resolve on EVERY event.
+# Hooks have no controlling terminal, so that meant forking `ps -Ao` over
+# every process on the machine (73-140ms measured) after every tool call,
+# on a path that blocks the turn -- for a value that had not changed.
+# These pin the new rule: resolve ONLY on turn-open (a resumed session can
+# move tabs, and it cannot do so without submitting a prompt). Nothing else
+# resolves -- not even to fill a missing entry, or a session with no terminal
+# anywhere would keep paying the full cost on every tool call.
+# ─────────────────────────────────────────────────────────────────────────
+def _counting_tty(value):
+    """Stand-in for _controlling_tty that records how often it ran, which is
+    the thing actually being optimised (each call is the expensive `ps`)."""
+    calls = []
+
+    def _fn():
+        calls.append(1)
+        return value
+    return _fn, calls
+
+
+def test_non_turn_open_events_never_resolve_the_tty(tmp_path, monkeypatch):
+    """The hot path: PostToolUse fires after every tool call, and hooks block
+    the turn. It must not run the expensive lookup at all -- not even to fill
+    a MISSING entry, or a session with no terminal anywhere (`claude -p`, CI)
+    would keep paying the full `ps` cost on every tool call."""
+    mod = _load_hook_module()
+    tty_dir = tmp_path / "tty"
+    monkeypatch.setattr(mod, "TTY_DIR", str(tty_dir))
+    fn, calls = _counting_tty("/dev/ttys999")
+    monkeypatch.setattr(mod, "_controlling_tty", fn)
+
+    for event in ("PostToolUse", "PreToolUse", "Notification", "Stop", "StopFailure"):
+        mod._record_session_tty("sess-a", event)
+
+    assert calls == [], "the expensive tty lookup ran off the turn-open path"
+
+
+def test_an_existing_entry_survives_the_hot_path(tmp_path, monkeypatch):
+    mod = _load_hook_module()
+    tty_dir = tmp_path / "tty"
+    tty_dir.mkdir()
+    (tty_dir / "sess-a").write_text("/dev/ttys003")
+    monkeypatch.setattr(mod, "TTY_DIR", str(tty_dir))
+    fn, _ = _counting_tty("/dev/ttys999")
+    monkeypatch.setattr(mod, "_controlling_tty", fn)
+
+    mod._record_session_tty("sess-a", "PostToolUse")
+
+    assert (tty_dir / "sess-a").read_text() == "/dev/ttys003"
+
+
+def test_an_existing_entry_is_touched_on_the_hot_path(tmp_path, monkeypatch):
+    """Pink-2026-09-24 (review #2): a live session's entry must not age out of
+    the watcher's 2h stale sweep during a long turn with no new prompt. Every
+    non-turn-open event cheaply bumps its mtime -- no `ps`, no write, no new
+    entry."""
+    import time as _time
+
+    mod = _load_hook_module()
+    tty_dir = tmp_path / "tty"
+    tty_dir.mkdir()
+    entry = tty_dir / "sess-a"
+    entry.write_text("/dev/ttys003")
+    old = _time.time() - 10_000
+    os.utime(entry, (old, old))
+    monkeypatch.setattr(mod, "TTY_DIR", str(tty_dir))
+    fn, calls = _counting_tty("/dev/ttys999")
+    monkeypatch.setattr(mod, "_controlling_tty", fn)
+
+    mod._record_session_tty("sess-a", "PostToolUse")
+
+    assert calls == [], "the expensive ps lookup ran on the hot path"
+    assert entry.read_text() == "/dev/ttys003", "content must be unchanged"
+    assert entry.stat().st_mtime > old, "mtime must be bumped so the sweep keeps it"
+
+
+def test_the_touch_never_creates_a_missing_entry(tmp_path, monkeypatch):
+    """The touch is total but must never fabricate an entry: a session with no
+    recorded tty stays unrecorded until its next turn-open (one turn of
+    cwd-guess fallback), never a bare zero-byte file."""
+    mod = _load_hook_module()
+    tty_dir = tmp_path / "tty"
+    tty_dir.mkdir()
+    monkeypatch.setattr(mod, "TTY_DIR", str(tty_dir))
+    fn, calls = _counting_tty("/dev/ttys999")
+    monkeypatch.setattr(mod, "_controlling_tty", fn)
+
+    mod._record_session_tty("sess-missing", "PostToolUse")
+
+    assert not (tty_dir / "sess-missing").exists()
+    assert calls == []
+
+
+def test_reresolves_on_turn_open_so_a_resumed_session_can_move_tabs(tmp_path, monkeypatch):
+    """`claude --resume` in another tab keeps the session_id but changes the
+    tty. A resumed session cannot do anything without submitting a prompt, so
+    turn-open is both the only place the tty can have changed and the only
+    place we need to look."""
+    mod = _load_hook_module()
+    tty_dir = tmp_path / "tty"
+    tty_dir.mkdir()
+    (tty_dir / "sess-a").write_text("/dev/ttys003")     # where it used to live
+    monkeypatch.setattr(mod, "TTY_DIR", str(tty_dir))
+    fn, calls = _counting_tty("/dev/ttys007")           # resumed in a new tab
+    monkeypatch.setattr(mod, "_controlling_tty", fn)
+
+    mod._record_session_tty("sess-a", "UserPromptSubmit")
+
+    assert len(calls) == 1
+    assert (tty_dir / "sess-a").read_text() == "/dev/ttys007"
+
+
+def test_a_missing_entry_is_filled_at_the_next_turn_open(tmp_path, monkeypatch):
+    """A hook installed mid-session never saw that session's earlier prompts.
+    It gets an entry at the next one -- one turn of cwd-guess fallback."""
+    mod = _load_hook_module()
+    tty_dir = tmp_path / "tty"
+    monkeypatch.setattr(mod, "TTY_DIR", str(tty_dir))
+    fn, calls = _counting_tty("/dev/ttys004")
+    monkeypatch.setattr(mod, "_controlling_tty", fn)
+
+    mod._record_session_tty("sess-new", "PostToolUse")
+    assert not (tty_dir / "sess-new").exists()
+    assert calls == []
+
+    mod._record_session_tty("sess-new", "UserPromptSubmit")
+    assert (tty_dir / "sess-new").read_text() == "/dev/ttys004"
+
+
+def test_a_turn_open_lookup_that_finds_no_terminal_drops_the_stale_entry(
+        tmp_path, monkeypatch):
+    """The lookup RAN and established there is no controlling terminal -- a
+    fact. Turn-open is the only refresh point, so keeping the old value would
+    strand the whole turn on the PREVIOUS tab after a resume, and a
+    confidently wrong tty is worse than none (no entry merely falls back to
+    the cwd guess).
+
+    Contrast test_a_transient_lookup_failure_keeps_the_existing_entry: when
+    the lookup could not run at all (`ps` failed or timed out, flagged by
+    _TTY_LOOKUP_FAILED) the entry is KEPT. These two inputs look identical to
+    _controlling_tty -- both give None -- which is exactly why the flag
+    exists. The stub here leaves it unset, i.e. a clean lookup."""
+    mod = _load_hook_module()
+    tty_dir = tmp_path / "tty"
+    tty_dir.mkdir()
+    (tty_dir / "sess-a").write_text("/dev/ttys003")     # the OLD tab
+    monkeypatch.setattr(mod, "TTY_DIR", str(tty_dir))
+    monkeypatch.setattr(mod, "_TTY_LOOKUP_FAILED", False)
+    fail, _ = _counting_tty(None)
+    monkeypatch.setattr(mod, "_controlling_tty", fail)
+
+    mod._record_session_tty("sess-a", "UserPromptSubmit")
+
+    assert not (tty_dir / "sess-a").exists(), "a stale tty survived a failed refresh"
+
+
+def test_the_write_is_atomic_and_leaves_no_orphan_tmp(tmp_path, monkeypatch):
+    """tmp+rename, with the pid in the tmp name so concurrent hooks for the
+    same session cannot truncate each other's file and publish a zero-byte
+    entry. A failed write must not leave the tmp behind -- nothing sweeps
+    TTY_DIR."""
+    mod = _load_hook_module()
+    tty_dir = tmp_path / "tty"
+    monkeypatch.setattr(mod, "TTY_DIR", str(tty_dir))
+    fn, _ = _counting_tty("/dev/ttys004")
+    monkeypatch.setattr(mod, "_controlling_tty", fn)
+
+    mod._record_session_tty("sess-a", "UserPromptSubmit")
+
+    assert (tty_dir / "sess-a").read_text() == "/dev/ttys004"
+    assert list(tty_dir.glob("*.tmp")) == [], "left an orphan tmp file"
+
+
+def test_a_transient_lookup_failure_keeps_the_existing_entry(tmp_path, monkeypatch):
+    """"Could not find out" is NOT "there is no terminal".
+
+    _controlling_tty() returns None for both, but `ps` timing out on a loaded
+    machine must not destroy a valid entry -- turn-open is the only refresh
+    point, so the whole turn would fall back to the cwd guess, which cannot
+    tell apart two sessions sharing a directory in different hosts. That is
+    the ambiguity this registry exists to resolve.
+    """
+    mod = _load_hook_module()
+    tty_dir = tmp_path / "tty"
+    tty_dir.mkdir()
+    (tty_dir / "sess-a").write_text("/dev/ttys003")
+    monkeypatch.setattr(mod, "TTY_DIR", str(tty_dir))
+    monkeypatch.setattr(mod, "_controlling_tty", lambda: None)
+    monkeypatch.setattr(mod, "_TTY_LOOKUP_FAILED", True)     # ps blew up
+
+    mod._record_session_tty("sess-a", "UserPromptSubmit")
+
+    assert (tty_dir / "sess-a").read_text() == "/dev/ttys003", (
+        "a transient ps failure destroyed a valid registry entry"
+    )
+
+
+def test_ps_failure_is_recorded_as_a_failure_not_as_no_terminal(monkeypatch):
+    """The flag that distinction depends on is actually set when `ps` blows
+    up -- otherwise the guard above is inert and the entry gets destroyed."""
+    mod = _load_hook_module()
+
+    def _boom(*args, **kwargs):
+        raise OSError("ps exploded")
+    monkeypatch.setattr("subprocess.run", _boom)
+
+    assert mod._ancestor_tty_via_ps() is None
+    assert mod._TTY_LOOKUP_FAILED is True
+
+
+def test_a_clean_ps_run_that_finds_nothing_is_not_a_failure(monkeypatch):
+    """The other half: `ps` ran fine and no ancestor has a terminal. That is a
+    fact, so the flag must stay false and the stale entry may be dropped."""
+    mod = _load_hook_module()
+    monkeypatch.setattr(mod, "_TTY_LOOKUP_FAILED", False)
+
+    monkeypatch.setattr(os, "getpid", lambda: 42)
+
+    class _Ok:
+        returncode = 0
+        # A complete snapshot that DOES contain us -- we walked to the top and
+        # genuinely found no terminal. (Our own pid must be present, or the
+        # table is partial and that is a failed lookup instead: see
+        # test_a_snapshot_missing_our_own_pid_is_a_failure.)
+        stdout = "42 1 ??\n1 0 ??\n"
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: _Ok())
+
+    assert mod._ancestor_tty_via_ps() is None
+    assert mod._TTY_LOOKUP_FAILED is False
+
+
+def test_a_ps_that_exits_nonzero_is_a_failure_not_no_terminal(monkeypatch):
+    """`ps` can RUN and still tell us nothing -- sandboxed/seatbelt env, a
+    broken `ps` on PATH. Empty stdout must not be read as "no ancestor has a
+    terminal", or the caller deletes a good registry entry on the strength of
+    an empty snapshot."""
+    mod = _load_hook_module()
+    monkeypatch.setattr(mod, "_TTY_LOOKUP_FAILED", False)
+
+    class _Broken:
+        returncode = 1
+        stdout = ""
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: _Broken())
+
+    assert mod._ancestor_tty_via_ps() is None
+    assert mod._TTY_LOOKUP_FAILED is True
+
+
+def test_a_failed_write_leaves_no_orphan_tmp(tmp_path, monkeypatch):
+    """Exercises the except branch: nothing sweeps TTY_DIR, so a tmp left
+    behind by a failed write would sit there forever."""
+    mod = _load_hook_module()
+    tty_dir = tmp_path / "tty"
+    monkeypatch.setattr(mod, "TTY_DIR", str(tty_dir))
+    monkeypatch.setattr(mod, "_controlling_tty", lambda: "/dev/ttys004")
+    real_replace = os.replace
+
+    def _fail_replace(src, dst):
+        raise OSError("no space left on device")
+    monkeypatch.setattr(os, "replace", _fail_replace)
+
+    mod._record_session_tty("sess-a", "UserPromptSubmit")
+
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert not (tty_dir / "sess-a").exists()
+    assert list(tty_dir.glob("*.tmp")) == [], "left an orphan tmp file"
+
+
+def test_a_usable_ps_snapshot_is_used_even_on_a_nonzero_exit(monkeypatch):
+    """`ps` exits nonzero merely because it could not read some unrelated
+    process, while still printing a usable table. Discarding that snapshot
+    would permanently downgrade such a machine to the cwd guess."""
+    mod = _load_hook_module()
+    monkeypatch.setattr(mod, "_TTY_LOOKUP_FAILED", False)
+    monkeypatch.setattr(os, "getpid", lambda: 42)
+
+    class _Partial:
+        returncode = 1
+        stdout = "42 7 ??\n7 1 ttys004\n"      # our parent DOES have a tty
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: _Partial())
+
+    assert mod._ancestor_tty_via_ps() == "/dev/ttys004"
+    assert mod._TTY_LOOKUP_FAILED is False
+
+
+def test_a_snapshot_missing_our_own_pid_is_a_failure(monkeypatch):
+    """Our own process is always running, so its absence from the table means
+    `ps` gave us a filtered/partial snapshot (sandboxed or shimmed), not that
+    the walk legitimately reached the top without finding a terminal. Treating
+    it as the latter would delete a valid registry entry."""
+    mod = _load_hook_module()
+    monkeypatch.setattr(mod, "_TTY_LOOKUP_FAILED", False)
+    monkeypatch.setattr(os, "getpid", lambda: 42)
+
+    class _Filtered:
+        returncode = 0                   # exits clean...
+        stdout = "999 1 ttys004\n"       # ...but we are not in it
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: _Filtered())
+
+    assert mod._ancestor_tty_via_ps() is None
+    assert mod._TTY_LOOKUP_FAILED is True
+
+
+def test_unit_tests_do_not_touch_the_real_squid_pet_home(tmp_path):
+    """Regression: _load_hook_module used to import the script without
+    SQUID_PET_HOME set, so LOG_PATH bound to the developer's real
+    ~/.squid-pet and any test reaching a _log() call appended to the live
+    hook log the watcher reads. 13 such lines were found in it."""
+    mod = _load_hook_module(tmp_path)
+    real_home = os.path.expanduser("~/.squid-pet")
+    for attr in ("LOG_PATH", "TTY_DIR", "FLAG_DIR", "FAILED_DIR"):
+        value = getattr(mod, attr, None)
+        if value:
+            assert not str(value).startswith(real_home), (
+                f"{attr} points at the real ~/.squid-pet: {value}"
+            )
+
+
+@pytest.mark.parametrize("payload", [
+    ["not", "an", "object"],
+    {"hook_event_name": [], "session_id": "abc"},
+    {"hook_event_name": "Stop", "session_id": 123},
+    {"hook_event_name": "Stop", "session_id": "../../escape"},
+    {"hook_event_name": "Stop", "session_id": "a\u0000b"},
+    {"hook_event_name": "Stop", "session_id": "\ud800"},
+    {"hook_event_name": "Stop", "session_id": ".hidden"},
+])
+def test_malformed_payload_or_session_id_exits_zero_and_writes_no_flags(payload, home, tmp_path):
+    """Only the hook's own log may be written; no flag file anywhere under
+    tmp_path (the parent of home, so an escape out of home is caught too)."""
+    r = _run(payload, home)
+    assert r.returncode == 0, r.stderr
+    assert r.stderr == ""
+    written = [p for p in tmp_path.rglob("*")
+               if p.is_file() and p != home / "claude_hook.log"]
+    assert written == []

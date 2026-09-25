@@ -218,12 +218,12 @@ STATE_TRIGGERS: list[tuple[str, Optional[frozenset[str]], str]] = [
 # Concern-reason formatting
 # ----------------------------------------------------------------------
 # Pink-2026-08-22: the natural trigger for "concerned" (the legacy agent's
-# detector reading its errors.log) was removed along with it -- no
-# equivalent exists for Claude Code / Codex. "concerned" is presently only
-# reachable via the ~/.squid-pet/force_state debug override, which never
-# populates concern_reason, so this formatting always falls through to the
-# generic concerned line below. Kept in case a future detector wires up
-# concern_reason again.
+# detector reading its errors.log) was removed along with it. Pink-2026-09-16:
+# "concerned" is reachable again -- watcher._apply_failure_override raises it
+# from Claude Code's StopFailure hook and Codex's failed-turn row, and it
+# populates concern_reason with a curated headline from
+# watcher._CONCERN_BY_ERROR_TYPE (e.g. "Sign-in expired — re-authenticate").
+# So this formatting is live, not just a force_state-only relic.
 
 _REASON_PREFIX_TRIM = (
     "anthropic.", "openai.", "google.", "pydantic_ai.", "httpx.",
@@ -231,7 +231,7 @@ _REASON_PREFIX_TRIM = (
 )
 
 def _format_concern_reason(reason: str) -> Optional[str]:
-    """Turn a raw error-log reason into a bubble-friendly string.
+    """Turn a concern reason into a bubble-friendly string.
 
     Returns None if the reason is empty or unsalvageable. Truncates to
     MAX_BUBBLE_CHARS - 1 (leaving room for trailing ellipsis if cut).
@@ -239,7 +239,8 @@ def _format_concern_reason(reason: str) -> Optional[str]:
     if not reason:
         return None
     r = reason.strip()
-    # Strip noisy module prefixes
+    # Strip noisy module prefixes (legacy raw-error reasons; curated headlines
+    # from _CONCERN_BY_ERROR_TYPE never match these).
     for prefix in _REASON_PREFIX_TRIM:
         if r.startswith(prefix):
             r = r[len(prefix):].lstrip(":. ")
@@ -249,8 +250,10 @@ def _format_concern_reason(reason: str) -> Optional[str]:
         r = r[7:]
     if r.lower().startswith("exception: "):
         r = r[11:]
-    # Lowercase for pet vibes (errors shouldn't SHOUT at you)
-    r = r.lower()
+    # Pink-2026-09-24: do NOT lowercase. The reason is now a curated headline
+    # ("Sign-in expired — re-authenticate"); forcing it lower ("sign-in
+    # expired ...") mangled deliberate casing. The old .lower() was for raw
+    # SHOUTING error-log lines that no longer feed this.
     # Truncate
     if len(r) > MAX_BUBBLE_CHARS:
         r = r[:MAX_BUBBLE_CHARS - 3].rstrip() + "..."

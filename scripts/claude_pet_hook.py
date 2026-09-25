@@ -5,8 +5,8 @@ claude_pet_hook.py -- squid-pet's Claude Code hook receiver.
 Wired into ~/.claude/settings.json under hooks.Notification,
 hooks.UserPromptSubmit, hooks.SessionEnd, hooks.Stop, hooks.PreCompact,
 hooks.PostCompact, hooks.PostToolUse, and hooks.PreToolUse (the last
-matched to AskUserQuestion|ExitPlanMode). Maintains three per-session
-flag-file signals that watcher.py reads:
+matched to AskUserQuestion|ExitPlanMode), and hooks.StopFailure. Maintains
+four per-session flag-file signals that watcher.py reads:
   - "awaiting input" (claude_sessions_awaiting_input()) -- mirrors what
     the legacy agent's own sitecustomize.py patch did via a PID-keyed
     flag directory, except keyed by session_id, since Claude Code hook
@@ -27,6 +27,11 @@ flag-file signals that watcher.py reads:
     for it to be called out by name. PreCompact/PostCompact bracket the
     compaction exactly, unlike any of the busy signals above (a compact
     is pure summarization -- no tool calls, no file writes).
+  - "failed" (claude_freshest_failure()) -- Pink-2026-09-16: drives the
+    concerned/warning sprite. Claude Code fires StopFailure (NOT Stop)
+    when a turn ends on an API error, carrying error_type; we record just
+    that CATEGORY. The only inference-free "she is blocked by an error"
+    signal -- Pink rejected guessing concerned from a stalled/silent turn.
 
 Protocol:
   - Notification with notification_type == permission_prompt
@@ -40,6 +45,9 @@ Protocol:
   - SessionEnd -> remove <awaiting_input_dir>/<session_id> and
     <recap_dir>/<session_id>  (session is gone)
   - Stop -> write <finished_dir>/<session_id>  (Claude just finished a turn)
+  - StopFailure -> write <failed_dir>/<session_id> = error_type  (turn ended
+    on an API error). Also closes the turn bracket; cleared on the next
+    UserPromptSubmit (retry) or SessionEnd.
   - PreCompact -> write <recap_dir>/<session_id>  (compaction starting)
   - PostCompact -> remove <recap_dir>/<session_id>  (compaction done)
 
@@ -83,6 +91,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -92,6 +101,25 @@ _SQUID_PET_HOME = os.environ.get(
 FLAG_DIR = os.path.join(_SQUID_PET_HOME, "claude_awaiting_input")
 FINISHED_DIR = os.path.join(_SQUID_PET_HOME, "claude_finished")
 RECAP_DIR = os.path.join(_SQUID_PET_HOME, "claude_recapping")
+# Pink-2026-09-16: "the turn ended because of an API error". Claude Code
+# fires StopFailure (NOT Stop) when a turn ends on a usage/rate limit,
+# server overload, auth/billing failure, etc., carrying a machine-readable
+# error_type. This is the only inference-free signal that she is BLOCKED by
+# an error rather than merely quiet -- watcher.claude_freshest_failure()
+# reads this dir to drive the concerned/warning sprite. Content-blind like
+# every other flag: we record only the error_type CATEGORY, never message
+# text. Cleared when the user reacts (UserPromptSubmit) or the session ends.
+FAILED_DIR = os.path.join(_SQUID_PET_HOME, "claude_failed")
+# Pink-2026-09-16: session_id -> controlling tty, so "take me there" can raise
+# the EXACT terminal/app a signal came from. focus.py otherwise matches a
+# session to its process by cwd, which is ambiguous when two sessions run in
+# the same directory (one in Terminal, one in Cursor) -- the wrong-window bug
+# where a failed Cursor turn's concerned double-click raised the Terminal
+# session instead. The hook is a non-detached child of the session's `claude`
+# process, so it shares that session's controlling terminal: an authoritative
+# key, not a guess. A tty is a device number, not user content -- consistent
+# with this script's content-blindness (see docs/PRIVACY.md).
+TTY_DIR = os.path.join(_SQUID_PET_HOME, "claude_session_tty")
 # Pink-2026-09-01: "a turn is in flight". UserPromptSubmit opens it, Stop
 # closes it. Exists because ClaudeCodeDetector infers thinking from
 # transcript mtime, and Claude Code only writes a transcript entry when a
@@ -153,15 +181,34 @@ _AWAITING_INPUT_TOOLS = frozenset({"AskUserQuestion", "ExitPlanMode"})
 #
 # Neither can suppress a genuine wave: the next permission_prompt re-arms
 # the flag on its own, whenever the session next actually blocks on you.
+#
+# Pink-2026-09-24: StopFailure added. It is the errored-turn twin of Stop --
+# the turn ended, so whatever it was waiting on is moot. Without it, a turn
+# that fails on an API error while a permission prompt is up left the
+# awaiting-input flag set, so "your turn" kept waving until the 2h sweep and
+# (approval taking prime over concerned) masked the concerned sprite entirely.
 _REMOVE_ON_EVENTS = frozenset({
-    "UserPromptSubmit", "SessionEnd", "PostToolUse", "Stop",
+    "UserPromptSubmit", "SessionEnd", "PostToolUse", "Stop", "StopFailure",
 })
+
+# Events handled by the SECOND dispatch chain (the one after the
+# remove-on-events / Notification / PreToolUse chain). Kept here so the
+# trailing UNKNOWN_EVENT guard doesn't mislabel them as unhandled.
+_SECOND_CHAIN_EVENTS = frozenset({"Stop", "StopFailure", "PreCompact", "PostCompact"})
 
 # Turn bracket: which events open a turn, and which close it.
 _TURN_OPEN_EVENTS = frozenset({"UserPromptSubmit"})
 # SessionEnd is crash safety -- a session killed mid-turn must not leave
-# Squid thinking forever.
-_TURN_CLOSE_EVENTS = frozenset({"Stop", "SessionEnd"})
+# Squid thinking forever. StopFailure ends the turn too (it fires INSTEAD of
+# Stop on an errored turn), so it must close the bracket as well -- otherwise
+# turn_in_flight stays True and the stall path keeps painting "thinking" over
+# the error.
+_TURN_CLOSE_EVENTS = frozenset({"Stop", "StopFailure", "SessionEnd"})
+
+# Events that mean the user has reacted to / moved past a prior failure, so a
+# stuck concerned/warning flag should stand down. UserPromptSubmit = retried
+# or typed something new; SessionEnd = the session is gone (crash safety).
+_CLEAR_FAILED_EVENTS = frozenset({"UserPromptSubmit", "SessionEnd"})
 
 
 def _truncate_log_if_large() -> None:
@@ -189,6 +236,235 @@ def _log(line: str) -> None:
         pass
 
 
+def _controlling_tty() -> str | None:
+    """The controlling terminal of the Claude Code session that fired this
+    hook -- the same /dev/ttysNNN the session's `claude` process reports and
+    that Terminal.app exposes as `tty of tab`. This is the authoritative
+    session->tty key: exact even when two sessions run in the same
+    directory, where matching by cwd cannot tell them apart.
+
+    Stdlib-only and best-effort (this script must never fail). Two ways,
+    strongest-available first:
+
+      1. OUR OWN controlling terminal (/dev/tty, then the standard fds).
+         Works when the hook is a plain terminal child (Terminal.app), and
+         is the cheap path.
+      2. THE CLAUDE ANCESTOR's terminal, read from `ps`. Claude Code spawns
+         hooks WITHOUT a controlling terminal of their own (verified live:
+         a hook process shows `tty ??`), so (1) returns nothing there -- but
+         the hook is still a descendant of exactly the session's `claude`
+         process, which does have a tty. Walking the parent chain up to the
+         first ancestor that has a real terminal recovers it, and because we
+         start from THIS hook it can only reach the process tree that
+         spawned us, i.e. the right session's.
+
+    Returns None only if no ancestor has a terminal (a truly headless run),
+    and the reader then falls back to the old cwd guess -- no worse than
+    before."""
+    own = _own_controlling_tty()
+    if own:
+        return own
+    return _ancestor_tty_via_ps()
+
+
+def _own_controlling_tty() -> str | None:
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY)
+        try:
+            return os.ttyname(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    for fd in (0, 1, 2):
+        try:
+            return os.ttyname(fd)
+        except OSError:
+            continue
+    return None
+
+
+# Set when a tty lookup could not be carried out at all (the `ps` snapshot
+# failed or timed out), as opposed to running fine and finding no terminal.
+# The two look identical to callers of _controlling_tty() -- both give None --
+# but they must NOT be treated the same: "no terminal" is a fact we can act
+# on, "could not find out" is not. Module-level is safe here because the hook
+# is a single-shot process: one event, one lookup, then exit.
+_TTY_LOOKUP_FAILED = False
+
+
+def _ancestor_tty_via_ps() -> str | None:
+    """First ancestor process (starting from this hook) that has a real
+    controlling terminal, via a single `ps` snapshot walked in memory.
+
+    One subprocess call, not one per hop. Since Pink-2026-09-19 this runs once
+    per turn (see _record_session_tty), not on every event. Any failure yields
+    None and sets _TTY_LOOKUP_FAILED (best-effort)."""
+    global _TTY_LOOKUP_FAILED
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid=,tty="],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception:
+        _TTY_LOOKUP_FAILED = True
+        return None
+    # Parse FIRST: `ps` exits nonzero merely because it could not read some
+    # unrelated process, while still printing a perfectly usable table. Only
+    # if the walk found nothing do we ask whether the run itself was sound --
+    # a bad run means "could not find out", not "no ancestor has a terminal",
+    # and the caller must keep any existing entry rather than delete it on the
+    # strength of an unusable snapshot.
+    me = os.getpid()
+    tty = _first_ancestor_tty(r.stdout, me)
+    if tty is None and (
+        r.returncode != 0
+        or not r.stdout.strip()
+        # Our OWN pid is always running, so its absence means the snapshot is
+        # filtered/partial (sandboxed or shimmed `ps`), not that the walk
+        # legitimately reached the top without finding a terminal. Without
+        # this the caller would delete a valid entry over an unusable table.
+        or not _pid_in_snapshot(r.stdout, me)
+    ):
+        _TTY_LOOKUP_FAILED = True
+    return tty
+
+
+def _pid_in_snapshot(ps_output: str, pid: int) -> bool:
+    """Whether `pid` appears as a pid (first column) in a ps snapshot."""
+    want = str(pid)
+    for line in ps_output.splitlines():
+        parts = line.split()
+        if parts and parts[0] == want:
+            return True
+    return False
+
+
+def _first_ancestor_tty(ps_output: str, start_pid: int) -> str | None:
+    """Walk `pid=,ppid=,tty=` ps output from start_pid up the parent chain,
+    returning the first process that has a real controlling terminal.
+
+    Pure (no subprocess) so the walk is unit-testable. Returns the tty in
+    the /dev-prefixed form the session's process and Terminal.app both use."""
+    parent: dict[int, int] = {}
+    tty: dict[int, str] = {}
+    for line in ps_output.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid_i, ppid_i = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        parent[pid_i] = ppid_i
+        # A process with no controlling terminal prints "??"; a missing 3rd
+        # field is treated the same.
+        tty[pid_i] = parts[2] if len(parts) >= 3 else "??"
+    pid = start_pid
+    depth = 0
+    while pid and pid > 1 and depth < 40:
+        t = tty.get(pid)
+        if t and t != "??":
+            return t if t.startswith("/dev/") else "/dev/" + t
+        pid = parent.get(pid, 0)
+        depth += 1
+    return None
+
+
+def _touch_session_tty(session_id: str) -> None:
+    """Bump an EXISTING tty entry's mtime so the watcher's 2h stale sweep does
+    not evict a still-live session mid-long-turn. Cheap and total: no `ps`, no
+    write, creates nothing (a missing entry raises FileNotFoundError, which is
+    swallowed), and never raises -- hooks block the turn."""
+    try:
+        os.utime(os.path.join(TTY_DIR, session_id))
+    except OSError:
+        pass
+
+
+def _record_session_tty(session_id: str, event: str) -> None:
+    """Best-effort: remember which terminal this session lives in. Never fails
+    the hook; a missing tty simply leaves no entry (the reader falls back to
+    the cwd guess).
+
+    Pink-2026-09-19 -- resolved ONLY on _TURN_OPEN_EVENTS. This used to run on
+    every event. Claude Code spawns hooks with no controlling terminal
+    (verified live: the hook process shows `tty ??`), so _own_controlling_tty()
+    always fails and _ancestor_tty_via_ps() runs, forking `ps -Ao` over every
+    process on the machine -- measured at 73-140ms. PostToolUse fires after
+    every tool call and hooks BLOCK the turn, so a 30-tool turn was paying 2+
+    seconds for a value that had not changed.
+
+    Once per turn is both sufficient and necessary:
+      - sufficient, because a session's tty is fixed for the life of its
+        process, and the one way a session_id legitimately moves hosts
+        (`claude --resume` in another tab) cannot happen without submitting a
+        prompt first;
+      - necessary, because anything cheaper would have to trust a cached
+        value across a resume.
+
+    Deliberately NOT "skip when an entry already exists": that variant still
+    paid the full cost on every event for any session where no ancestor has a
+    terminal at all (`claude -p`, CI, a detached spawn), since the lookup fails
+    and no file is ever written -- precisely the population the change is
+    supposed to relieve. The cost of this rule is that a hook installed
+    mid-session has no entry until that session's next prompt; one turn of
+    cwd-guess fallback is a fair price.
+    """
+    if event not in _TURN_OPEN_EVENTS:
+        # Pink-2026-09-24: keep a live session's entry from ageing out of the
+        # watcher's 2h stale sweep during a long turn with no new prompt.
+        # Cheaply bump its mtime IF it already exists -- no `ps`, no write, no
+        # new entry, and never raises (hooks block the turn, so this stays off
+        # the expensive path that only turn-open pays).
+        _touch_session_tty(session_id)
+        return
+    tty = _controlling_tty()
+    path = os.path.join(TTY_DIR, session_id)
+    if not tty:
+        if _TTY_LOOKUP_FAILED:
+            # We could not find out -- `ps` failed or timed out on a loaded
+            # machine. Keep whatever we had: it is probably still correct, and
+            # this is now the only refresh point, so destroying a valid entry
+            # over a transient hiccup would strand the whole turn on the cwd
+            # guess (wrong window whenever two sessions share a directory in
+            # different hosts -- exactly what this registry prevents).
+            return
+        # Lookup ran and found no terminal: a fact. Drop any existing entry
+        # rather than keep a value we just decided needed refreshing -- after
+        # a `claude --resume` into a different tab, a stale tty sends "take me
+        # there" to a confidently wrong window, while no entry merely falls
+        # back to the cwd guess.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return
+    if not _ensure_dir(TTY_DIR, "tty"):
+        return
+    # tmp + rename so a reader never sees a half-written entry, and a failed
+    # write cannot truncate a good entry into a zero-byte one. The pid in the
+    # tmp name keeps that true even if two hooks for the same session ever
+    # overlap (they should not now that this is turn-open only, but a shared
+    # tmp name would make the rename actively unsafe if they did).
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write(tty)
+        os.replace(tmp, path)
+    except Exception as e:
+        _log(f"TTY {session_id} WRITE_FAILED {e!r}")
+        try:
+            # Nothing ever sweeps TTY_DIR, so clean up after ourselves. This
+            # covers a failed write, not a kill between open() and replace() --
+            # such an orphan is inert (the dir is only ever read by exact
+            # session id, never listed) but would sit there indefinitely.
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def _ensure_dir(path: str, event: str) -> bool:
     """mkdir -p, logging + returning False on failure so the caller can
     bail out before attempting a file op inside a dir that isn't there."""
@@ -200,6 +476,9 @@ def _ensure_dir(path: str, event: str) -> bool:
         return False
 
 
+_SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
 def main() -> int:
     try:
         raw = sys.stdin.read()
@@ -208,11 +487,28 @@ def main() -> int:
         _log(f"PARSE_ERROR {e!r}")
         return 0
 
+    if not isinstance(payload, dict):
+        _log("PARSE_ERROR payload is not an object")
+        return 0
     event = payload.get("hook_event_name", "")
     session_id = payload.get("session_id", "")
     if not session_id:
         _log(f"{event} NO_SESSION_ID")
         return 0
+    # session_id becomes a filename in several flag dirs, and event is used in
+    # set lookups; refuse anything that could raise or escape a dir. Claude
+    # Code session ids are UUIDs, well inside this charset.
+    if not isinstance(event, str):
+        _log("PARSE_ERROR hook_event_name is not a string")
+        return 0
+    if not isinstance(session_id, str) or not _SAFE_SESSION_ID.fullmatch(session_id):
+        _log(f"{event} BAD_SESSION_ID")
+        return 0
+
+    # Record this session's terminal before dispatching, so every signal a
+    # session can raise ("take me there") is resolvable to the exact tab/app
+    # it fired from, not guessed by cwd. Cleared on SessionEnd below.
+    _record_session_tty(session_id, event)
 
     if event == "Notification":
         ntype = payload.get("notification_type", "")
@@ -243,16 +539,19 @@ def main() -> int:
         else:
             _log(f"PreToolUse {session_id} NOOP {tool!r}")
     elif event in _REMOVE_ON_EVENTS:
-        if not _ensure_dir(FLAG_DIR, event):
-            return 0
-        flag_path = os.path.join(FLAG_DIR, session_id)
-        try:
-            os.unlink(flag_path)
-            _log(f"{event} {session_id} REMOVED")
-        except FileNotFoundError:
-            _log(f"{event} {session_id} NOOP (no flag)")
-        except Exception as e:
-            _log(f"{event} {session_id} REMOVE_FAILED {e!r}")
+        # Pink-2026-09-24: no early `return 0` on a mkdir failure -- a turn-close
+        # event (Stop/StopFailure/SessionEnd) MUST still reach the turn-close
+        # block below, or turn_in_flight sticks and the stall path paints
+        # "thinking" over a finished/errored turn.
+        if _ensure_dir(FLAG_DIR, event):
+            flag_path = os.path.join(FLAG_DIR, session_id)
+            try:
+                os.unlink(flag_path)
+                _log(f"{event} {session_id} REMOVED")
+            except FileNotFoundError:
+                _log(f"{event} {session_id} NOOP (no flag)")
+            except Exception as e:
+                _log(f"{event} {session_id} REMOVE_FAILED {e!r}")
         if event == "SessionEnd":
             # Crash-safety only -- PostCompact is the normal way this
             # clears. A session ending mid-compact (rare) would otherwise
@@ -261,6 +560,11 @@ def main() -> int:
             try:
                 os.unlink(os.path.join(RECAP_DIR, session_id))
                 _log(f"{event} {session_id} RECAP_REMOVED")
+            except (FileNotFoundError, OSError):
+                pass
+            try:
+                os.unlink(os.path.join(TTY_DIR, session_id))
+                _log(f"{event} {session_id} TTY_REMOVED")
             except (FileNotFoundError, OSError):
                 pass
     if event == "Stop":
@@ -273,6 +577,25 @@ def main() -> int:
             _log(f"Stop {session_id} WRITE")
         except Exception as e:
             _log(f"Stop {session_id} WRITE_FAILED {e!r}")
+    elif event == "StopFailure":
+        # Turn ended on an API error. Record the error_type CATEGORY only
+        # (never message text) so the watcher can show the right concerned
+        # reason/severity. Missing error_type still means "the turn failed" --
+        # record it as "unknown" rather than dropping the signal.
+        #
+        # Pink-2026-09-24: no early `return 0` if FAILED_DIR cannot be made --
+        # the turn still ended, so the turn-close block below MUST run
+        # regardless, or turn_in_flight sticks and the stall path keeps
+        # painting "thinking" over the error.
+        if _ensure_dir(FAILED_DIR, event):
+            error_type = payload.get("error_type") or "unknown"
+            failed_path = os.path.join(FAILED_DIR, session_id)
+            try:
+                with open(failed_path, "w") as f:
+                    f.write(str(error_type))
+                _log(f"StopFailure {session_id} WRITE {error_type}")
+            except Exception as e:
+                _log(f"StopFailure {session_id} WRITE_FAILED {e!r}")
     elif event == "PreCompact":
         if not _ensure_dir(RECAP_DIR, event):
             return 0
@@ -295,6 +618,13 @@ def main() -> int:
             _log(f"PostCompact {session_id} NOOP (no flag)")
         except Exception as e:
             _log(f"PostCompact {session_id} REMOVE_FAILED {e!r}")
+    if event in _CLEAR_FAILED_EVENTS:
+        try:
+            os.unlink(os.path.join(FAILED_DIR, session_id))
+            _log(f"{event} {session_id} FAILED_CLEARED")
+        except (FileNotFoundError, OSError):
+            pass
+
     if event in _TURN_OPEN_EVENTS:
         if _ensure_dir(TURN_ACTIVE_DIR, event):
             try:
@@ -310,12 +640,14 @@ def main() -> int:
         except (FileNotFoundError, OSError):
             pass
 
-    if event not in _REMOVE_ON_EVENTS and event not in ("Notification", "PreToolUse"):
-        # Guarded against the first dispatch chain above: an event handled
-        # there (PostToolUse, UserPromptSubmit, ...) reaches here too, and
-        # without this check it would be logged as UNKNOWN alongside its own
-        # successful handling -- misleading in exactly the log you reach for
-        # when a flag looks stuck.
+    if (event not in _REMOVE_ON_EVENTS
+            and event not in _SECOND_CHAIN_EVENTS
+            and event not in ("Notification", "PreToolUse")):
+        # Guarded against BOTH dispatch chains above: an event handled there
+        # (PostToolUse, UserPromptSubmit, Stop, StopFailure, PreCompact, ...)
+        # reaches here too, and without this check it would be logged as
+        # UNKNOWN alongside its own successful handling -- misleading in
+        # exactly the log you reach for when a flag looks stuck.
         _log(f"UNKNOWN_EVENT {event!r} {session_id}")
 
     return 0
