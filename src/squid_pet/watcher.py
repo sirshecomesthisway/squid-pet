@@ -2003,9 +2003,25 @@ class StateMachine:
                 return None
             return {"agent": "codex", "owner": {"pid": record['pid'], "created": record['created']}}
 
+        def _claude_focus_session() -> str | None:
+            # A2 (2026-09-24): the owning session id derived from the live
+            # transcript path, so "take me there" can resolve the right tab
+            # even when a background subagent is driving the state after the
+            # parent's Stop cleared the turn-active flag (which the turn_active
+            # signal dir would otherwise have named). For a subagent transcript
+            # this is the PARENT session -- see
+            # detectors.claude_session_id_from_transcript.
+            from .detectors import claude_session_id_from_transcript
+            return claude_session_id_from_transcript(
+                getattr(claude, 'transcript_path', None))
+
         def streaming_target() -> dict | None:
             if claude_streaming:
-                return {"agent": "claude"}
+                target: dict = {"agent": "claude"}
+                sid = _claude_focus_session()
+                if sid:
+                    target["session"] = sid
+                return target
             path = getattr(codex, 'transcript_path', None)
             matches = [r for r in codex_turn_records if path and r.get('transcript_key') == digest(path)]
             owners = {(r['pid'], r['created']) for r in matches}
@@ -2016,6 +2032,17 @@ class StateMachine:
             owner = getattr(detector, 'shell_owner', None)
             if not owner:
                 return None
+            # finding 2 (2026-09-24): the shell OWNER is authoritative for a
+            # working target -- it is the exact process running the tool
+            # subprocess. Deliberately NOT stamped with a transcript-derived
+            # session here: the newest transcript can belong to a DIFFERENT
+            # session than the one running the shell (session A runs a command
+            # while session B has the freshest transcript), and attaching B's
+            # session would make focus raise B's tab. The transcript-derived
+            # session is only trustworthy where the transcript IS the winning
+            # source -- see streaming_target. A helper's Bash runs as a child of
+            # the PARENT claude process, so this owner already maps to the right
+            # terminal via its parent chain (focus._focus_claude_state).
             return {"agent": "claude" if claude_shell_active else "codex", "owner": dict(owner)}
 
         # Merged signals feeding branch 4 below.
