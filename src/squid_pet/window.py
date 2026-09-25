@@ -81,7 +81,6 @@ BUBBLE_PRIO_MOOD = 0      # drowsy / waking emotes (on_mood_change)
 BUBBLE_PRIO_AMBIENT = 1   # idle chatter, "still working" reannounce
 BUBBLE_PRIO_STATE = 2     # state-transition "why" + user interactions
 
-POSITION_FILE = Path.home() / ".squid-pet" / "position.json"
 SETTINGS_FILE = Path.home() / ".squid-pet" / "settings.json"
 # Presence == intentionally hidden via the menu bar toggle. Written by
 # _apply_hide_state() so `squid doctor` (a separate CLI process with no
@@ -295,7 +294,7 @@ def _sync_edge_for_corner(wanderer, corner: str, context: str) -> str | None:
     (authoritative from the corner name), not refresh_edge()'s distance
     heuristic -- see _edge_for_corner's docstring for why the latter
     reliably misses corner-snapped positions. Shared by every corner-snap
-    call site (next_corner, _menu_snap, _menu_recenter, startup) instead
+    call site (next_corner, _menu_snap, startup) instead
     of duplicating this try/except + log at each one. Returns the edge
     now in effect, or None if there's no wanderer yet (e.g. a startup
     race) or the sync itself failed -- both logged, neither raises."""
@@ -349,44 +348,47 @@ def move_window_by_delta(dx: float, dy: float) -> tuple[float, float] | None:
 # ──────────────────────────────────────────────────────────────────
 # Persistent corner
 # ──────────────────────────────────────────────────────────────────
-def load_corner() -> str:
-    """Resolve which corner Squid should start in.
+def _resolve_starting_corner(starting_corner: str | None) -> str:
+    """Pure startup corner-resolution policy, split out of load_corner()'s file
+    IO so the rule is unit-testable without touching disk.
 
-    Priority: position.json (last saved location) -> settings.json
-    starting_corner (user-configured intent) -> "bottom-right"
-    (Pink-blessed default 2026-06-25; feels more natural than top-right
-    because the dock + macOS menu bar already crowd the top edge)."""
-    try:
-        if POSITION_FILE.exists():
-            data = json.loads(POSITION_FILE.read_text())
-            c = data.get("corner")
-            if c in CORNERS:
-                return c
-    except Exception:
-        pass
-    # Fall back to user-configured starting_corner from settings.json.
-    try:
-        settings_file = Path.home() / ".squid-pet" / "settings.json"
-        if settings_file.exists():
-            s = json.loads(settings_file.read_text())
-            c = s.get("starting_corner")
-            if c in CORNERS:
-                return c
-    except Exception:
-        pass
+    Rule: the settings.json `starting_corner` power-user override wins IF it is a
+    valid corner; otherwise "bottom-right" (Pink-blessed default -- feels more
+    natural than top-right because the dock + macOS menu bar already crowd the
+    top edge).
+
+    Pink-2026-09-23: squid now ALWAYS starts bottom-right -- there is no
+    cross-restart corner memory. The right-click Position menu / corner cycling
+    are for in-session moves only and no longer persist anywhere. This dropped
+    the former position.json "resume last corner" path entirely (Option A);
+    `starting_corner` remains only as an optional, hand-edited override in
+    settings.json. Only values in CORNERS are honored; everything else (unset,
+    typo, wrong type) falls through to the default. This is a resolution-policy
+    choice, not a coordinate one -- the Cocoa bottom-left origin math in
+    corner_origin()/_char_bounds() is pinned by test_window_constants_agree.py."""
+    if starting_corner in CORNERS:
+        return starting_corner  # type: ignore[return-value]
     return "bottom-right"
 
 
-def save_corner(corner: str) -> None:
-    POSITION_FILE.parent.mkdir(parents=True, exist_ok=True)
-    POSITION_FILE.write_text(json.dumps({"corner": corner}, indent=2))
+def load_corner() -> str:
+    """Resolve which corner Squid should start in. See _resolve_starting_corner
+    for the policy; this only reads the optional settings.json override. Squid
+    no longer remembers her last position across restarts (position.json is not
+    consulted) -- she always starts bottom-right unless starting_corner overrides
+    it."""
+    return _resolve_starting_corner(load_settings().get("starting_corner"))
 
 
 def load_settings() -> dict:
     """Persistent settings (stroll mode, future toggles). Safe defaults."""
     try:
         if SETTINGS_FILE.exists():
-            return json.loads(SETTINGS_FILE.read_text())
+            data = json.loads(SETTINGS_FILE.read_text())
+            # Hand-edited file: every caller does .get(), so a list/null/
+            # string here must not crash startup.
+            if isinstance(data, dict):
+                return data
     except Exception:
         pass
     return {}
@@ -1011,10 +1013,11 @@ class PetApi:
         self._forced_state = None
 
     def next_corner(self) -> str:
-        """Snap to next corner via NSWindow."""
+        """Snap to next corner via NSWindow. In-session only: the cycle advances
+        in-memory (self._corner) and is NOT persisted -- she always relaunches
+        bottom-right (see load_corner)."""
         idx = CORNERS.index(self._corner)
         self._corner = CORNERS[(idx + 1) % len(CORNERS)]
-        save_corner(self._corner)
         ok = move_to_corner(self._corner)
         _sync_edge_for_corner(self._wanderer, self._corner, "corner snap")
         log.info(f"corner snap -> {self._corner} (ok={ok})")
@@ -1082,7 +1085,10 @@ class PetApi:
     # ─── Position ───
     def _menu_snap(self, corner: str) -> None:
         if move_to_corner(corner):
-            save_corner(corner)
+            # In-session only: track the corner in memory so next_corner()
+            # cycling continues from here, but do NOT persist -- she always
+            # relaunches bottom-right (see load_corner).
+            self._corner = corner
             # Sync sprite rotation + passthrough's edge-aware hit-test
             # offset to the new position, same fix next_corner()/
             # startup/drag's _on_end apply.
@@ -1466,12 +1472,6 @@ class PetApi:
             self._emit_hint("🏃‍♀️ sprinting!")
         except Exception as e:
             self._emit_hint(f"⚠ sprint failed: {e}")
-
-    def _menu_recenter(self) -> None:
-        corner = load_corner()
-        if move_to_corner(corner):
-            _sync_edge_for_corner(self._wanderer, corner, "recenter")
-            self._emit_hint(f"🎯 recentered → {corner}")
 
     # ─── Mood ───
     def _menu_force(self, name: str) -> None:
