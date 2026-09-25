@@ -505,9 +505,35 @@ def main() -> int:
         _log(f"{event} BAD_SESSION_ID")
         return 0
 
+    # Pink-2026-09-24 (review findings 2 + round-2 A): a subagent (Task-tool
+    # helper) event carries the PARENT session_id PLUS an agent_id (main-thread
+    # events NEVER carry agent_id). A helper shares the parent's session_id, so
+    # letting it write/clear the parent's per-session flags corrupts the parent's
+    # state -- e.g. an ExitPlanMode raising a wave that later never clears, a
+    # PostToolUse clearing a wave the parent genuinely raised, or (round-2) a
+    # Stop/StopFailure/UserPromptSubmit/PreCompact/PostCompact/SessionEnd writing
+    # claude_finished / claude_failed, opening or closing the turn bracket, or
+    # touching recapping under the parent's id. All three dispatch chains below
+    # are therefore gated behind ONE early return (see below) rather than a
+    # scatter of `not is_helper` checks.
+    #
+    # Verified live (Claude Code 2.1.282): subagent PreToolUse, PostToolUse,
+    # SubagentStart and SubagentStop all carry agent_id (+ agent_type); main-
+    # thread events carry none. Whether a helper-triggered Notification carries
+    # agent_id is UNVERIFIED -- and the Notification branch is DELIBERATELY the
+    # one exception: it runs before the gate so a permission_prompt (even a
+    # background helper's, which Claude Code surfaces in the main session) still
+    # waves -- a genuine "blocked on the USER" moment. The early return also
+    # means an ever-registered SubagentStart/SubagentStop (which carry agent_id)
+    # is handled here, never mislabelled by the trailing UNKNOWN_EVENT guard.
+    is_helper = bool(payload.get("agent_id"))
+
     # Record this session's terminal before dispatching, so every signal a
     # session can raise ("take me there") is resolvable to the exact tab/app
     # it fired from, not guessed by cwd. Cleared on SessionEnd below.
+    # Kept for helper events too: it never *writes* a new entry off a helper
+    # event (helpers don't fire turn-open), only bumps an existing one's mtime
+    # so the parent session doesn't age out of the tty registry mid-helper-run.
     _record_session_tty(session_id, event)
 
     if event == "Notification":
@@ -524,7 +550,19 @@ def main() -> int:
                 _log(f"Notification {session_id} WRITE_FAILED {e!r}")
         else:
             _log(f"Notification {session_id} IGNORED {ntype!r}")
-    elif event == "PreToolUse":
+        # Notification touches no later chain; return so the helper gate below
+        # never sees it (a helper's permission_prompt must still wave).
+        return 0
+
+    if is_helper:
+        # ONE gate for every dispatch chain below: a helper shares the parent's
+        # session_id, so it must not write or clear any of the parent's flags
+        # (awaiting / finished / failed / recapping / turn_active). Notification
+        # is the sole exception and already returned above. Content-blind.
+        _log(f"{event} {session_id} HELPER_SKIP (agent_id)")
+        return 0
+
+    if event == "PreToolUse":
         tool = payload.get("tool_name", "")
         if tool in _AWAITING_INPUT_TOOLS:
             if not _ensure_dir(FLAG_DIR, event):
