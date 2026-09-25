@@ -35,7 +35,18 @@ class FakeAgent:
 
 @pytest.fixture
 def isolated_clock(monkeypatch, tmp_path):
-    """Keep every external activity/approval signal deterministic."""
+    """Keep every external activity/approval signal deterministic.
+
+    Hermeticity (2026-09-24): several signals StateMachine.compute() reads
+    directly are NOT function-stubbed above -- they read flag directories under
+    the developer's real ~/.squid-pet by way of module-level path constants
+    (claude_finished_freshest_age -> CLAUDE_FINISHED_DIR was the culprit: a live
+    "just finished" flag on this machine flipped these tests to 'grooving').
+    Point every such directory at an empty tmp path so the tests never read --
+    or, via sweep_stale_session_ttys, WRITE/DELETE -- real ~/.squid-pet state.
+    force_state (read from Path.home() directly, not a constant) is neutralised
+    with a no-op so a debug override left on disk can't hijack the cascade.
+    """
     clock = {"now": 100.0}
     monkeypatch.setattr(watcher.time, "time", lambda: clock["now"])
     monkeypatch.setattr(watcher, "macos_idle_seconds", lambda: 0.0)
@@ -48,6 +59,18 @@ def isolated_clock(monkeypatch, tmp_path):
     monkeypatch.setattr(watcher, "filter_eligible_codex_requests", lambda ids: ids)
     monkeypatch.setattr(watcher, "find_claude_code_processes", lambda: [])
     monkeypatch.setattr(watcher, "STATE_DIR", tmp_path)
+    # Isolate every ~/.squid-pet flag dir the cascade + overrides read directly.
+    empty = str(tmp_path / "nonexistent-squid-pet")
+    for const in (
+        "CLAUDE_FINISHED_DIR", "CLAUDE_FAILED_DIR", "CLAUDE_RECAPPING_DIR",
+        "CLAUDE_TASK_COMPLETE_DIR", "CLAUDE_TURN_ACTIVE_DIR",
+        "CLAUDE_AWAITING_INPUT_DIR", "CLAUDE_SESSION_TTY_DIR",
+        "CODEX_AWAITING_INPUT_DIR",
+    ):
+        monkeypatch.setattr(watcher, const, empty)
+    monkeypatch.setattr(
+        watcher.StateMachine, "_apply_force_state_override",
+        lambda self, st: None)
     return clock
 
 
