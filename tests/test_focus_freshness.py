@@ -185,9 +185,7 @@ def test_a_named_but_dead_session_still_raises_the_app(tmp_path, monkeypatch):
     d = tmp_path / "failed"
     _flag(str(d), "sess-gone", 5)                       # fresh, so sid resolves
     monkeypatch.setitem(focus.STATE_SIGNAL_DIRS, "concerned", str(d))
-    monkeypatch.setattr("squid_pet.watcher.claude_session_tty", lambda sid: None)
-    monkeypatch.setattr("squid_pet.watcher.find_terminal_app_bundle_for_session",
-                        lambda sid: None)
+    monkeypatch.setattr("squid_pet.watcher.claude_session_proc", lambda sid: None)
     monkeypatch.setattr("squid_pet.watcher.find_claude_code_processes", lambda: [])
     monkeypatch.setattr("squid_pet.watcher.find_terminal_app_bundle_for_claude_code",
                         lambda: "com.googlecode.iterm2")
@@ -246,9 +244,7 @@ def test_a_dead_named_session_can_still_raise_an_unrelated_tab(tmp_path, monkeyp
     d = tmp_path / "failed"
     _flag(str(d), "sess-dead", 5)                       # fresh -> sid resolves
     monkeypatch.setitem(focus.STATE_SIGNAL_DIRS, "concerned", str(d))
-    monkeypatch.setattr("squid_pet.watcher.claude_session_tty", lambda sid: None)
-    monkeypatch.setattr("squid_pet.watcher.find_terminal_app_bundle_for_session",
-                        lambda sid: None)
+    monkeypatch.setattr("squid_pet.watcher.claude_session_proc", lambda sid: None)
 
     class _Decoy:                                       # an UNRELATED live session
         def terminal(self):
@@ -266,3 +262,62 @@ def test_a_dead_named_session_can_still_raise_an_unrelated_tab(tmp_path, monkeyp
     assert "/dev/ttys099" in seen[0], (
         "documents that an unrelated session's tab is the one raised"
     )
+
+
+# ── the exact session, not merely the freshest (Pink-2026-09-24, review #1) ──
+# A concerned snapshot carries focus_target={"agent":"claude","session":<sid>}.
+# If session A fails, then session B fails before the double-click, the freshest
+# flag is B's -- but the face Pink is reacting to came from A's tick, so
+# take-me-there must raise A. The pinned sid overrides "freshest" while A's flag
+# is still fresh.
+def test_snapshot_session_pins_take_me_there_to_the_failing_session(tmp_path, monkeypatch):
+    d = tmp_path / "failed"
+    _flag(str(d), "sess-A", 5)                 # failed first
+    _flag(str(d), "sess-B", 1)                 # failed later -> freshest flag
+    monkeypatch.setitem(focus.STATE_SIGNAL_DIRS, "concerned", str(d))
+
+    class _Proc:
+        def __init__(self, tty):
+            self._tty = tty
+
+        def terminal(self):
+            return self._tty
+
+    ttys = {"sess-A": "/dev/ttysAAA", "sess-B": "/dev/ttysBBB"}
+    monkeypatch.setattr("squid_pet.watcher.claude_session_proc",
+                        lambda sid: _Proc(ttys[sid]))
+    monkeypatch.setattr("squid_pet.watcher._terminal_app_bundle_for_proc",
+                        lambda proc: focus.TERMINAL_APP_BUNDLE_ID)
+
+    snapshot = watcher.PetState(state="concerned",
+                                focus_target={"agent": "claude", "session": "sess-A"})
+    seen = []
+    result = focus.focus_for_snapshot(snapshot, run=lambda s: seen.append(s) or "matched")
+
+    assert result == "matched"
+    assert "ttysAAA" in seen[0], "must raise A (the session that produced the face)"
+    assert all("ttysBBB" not in s for s in seen), "must not chase B's newer flag"
+
+
+def test_snapshot_session_falls_back_to_freshest_when_its_flag_is_gone(tmp_path, monkeypatch):
+    """If the pinned session's flag has since gone (replied / aged out), fall
+    back to the freshest fresh flag rather than doing nothing."""
+    d = tmp_path / "failed"
+    _flag(str(d), "sess-B", 1)                 # only B's flag remains, fresh
+    monkeypatch.setitem(focus.STATE_SIGNAL_DIRS, "concerned", str(d))
+
+    class _Proc:
+        def terminal(self):
+            return "/dev/ttysBBB"
+
+    monkeypatch.setattr("squid_pet.watcher.claude_session_proc", lambda sid: _Proc())
+    monkeypatch.setattr("squid_pet.watcher._terminal_app_bundle_for_proc",
+                        lambda proc: focus.TERMINAL_APP_BUNDLE_ID)
+
+    snapshot = watcher.PetState(state="concerned",
+                                focus_target={"agent": "claude", "session": "sess-A"})
+    seen = []
+    result = focus.focus_for_snapshot(snapshot, run=lambda s: seen.append(s) or "matched")
+
+    assert result == "matched"
+    assert "ttysBBB" in seen[0]

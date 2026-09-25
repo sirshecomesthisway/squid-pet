@@ -127,6 +127,26 @@ def test_fresh_failure_overrides_idle_cascade_to_concerned(tmp_failed_dir, monke
     assert "StopFailure" in st.state_reason
 
 
+def test_claude_failure_names_claude_as_the_focus_target(tmp_failed_dir, monkeypatch):
+    """Pink-2026-09-24: a Claude StopFailure concern must set focus_target to
+    the Claude source, not inherit whatever the underlying cascade picked (e.g.
+    a Codex working owner) -- otherwise take-me-there raises the wrong agent's
+    window."""
+    _isolate_other_flag_dirs(monkeypatch)
+    _write(tmp_failed_dir / "sess-1", "rate_limit", mtime_age_sec=1.0)
+
+    # Seed a bogus non-Claude target the override must overwrite.
+    st = watcher.PetState(state="working",
+                          focus_target={"agent": "codex", "owner": {"pid": 1}})
+    StateMachine(detectors=[]).\
+        _apply_failure_override(st, time.time())
+
+    assert st.state == "concerned"
+    # Names the EXACT failing session (review #1), not just the agent, so a
+    # later failure in another session cannot move take-me-there to its flag.
+    assert st.focus_target == {"agent": "claude", "session": "sess-1"}
+
+
 def test_no_failure_flag_leaves_cascade_untouched(tmp_failed_dir, monkeypatch):
     _isolate_other_flag_dirs(monkeypatch)
     sm = StateMachine(detectors=[])
@@ -187,3 +207,6 @@ def test_approval_needed_wins_over_concerned(tmp_failed_dir, tmp_path, monkeypat
     st = sm.compute(notify=False)
 
     assert st.state == "approval_needed"
+    # The approval override runs after the failure override and must overwrite
+    # focus_target with its own source, not leave the concern's behind.
+    assert st.focus_target == {"agent": "claude"}

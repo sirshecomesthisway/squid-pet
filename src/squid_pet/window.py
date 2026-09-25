@@ -1381,7 +1381,17 @@ class PetApi:
         the awaiting flag). Covers a Codex-sourced concern too, which has no
         flag to delete. Returns the bubble on the RPC response so it shows
         immediately instead of racing the ~1s poll -- see the dblclick
-        handler in index.html."""
+        handler in index.html.
+
+        Pink-2026-09-24: the dismiss is DEFERRED by ACKNOWLEDGE_DISMISS_DELAY_SEC
+        via a background timer, matching acknowledge_approval -- the bubble
+        appears instantly but the worried face settles a beat later, reading as
+        her having noticed rather than a hard cut. take_me_there in the same
+        gesture cannot lose the race here regardless of the delay: it navigates
+        off the state SNAPSHOT (focus_for_snapshot reads snapshot.focus_target
+        and the on-disk failed flag), and dismiss_concern only snoozes the
+        override for future compute() ticks -- it mutates neither self._latest
+        nor the flag file, so the session stays resolvable."""
         with self._lock:
             current_state = self._latest.state
         if current_state != "concerned":
@@ -1389,11 +1399,17 @@ class PetApi:
         bubble = self._observer.on_interaction("like")
         if bubble is not None:
             self._set_pending_bubble(bubble, BUBBLE_PRIO_STATE)
-        from . import watcher as _w
-        try:
-            _w.dismiss_concern()
-        except Exception as e:
-            log.warning(f"dismiss_concern failed: {e}")
+
+        def _dismiss() -> None:
+            from . import watcher as _w
+            try:
+                _w.dismiss_concern()
+            except Exception as e:
+                log.warning(f"dismiss_concern failed: {e}")
+
+        timer = threading.Timer(ACKNOWLEDGE_DISMISS_DELAY_SEC, _dismiss)
+        timer.daemon = True
+        timer.start()
         return {"status": "calmed", "bubble": bubble}
 
     def take_me_there(self) -> dict:

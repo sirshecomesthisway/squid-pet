@@ -174,6 +174,7 @@ def test_acknowledge_concern_calms_and_dismisses(monkeypatch):
     from squid_pet import watcher as _w
     dismiss = MagicMock()
     monkeypatch.setattr(_w, "dismiss_concern", dismiss)
+    fake = _patch_timer(monkeypatch)
 
     api = _make_api()
     api._latest = PetState(state="concerned")
@@ -181,8 +182,20 @@ def test_acknowledge_concern_calms_and_dismisses(monkeypatch):
 
     result = api.acknowledge_concern()
 
+    # Bubble + return value land immediately.
     assert result == {"status": "calmed", "bubble": "phew"}
     api._observer.on_interaction.assert_called_once_with("like")
     assert api._pending_bubble == "phew"
+
+    # Mirrors acknowledge_approval: the dismiss is deferred by
+    # ACKNOWLEDGE_DISMISS_DELAY_SEC, so the worried face lingers a beat.
+    dismiss.assert_not_called()
+    assert len(fake.instances) == 1
+    timer = fake.instances[0]
+    assert timer.delay == ACKNOWLEDGE_DISMISS_DELAY_SEC
+    assert timer.started is True
+
+    # Simulate the timer firing after the delay.
+    timer.fn()
     dismiss.assert_called_once()
 

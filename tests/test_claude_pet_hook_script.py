@@ -528,6 +528,42 @@ def test_stop_failure_closes_the_turn_bracket(home):
     assert not _turn_active_path(home, "sess-f3").exists()
 
 
+def test_stop_failure_clears_a_stuck_awaiting_input_flag(home):
+    """Pink-2026-09-24 (review #4): a turn that fails on an API error while a
+    permission prompt is up must clear the wave. Without this, 'your turn' kept
+    waving until the 2h sweep and -- approval taking prime over concerned --
+    masked the concerned sprite the whole time."""
+    _run({"session_id": "sess-f9", "hook_event_name": "Notification",
+          "notification_type": "permission_prompt"}, home)
+    assert _flag_path(home, "sess-f9").exists()
+
+    r = _run({"session_id": "sess-f9", "hook_event_name": "StopFailure",
+              "error_type": "rate_limit"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _flag_path(home, "sess-f9").exists()
+    # The failure signal itself must still land -- clearing is additive.
+    assert _failed_path(home, "sess-f9").read_text() == "rate_limit"
+
+
+def test_stop_failure_closes_the_turn_even_when_failed_dir_is_unwritable(home):
+    """Pink-2026-09-24 (review #9): the failed-flag write must not gate the
+    turn-close. If claude_failed/ can't be created, the turn still ENDED --
+    turn_in_flight must not stick, or the stall path keeps painting 'thinking'
+    over the error."""
+    _run({"session_id": "sess-f10", "hook_event_name": "UserPromptSubmit"}, home)
+    assert _turn_active_path(home, "sess-f10").exists()
+
+    # A regular file sits where claude_failed/ would go, so os.makedirs raises.
+    (home / "claude_failed").write_text("not a directory")
+
+    r = _run({"session_id": "sess-f10", "hook_event_name": "StopFailure",
+              "error_type": "overloaded"}, home)
+    assert r.returncode == 0, r.stderr
+    assert not _turn_active_path(home, "sess-f10").exists(), (
+        "turn stayed in flight after a StopFailure whose flag write failed")
+    assert (home / "claude_failed").is_file()  # untouched, and no crash
+
+
 def test_stop_failure_does_not_write_finished_flag(home):
     """A failed turn is not a completion -- it must never look like a Stop and
     trigger the celebrate/groove path."""
@@ -746,6 +782,48 @@ def test_an_existing_entry_survives_the_hot_path(tmp_path, monkeypatch):
     mod._record_session_tty("sess-a", "PostToolUse")
 
     assert (tty_dir / "sess-a").read_text() == "/dev/ttys003"
+
+
+def test_an_existing_entry_is_touched_on_the_hot_path(tmp_path, monkeypatch):
+    """Pink-2026-09-24 (review #2): a live session's entry must not age out of
+    the watcher's 2h stale sweep during a long turn with no new prompt. Every
+    non-turn-open event cheaply bumps its mtime -- no `ps`, no write, no new
+    entry."""
+    import time as _time
+
+    mod = _load_hook_module()
+    tty_dir = tmp_path / "tty"
+    tty_dir.mkdir()
+    entry = tty_dir / "sess-a"
+    entry.write_text("/dev/ttys003")
+    old = _time.time() - 10_000
+    os.utime(entry, (old, old))
+    monkeypatch.setattr(mod, "TTY_DIR", str(tty_dir))
+    fn, calls = _counting_tty("/dev/ttys999")
+    monkeypatch.setattr(mod, "_controlling_tty", fn)
+
+    mod._record_session_tty("sess-a", "PostToolUse")
+
+    assert calls == [], "the expensive ps lookup ran on the hot path"
+    assert entry.read_text() == "/dev/ttys003", "content must be unchanged"
+    assert entry.stat().st_mtime > old, "mtime must be bumped so the sweep keeps it"
+
+
+def test_the_touch_never_creates_a_missing_entry(tmp_path, monkeypatch):
+    """The touch is total but must never fabricate an entry: a session with no
+    recorded tty stays unrecorded until its next turn-open (one turn of
+    cwd-guess fallback), never a bare zero-byte file."""
+    mod = _load_hook_module()
+    tty_dir = tmp_path / "tty"
+    tty_dir.mkdir()
+    monkeypatch.setattr(mod, "TTY_DIR", str(tty_dir))
+    fn, calls = _counting_tty("/dev/ttys999")
+    monkeypatch.setattr(mod, "_controlling_tty", fn)
+
+    mod._record_session_tty("sess-missing", "PostToolUse")
+
+    assert not (tty_dir / "sess-missing").exists()
+    assert calls == []
 
 
 def test_reresolves_on_turn_open_so_a_resumed_session_can_move_tabs(tmp_path, monkeypatch):
@@ -971,3 +1049,23 @@ def test_unit_tests_do_not_touch_the_real_squid_pet_home(tmp_path):
             assert not str(value).startswith(real_home), (
                 f"{attr} points at the real ~/.squid-pet: {value}"
             )
+
+
+@pytest.mark.parametrize("payload", [
+    ["not", "an", "object"],
+    {"hook_event_name": [], "session_id": "abc"},
+    {"hook_event_name": "Stop", "session_id": 123},
+    {"hook_event_name": "Stop", "session_id": "../../escape"},
+    {"hook_event_name": "Stop", "session_id": "a\u0000b"},
+    {"hook_event_name": "Stop", "session_id": "\ud800"},
+    {"hook_event_name": "Stop", "session_id": ".hidden"},
+])
+def test_malformed_payload_or_session_id_exits_zero_and_writes_no_flags(payload, home, tmp_path):
+    """Only the hook's own log may be written; no flag file anywhere under
+    tmp_path (the parent of home, so an escape out of home is caught too)."""
+    r = _run(payload, home)
+    assert r.returncode == 0, r.stderr
+    assert r.stderr == ""
+    written = [p for p in tmp_path.rglob("*")
+               if p.is_file() and p != home / "claude_hook.log"]
+    assert written == []

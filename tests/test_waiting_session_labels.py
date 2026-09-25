@@ -200,3 +200,69 @@ def test_unresolvable_sessions_still_report_a_count(tmp_path, monkeypatch):
     monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(tmp_path))
     out = watcher.describe_waiting_sessions(["x", "y"])
     assert out is None or "2" in out
+
+
+# ── stale tty sweep (Pink-2026-09-24, review #7) ───────────────────────────
+# claude_session_tty/ is read only by exact session_id, never listed, so it
+# had no read-time prune -- SessionEnd was its only removal path. A crashed
+# session leaked its entry, and a later reuse of /dev/ttysNNN could then match
+# an unrelated process. sweep_stale_session_ttys evicts entries past the same
+# 2h crash-safety window the other flag dirs use.
+def test_sweep_evicts_stale_tty_entries_but_keeps_fresh_ones(tmp_path, monkeypatch):
+    import os
+    import time
+
+    d = tmp_path / "session_tty"; d.mkdir()
+    monkeypatch.setattr(watcher, "CLAUDE_SESSION_TTY_DIR", str(d))
+    now = time.time()
+
+    fresh = d / "sess-live"; fresh.write_text("/dev/ttys002")
+    stale = d / "sess-crashed"; stale.write_text("/dev/ttys009")
+    old = now - watcher.CLAUDE_SESSION_TTY_STALE_SEC - 60
+    os.utime(stale, (old, old))
+
+    watcher.sweep_stale_session_ttys(now)
+
+    assert fresh.exists(), "a fresh entry (live session) must survive the sweep"
+    assert not stale.exists(), "a crashed session's stale entry must be evicted"
+
+
+def test_sweep_is_a_noop_when_the_dir_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(watcher, "CLAUDE_SESSION_TTY_DIR", str(tmp_path / "nope"))
+    watcher.sweep_stale_session_ttys()  # must not raise
+
+
+def test_sweep_does_not_unlink_an_entry_re_stamped_after_the_listing(tmp_path, monkeypatch):
+    """Pink-2026-09-24 (review #3): the TOCTOU window. A hook may os.replace()
+    a fresh entry between the sweep's listing and its unlink; re-stat'ing
+    immediately before unlink lets us skip an entry that is fresh again."""
+    import os
+    import time
+
+    d = tmp_path / "session_tty"; d.mkdir()
+    monkeypatch.setattr(watcher, "CLAUDE_SESSION_TTY_DIR", str(d))
+    now = time.time()
+    entry = d / "sess-race"; entry.write_text("/dev/ttys002")
+    old = now - watcher.CLAUDE_SESSION_TTY_STALE_SEC - 60
+    os.utime(entry, (old, old))
+
+    real_stat = os.stat
+    stat_calls = {"n": 0}
+
+    class _Fresh:
+        st_mtime = now  # a hook just re-stamped it
+
+    def _fake_stat(path, *a, **k):
+        if str(path) == str(entry):
+            stat_calls["n"] += 1
+            if stat_calls["n"] == 1:
+                return real_stat(path)          # listing sees the stale mtime
+            return _Fresh()                     # re-stat before unlink: fresh
+        return real_stat(path, *a, **k)
+
+    monkeypatch.setattr(watcher.os, "stat", _fake_stat)
+
+    watcher.sweep_stale_session_ttys(now)
+
+    assert "sess-race" in os.listdir(str(d)), "a just-re-stamped entry was unlinked"
+    assert stat_calls["n"] == 2, "the sweep must re-stat immediately before unlinking"

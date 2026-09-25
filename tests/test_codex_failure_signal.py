@@ -101,7 +101,18 @@ def test_retry_in_other_thread_does_not_clear(db):
 
 def test_malformed_json_degrades_safely(db):
     add(db, raw='{broken')
-    assert watcher.codex_freshest_failure(NOW) is None
+    assert watcher.codex_freshest_failure(NOW) == 'unknown'
+
+
+def test_malformed_newest_row_does_not_hide_older_fresh_failure(db):
+    """Pink-2026-09-24 (review #3): the outer CASE had no ELSE, so a malformed
+    NEWEST row projected NULL and -- ORDER BY completed_at DESC LIMIT 1 -- made
+    the whole query return None, hiding every other fresh failure. With
+    ELSE 'unknown' the failed row surfaces as 'unknown' rather than going
+    silent."""
+    add(db, 'usageLimitExceeded', thread='older', age=30)   # valid, older
+    add(db, thread='newest', age=1, raw='{broken')          # malformed, newest
+    assert watcher.codex_freshest_failure(NOW) == 'unknown'
 
 
 def test_unknown_schema_is_noop(db):
@@ -173,6 +184,24 @@ def test_failure_through_state_machine(db, monkeypatch):
     assert state.concern_severity == 'hard'
     assert 'limit' in state.concern_reason.lower()
     assert 'codex' in state.state_reason
+
+
+def test_codex_concern_has_no_focus_target(db, monkeypatch):
+    """Pink-2026-09-24: a Codex failed-turn row carries no reliable process
+    owner, so take-me-there has no session to raise -- focus_target must be
+    None, and focus_for_snapshot then returns 'none' (a no-op) rather than
+    guessing or inheriting a Claude window."""
+    from squid_pet import focus
+
+    add(db)
+    state = machine(monkeypatch).compute(notify=False)
+    assert state.state == 'concerned'
+    assert state.focus_target is None
+    # A no-target concern must resolve to a hard no-op: no window raised. The
+    # run callback would raise if focus_for_snapshot tried to open anything.
+    def _must_not_run(_script):
+        raise AssertionError("a Codex-sourced concern must not raise any window")
+    assert focus.focus_for_snapshot(state, run=_must_not_run) == 'none'
 
 
 def test_disabled_detector_skips_read(db, monkeypatch):

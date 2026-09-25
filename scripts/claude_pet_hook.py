@@ -91,6 +91,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -180,8 +181,14 @@ _AWAITING_INPUT_TOOLS = frozenset({"AskUserQuestion", "ExitPlanMode"})
 #
 # Neither can suppress a genuine wave: the next permission_prompt re-arms
 # the flag on its own, whenever the session next actually blocks on you.
+#
+# Pink-2026-09-24: StopFailure added. It is the errored-turn twin of Stop --
+# the turn ended, so whatever it was waiting on is moot. Without it, a turn
+# that fails on an API error while a permission prompt is up left the
+# awaiting-input flag set, so "your turn" kept waving until the 2h sweep and
+# (approval taking prime over concerned) masked the concerned sprite entirely.
 _REMOVE_ON_EVENTS = frozenset({
-    "UserPromptSubmit", "SessionEnd", "PostToolUse", "Stop",
+    "UserPromptSubmit", "SessionEnd", "PostToolUse", "Stop", "StopFailure",
 })
 
 # Events handled by the SECOND dispatch chain (the one after the
@@ -365,6 +372,17 @@ def _first_ancestor_tty(ps_output: str, start_pid: int) -> str | None:
     return None
 
 
+def _touch_session_tty(session_id: str) -> None:
+    """Bump an EXISTING tty entry's mtime so the watcher's 2h stale sweep does
+    not evict a still-live session mid-long-turn. Cheap and total: no `ps`, no
+    write, creates nothing (a missing entry raises FileNotFoundError, which is
+    swallowed), and never raises -- hooks block the turn."""
+    try:
+        os.utime(os.path.join(TTY_DIR, session_id))
+    except OSError:
+        pass
+
+
 def _record_session_tty(session_id: str, event: str) -> None:
     """Best-effort: remember which terminal this session lives in. Never fails
     the hook; a missing tty simply leaves no entry (the reader falls back to
@@ -395,6 +413,12 @@ def _record_session_tty(session_id: str, event: str) -> None:
     cwd-guess fallback is a fair price.
     """
     if event not in _TURN_OPEN_EVENTS:
+        # Pink-2026-09-24: keep a live session's entry from ageing out of the
+        # watcher's 2h stale sweep during a long turn with no new prompt.
+        # Cheaply bump its mtime IF it already exists -- no `ps`, no write, no
+        # new entry, and never raises (hooks block the turn, so this stays off
+        # the expensive path that only turn-open pays).
+        _touch_session_tty(session_id)
         return
     tty = _controlling_tty()
     path = os.path.join(TTY_DIR, session_id)
@@ -452,6 +476,9 @@ def _ensure_dir(path: str, event: str) -> bool:
         return False
 
 
+_SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
 def main() -> int:
     try:
         raw = sys.stdin.read()
@@ -460,10 +487,22 @@ def main() -> int:
         _log(f"PARSE_ERROR {e!r}")
         return 0
 
+    if not isinstance(payload, dict):
+        _log("PARSE_ERROR payload is not an object")
+        return 0
     event = payload.get("hook_event_name", "")
     session_id = payload.get("session_id", "")
     if not session_id:
         _log(f"{event} NO_SESSION_ID")
+        return 0
+    # session_id becomes a filename in several flag dirs, and event is used in
+    # set lookups; refuse anything that could raise or escape a dir. Claude
+    # Code session ids are UUIDs, well inside this charset.
+    if not isinstance(event, str):
+        _log("PARSE_ERROR hook_event_name is not a string")
+        return 0
+    if not isinstance(session_id, str) or not _SAFE_SESSION_ID.fullmatch(session_id):
+        _log(f"{event} BAD_SESSION_ID")
         return 0
 
     # Record this session's terminal before dispatching, so every signal a
@@ -500,16 +539,19 @@ def main() -> int:
         else:
             _log(f"PreToolUse {session_id} NOOP {tool!r}")
     elif event in _REMOVE_ON_EVENTS:
-        if not _ensure_dir(FLAG_DIR, event):
-            return 0
-        flag_path = os.path.join(FLAG_DIR, session_id)
-        try:
-            os.unlink(flag_path)
-            _log(f"{event} {session_id} REMOVED")
-        except FileNotFoundError:
-            _log(f"{event} {session_id} NOOP (no flag)")
-        except Exception as e:
-            _log(f"{event} {session_id} REMOVE_FAILED {e!r}")
+        # Pink-2026-09-24: no early `return 0` on a mkdir failure -- a turn-close
+        # event (Stop/StopFailure/SessionEnd) MUST still reach the turn-close
+        # block below, or turn_in_flight sticks and the stall path paints
+        # "thinking" over a finished/errored turn.
+        if _ensure_dir(FLAG_DIR, event):
+            flag_path = os.path.join(FLAG_DIR, session_id)
+            try:
+                os.unlink(flag_path)
+                _log(f"{event} {session_id} REMOVED")
+            except FileNotFoundError:
+                _log(f"{event} {session_id} NOOP (no flag)")
+            except Exception as e:
+                _log(f"{event} {session_id} REMOVE_FAILED {e!r}")
         if event == "SessionEnd":
             # Crash-safety only -- PostCompact is the normal way this
             # clears. A session ending mid-compact (rare) would otherwise
@@ -540,16 +582,20 @@ def main() -> int:
         # (never message text) so the watcher can show the right concerned
         # reason/severity. Missing error_type still means "the turn failed" --
         # record it as "unknown" rather than dropping the signal.
-        if not _ensure_dir(FAILED_DIR, event):
-            return 0
-        error_type = payload.get("error_type") or "unknown"
-        failed_path = os.path.join(FAILED_DIR, session_id)
-        try:
-            with open(failed_path, "w") as f:
-                f.write(str(error_type))
-            _log(f"StopFailure {session_id} WRITE {error_type}")
-        except Exception as e:
-            _log(f"StopFailure {session_id} WRITE_FAILED {e!r}")
+        #
+        # Pink-2026-09-24: no early `return 0` if FAILED_DIR cannot be made --
+        # the turn still ended, so the turn-close block below MUST run
+        # regardless, or turn_in_flight sticks and the stall path keeps
+        # painting "thinking" over the error.
+        if _ensure_dir(FAILED_DIR, event):
+            error_type = payload.get("error_type") or "unknown"
+            failed_path = os.path.join(FAILED_DIR, session_id)
+            try:
+                with open(failed_path, "w") as f:
+                    f.write(str(error_type))
+                _log(f"StopFailure {session_id} WRITE {error_type}")
+            except Exception as e:
+                _log(f"StopFailure {session_id} WRITE_FAILED {e!r}")
     elif event == "PreCompact":
         if not _ensure_dir(RECAP_DIR, event):
             return 0

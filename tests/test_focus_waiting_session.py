@@ -135,10 +135,15 @@ def test_working_focuses_the_session_that_is_mid_turn(tmp_path, monkeypatch):
     d = tmp_path / "turn"; d.mkdir()
     (d / "sess-w").write_text("turn")
     monkeypatch.setitem(focus.STATE_SIGNAL_DIRS, "working", str(d))
-    monkeypatch.setattr("squid_pet.watcher.claude_session_tty",
-                        lambda sid: "/dev/ttys011" if sid == "sess-w" else None)
-    monkeypatch.setattr("squid_pet.watcher.find_terminal_app_bundle_for_claude_code",
-                        lambda: focus.TERMINAL_APP_BUNDLE_ID)
+
+    class _Proc:
+        def terminal(self):
+            return "/dev/ttys011"
+
+    monkeypatch.setattr("squid_pet.watcher.claude_session_proc",
+                        lambda sid: _Proc() if sid == "sess-w" else None)
+    monkeypatch.setattr("squid_pet.watcher._terminal_app_bundle_for_proc",
+                        lambda proc: focus.TERMINAL_APP_BUNDLE_ID)
     seen = []
     result = focus.focus_for_state("working",
                                    run=lambda s: (seen.append(s), "matched")[1])
@@ -175,11 +180,29 @@ def test_take_me_there_raises_the_failed_sessions_own_app_not_a_bystander(
     d = tmp_path / "failed"; d.mkdir()
     (d / "sess-cursor").write_text("StopFailure")
     monkeypatch.setitem(focus.STATE_SIGNAL_DIRS, "concerned", str(d))
-    # Both tty and app resolve through the SAME failed session:
-    monkeypatch.setattr("squid_pet.watcher.claude_session_tty",
-                        lambda sid: "/dev/ttys050" if sid == "sess-cursor" else None)
-    monkeypatch.setattr("squid_pet.watcher.find_terminal_app_bundle_for_session",
-                        lambda sid: _CURSOR_BUNDLE if sid == "sess-cursor" else None)
+
+    class _Proc:
+        def terminal(self):
+            return "/dev/ttys050"
+
+    # Both tty and app resolve through the SAME failed session's process. The
+    # proc must be resolved ONCE and reused (review #6): count the calls and
+    # capture the object the bundle resolver is handed.
+    proc_calls = []
+    the_proc = _Proc()
+
+    def _resolve(sid):
+        proc_calls.append(sid)
+        return the_proc if sid == "sess-cursor" else None
+
+    bundle_procs = []
+
+    def _bundle(proc):
+        bundle_procs.append(proc)
+        return _CURSOR_BUNDLE
+
+    monkeypatch.setattr("squid_pet.watcher.claude_session_proc", _resolve)
+    monkeypatch.setattr("squid_pet.watcher._terminal_app_bundle_for_proc", _bundle)
     # The session-blind scan would answer Terminal.app -- the bystander:
     monkeypatch.setattr("squid_pet.watcher.find_terminal_app_bundle_for_claude_code",
                         lambda: focus.TERMINAL_APP_BUNDLE_ID)
@@ -189,20 +212,22 @@ def test_take_me_there_raises_the_failed_sessions_own_app_not_a_bystander(
     assert _CURSOR_BUNDLE in seen[0], "must activate Cursor, the app that errored"
     assert all("Terminal" not in s for s in seen), \
         "must never run the Terminal focus script for a Cursor-hosted session"
+    # One resolution, and the bundle resolver saw the SAME proc used for tty --
+    # this is what the old two-lookup code (which called claude_session_proc
+    # twice) would have failed.
+    assert proc_calls == ["sess-cursor"], "the session's process was resolved more than once"
+    assert bundle_procs == [the_proc], "the app was resolved from a different proc than the tab"
 
 
 def test_take_me_there_falls_back_to_session_blind_bundle_when_unresolved(
         tmp_path, monkeypatch):
     """A Codex-sourced concern (or an aged-out flag) has no resolvable
-    session process. find_terminal_app_bundle_for_session returns None, so
-    take-me-there falls back to the old session-blind lookup rather than
-    doing nothing."""
+    session process. claude_session_proc returns None, so take-me-there falls
+    back to the old session-blind lookup rather than doing nothing."""
     d = tmp_path / "failed"; d.mkdir()
     (d / "sess-gone").write_text("StopFailure")
     monkeypatch.setitem(focus.STATE_SIGNAL_DIRS, "concerned", str(d))
-    monkeypatch.setattr("squid_pet.watcher.claude_session_tty", lambda sid: None)
-    monkeypatch.setattr("squid_pet.watcher.find_terminal_app_bundle_for_session",
-                        lambda sid: None)
+    monkeypatch.setattr("squid_pet.watcher.claude_session_proc", lambda sid: None)
     monkeypatch.setattr("squid_pet.watcher.find_claude_code_processes", lambda: [])
     monkeypatch.setattr("squid_pet.watcher.find_terminal_app_bundle_for_claude_code",
                         lambda: "com.googlecode.iterm2")

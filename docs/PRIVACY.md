@@ -48,7 +48,7 @@ config, outside this repo).
 |--------|----------|
 | `~/.squid-pet/claude_awaiting_input/<session_id>` (content: the notification_type string) | direct signal: this Claude Code session is waiting on you right now |
 | `~/.squid-pet/claude_failed/<session_id>` (content: the error_type category) | direct signal: this session's turn ended on an API error (usage limit, overload, auth, billing, ...) -- shows "concerned". Never contains message text |
-| `~/.squid-pet/claude_session_tty/<session_id>` (content: a `/dev/ttysNNN` string) | lets "take me there" raise the exact terminal/tab a signal came from, rather than guessing by working directory (which cannot tell apart two sessions in the same folder). A terminal device number only -- not the working directory, project name, or any content. Removed on `SessionEnd` |
+| `~/.squid-pet/claude_session_tty/<session_id>` (content: a `/dev/ttysNNN` string) | lets "take me there" raise the exact terminal/tab a signal came from, rather than guessing by working directory (which cannot tell apart two sessions in the same folder). A terminal device number only -- not the working directory, project name, or any content. Removed on `SessionEnd`, and swept after 2h as crash-safety (like the other flag dirs) so a session that died without firing `SessionEnd` cannot leak a stale entry |
 | `~/.squid-pet/claude_hook.log` (one line per hook invocation, auto-truncated past 200KB) | lets you verify the hook is actually firing -- `tail -f` it while using Claude Code |
 
 Does NOT read: the `message` field's human-readable text, `transcript_path`,

@@ -469,8 +469,9 @@ def find_terminal_app_bundle_for_claude_code() -> str | None:
     process is found or its ancestry hits no app within a few hops.
 
     When the caller knows WHICH session it means (a session-id-keyed flag
-    dir named it), find_terminal_app_bundle_for_session resolves the app
-    through that exact process instead, which is what makes "take me there"
+    dir named it), focus._focus_claude_state resolves that session's process
+    (claude_session_proc) once and derives both its tab and its app from it
+    via _terminal_app_bundle_for_proc, which is what makes "take me there"
     land in the right app when sessions run in different hosts.
     """
     for proc in find_claude_code_processes():
@@ -808,9 +809,17 @@ def dismiss_concern(now: float | None = None) -> None:
     _concern_dismissed_until = now + CONCERN_DISMISS_SEC
 
 
-def claude_freshest_failure(now: float | None = None) -> str | None:
-    """error_type of the most-recently-written, still-fresh StopFailure flag,
-    or None if no Claude Code session failed within CLAUDE_FAILED_FRESH_SEC.
+def claude_freshest_failure_with_session(
+    now: float | None = None,
+) -> tuple[str, str] | None:
+    """(error_type, session_id) of the most-recently-written, still-fresh
+    StopFailure flag, or None if no Claude Code session failed within
+    CLAUDE_FAILED_FRESH_SEC.
+
+    Pink-2026-09-24: returns the sid too, so _apply_failure_override can pin
+    take-me-there to the EXACT session that failed. Without it, a second
+    session failing before the double-click would move the freshest flag and
+    send you to the wrong window.
 
     Reads the freshest flag's content (an error CATEGORY, not message text).
     """
@@ -835,9 +844,19 @@ def claude_freshest_failure(now: float | None = None) -> str | None:
         return None
     try:
         with open(os.path.join(CLAUDE_FAILED_DIR, freshest_sid)) as f:
-            return f.read().strip() or "unknown"
+            return (f.read().strip() or "unknown", freshest_sid)
     except OSError:
         return None
+
+
+def claude_freshest_failure(now: float | None = None) -> str | None:
+    """error_type of the most-recently-written, still-fresh StopFailure flag,
+    or None if no Claude Code session failed within CLAUDE_FAILED_FRESH_SEC.
+
+    Reads the freshest flag's content (an error CATEGORY, not message text).
+    """
+    hit = claude_freshest_failure_with_session(now)
+    return hit[0] if hit else None
 
 
 # Versioned internal schema, verified against installed codex-cli 0.153.4.
@@ -860,9 +879,12 @@ def codex_freshest_failure(now: float | None = None) -> str | None:
     SQLite projects allowlisted constants from error_json.codexErrorInfo
     (string enum or tagged object). Never SELECT error_json itself, message,
     additionalDetails, thread_items, or transcripts. Unknown categories on
-    explicit failures become 'unknown'; malformed JSON/schema is a no-op.
-    A newer turn in the same thread suppresses its previous failure; ties
-    conservatively suppress it too. Silence never creates a failure.
+    explicit failures become 'unknown'; so does a failed row with missing or
+    malformed error_json (Pink-2026-09-24: an ELSE-less outer CASE projected
+    NULL there, so a malformed NEWEST row hid every older fresh failure under
+    ORDER BY completed_at DESC LIMIT 1). A newer turn in the same thread
+    suppresses its previous failure; ties conservatively suppress it too.
+    Silence never creates a failure.
 
     mode=ro preserves WAL visibility (immutable=1 would miss live WAL rows).
     No writes, migrations, explicit locks, or busy waits; the short SQLite
@@ -897,7 +919,7 @@ def codex_freshest_failure(now: float | None = None) -> str | None:
                                 '$.codexErrorInfo.responseTooManyFailedAttempts') = 'object'
                             THEN 'codex_connection_error' ELSE 'unknown' END
                     END
-                END
+                ELSE 'unknown' END
                 FROM thread_turns AS f
                 WHERE f.status = 'failed'
                   AND typeof(f.completed_at) = 'integer'
@@ -1048,6 +1070,47 @@ def claude_session_label(session_id: str) -> str | None:
 CLAUDE_SESSION_TTY_DIR = os.path.join(
     os.path.expanduser("~"), ".squid-pet", "claude_session_tty"
 )
+CLAUDE_SESSION_TTY_STALE_SEC = 7200.0  # 2h -- crashed-session disk cleanup only
+
+
+def sweep_stale_session_ttys(now: float | None = None) -> None:
+    """Evict tty entries a crashed/killed session left behind.
+
+    Pink-2026-09-24: unlike every other flag dir, claude_session_tty/ is only
+    ever read by exact session_id (claude_session_recorded_tty), never listed,
+    so nothing pruned it -- SessionEnd was its ONLY removal path. A session
+    that died without firing SessionEnd leaked its entry forever, and because
+    /dev/ttysNNN numbers are reused, that stale tty could later match an
+    UNRELATED live process and send take-me-there to the wrong window (the very
+    class of bug this registry exists to prevent). Evict entries past the same
+    2h crash-safety window the other flag dirs use (_scan_session_flag_dir); a
+    live session re-stamps its entry on its next turn (_record_session_tty) or
+    touches it on any other event (claude_pet_hook._touch_session_tty), so the
+    only cost of an over-eager prune is one turn of cwd-guess fallback.
+    """
+    if now is None:
+        now = time.time()
+    try:
+        names = os.listdir(CLAUDE_SESSION_TTY_DIR)
+    except OSError:
+        return
+    for name in names:
+        if name.startswith("."):
+            continue
+        path = os.path.join(CLAUDE_SESSION_TTY_DIR, name)
+        try:
+            if now - os.stat(path).st_mtime > CLAUDE_SESSION_TTY_STALE_SEC:
+                # Re-stat immediately before unlink: a hook may have re-stamped
+                # (os.replace / _touch_session_tty) this entry since the listing
+                # above. Skip if it is fresh again, so we never delete a just-
+                # refreshed entry. A microsecond residual race remains (a
+                # re-stamp between this stat and the unlink); its only cost is
+                # one turn of cwd-guess fallback, so it is accepted.
+                if now - os.stat(path).st_mtime <= CLAUDE_SESSION_TTY_STALE_SEC:
+                    continue
+                os.unlink(path)
+        except OSError:
+            pass
 
 
 def claude_session_recorded_tty(session_id: str) -> str | None:
@@ -1118,21 +1181,6 @@ def claude_session_tty(session_id: str) -> str | None:
         return proc.terminal()
     except Exception:
         return None
-
-
-def find_terminal_app_bundle_for_session(session_id: str) -> str | None:
-    """The terminal/IDE app hosting a SPECIFIC session, resolved through
-    that session's own process.
-
-    Companion to claude_session_tty: the tty tells "take me there" which
-    tab, this tells it which app. Both come from the same claude_session_proc
-    match, so a failed session in Cursor is never raised as the Terminal.app
-    session that merely happened to be found first (Pink-2026-09-16 bug:
-    double-clicking the concerned face landed in the wrong window). Returns
-    None when the session's process can't be located -- the caller then
-    falls back to the session-blind lookup, no worse than before.
-    """
-    return _terminal_app_bundle_for_proc(claude_session_proc(session_id))
 
 
 def describe_waiting_sessions(session_ids: list[str]) -> str | None:
@@ -1556,6 +1604,9 @@ class StateMachine:
         st = self._compute_inner()
         now = time.time()
         self._track_agent_idle(st, now)
+        # Prune tty entries crashed sessions leaked -- this dir is read only by
+        # exact key, never listed, so it has no read-time prune of its own.
+        sweep_stale_session_ttys(now)
 
         # Approval-needed is layered on AFTER the cascade, from Claude Code's
         # and Codex's own hook-written flag files. It OVERRIDES whatever the
@@ -1801,14 +1852,27 @@ class StateMachine:
         # snoozes this override for CONCERN_DISMISS_SEC.
         if now < _concern_dismissed_until:
             return
-        error_type = claude_freshest_failure(now)
+        claude_hit = claude_freshest_failure_with_session(now)
+        error_type = claude_hit[0] if claude_hit else None
         source = "claude StopFailure"
+        # Pink-2026-09-24: name the source of the concern so take-me-there
+        # follows THIS override rather than inheriting the underlying state's
+        # target (e.g. a Codex working owner) and raising the wrong window.
+        # Carry the EXACT failing session id, so a second session failing
+        # before the double-click cannot move focus to its newer flag.
+        focus_target: dict | None = (
+            {"agent": "claude", "session": claude_hit[1]} if claude_hit
+            else {"agent": "claude"})
         # Preserve Claude priority; only consult Codex when its detector is
         # enabled. The process may already have exited after the failure.
         if (error_type is None and self._codex_detector is not None
                 and getattr(self._codex_detector, "enabled", False)):
             error_type = codex_freshest_failure(now)
             source = "codex failed turn"
+            # A Codex failed-turn row carries no reliable process owner, so
+            # there is no session to raise; focus_for_snapshot falls through
+            # to "resting" rather than guessing a window.
+            focus_target = None
         if error_type is None:
             return
         reason, severity = concern_for_error_type(error_type)
@@ -1817,6 +1881,7 @@ class StateMachine:
         st.concern_severity = severity
         st.state_reason = f"{source} ({error_type})"
         st.message = f"⚠️ {reason}"
+        st.focus_target = focus_target
 
     def _apply_force_state_override(self, st: PetState) -> None:
         # ── FORCE-STATE OVERRIDE (test/demo) ─────────────────────────

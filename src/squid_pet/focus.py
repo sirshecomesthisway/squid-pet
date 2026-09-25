@@ -342,12 +342,29 @@ def focus_for_snapshot(snapshot, run=None) -> str:
     if target.get('agent') == 'claude':
         # Resolve only Claude's signal directory. The snapshot may predate a
         # new Codex request, which must not steal a Claude-origin click.
-        return _focus_claude_state(snapshot.state, run)
+        return _focus_claude_state(snapshot.state, run, session=target.get('session'))
     return "none"
 
 
+def _named_if_fresh(dir_path: str, name: str,
+                    fresh_sec: Optional[float]) -> Optional[str]:
+    """Return `name` if its flag is present in `dir_path` and (when fresh_sec
+    is given) still within that window; otherwise None. Read-only, like
+    _freshest_in -- pruning belongs to the watcher."""
+    import os
+    import time
+    try:
+        mtime = os.stat(os.path.join(dir_path, name)).st_mtime
+    except OSError:
+        return None
+    if fresh_sec is not None and (time.time() - mtime) > fresh_sec:
+        return None
+    return name
+
+
 def _focus_claude_state(state: str,
-                        run: Optional[Callable[[str], Optional[str]]] = None) -> str:
+                        run: Optional[Callable[[str], Optional[str]]] = None,
+                        session: Optional[str] = None) -> str:
     signal_dir = STATE_SIGNAL_DIRS.get(state)
     if signal_dir is None:
         return "resting"
@@ -355,20 +372,39 @@ def _focus_claude_state(state: str,
     # this stays exactly the pre-existing lookup everywhere else: no
     # behaviour change, and no second pass that could only ever return the
     # same answer.
-    sid = _freshest_in(signal_dir, _state_fresh_sec(state))
+    fresh_sec = _state_fresh_sec(state)
+    # When the winning state named its exact session (a StopFailure concern),
+    # honour THAT session while its flag is still fresh -- a later failure in
+    # another session must not move the click to its newer flag. If that
+    # session's flag has since gone (replied/aged out), fall back to freshest.
+    sid = _named_if_fresh(signal_dir, session, fresh_sec) if session else None
+    if sid is None:
+        sid = _freshest_in(signal_dir, fresh_sec)
     tty = None
     bundle = None
     if sid:
         try:
-            from .watcher import claude_session_tty, find_terminal_app_bundle_for_session
+            from .watcher import _terminal_app_bundle_for_proc, claude_session_proc
             # Resolve BOTH the tab (tty) and the app (bundle) through the one
             # session that caused the state. Resolving the app separately, as
             # _raise's session-blind fallback does, can name a different
             # session's host when several run in different apps -- the
             # Pink-2026-09-16 bug where a failed Cursor turn sent the
             # concerned double-click to a Terminal window instead.
-            tty = claude_session_tty(sid)
-            bundle = find_terminal_app_bundle_for_session(sid)
+            #
+            # Pink-2026-09-24: resolve the session's PROCESS once and derive
+            # both facts from it. claude_session_tty() and
+            # find_terminal_app_bundle_for_session() each re-ran
+            # claude_session_proc() independently, so a session that moved (or
+            # a process list that changed between the two lookups) could give a
+            # tty and a bundle that name different sessions.
+            proc = claude_session_proc(sid)
+            if proc is not None:
+                try:
+                    tty = proc.terminal()
+                except Exception:
+                    tty = None
+                bundle = _terminal_app_bundle_for_proc(proc)
         except Exception:
             tty = None
             bundle = None
