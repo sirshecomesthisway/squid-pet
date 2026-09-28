@@ -41,8 +41,10 @@ def _clear_claude_session_state():
     """_CLAUDE_SESSION_FLAG_FIRST_SEEN is module-level state -- reset
     around every test so tests can't leak into each other."""
     watcher._CLAUDE_SESSION_FLAG_FIRST_SEEN.clear()
+    watcher._CLAUDE_SESSION_FLAG_MTIME.clear()
     yield
     watcher._CLAUDE_SESSION_FLAG_FIRST_SEEN.clear()
+    watcher._CLAUDE_SESSION_FLAG_MTIME.clear()
 
 
 # ── claude_sessions_awaiting_input() ──────────────────────────────────
@@ -474,3 +476,333 @@ def test_state_reverts_once_flag_removed_between_ticks(tmp_claude_dir):
 
     assert st.state != "approval_needed", \
         "state must revert immediately once the flag is gone (next tick)"
+
+
+# ── round 3 (review #3): a NEW add to a still-present flag re-arms ────────
+# The flag is an owner set, so a second prompt in the same session (a helper's,
+# or the parent's next one) no longer makes the file vanish and reappear -- it
+# ADDS a line and advances the mtime. The snooze and the one-shot OS alert
+# must re-arm on that advance, not only on a vanish/reappear. A partial clear
+# never advances the mtime, so it must not re-alert.
+def _set_mtime(path, t):
+    import os
+    os.utime(path, (t, t))
+
+
+def test_mtime_advance_rearms_a_snoozed_session(tmp_claude_dir):
+    flag = tmp_claude_dir / "sess-adv"
+    flag.write_text("permission_prompt\nparent 1")
+    now = time.time()
+    _set_mtime(flag, now - 300)
+    with patch("time.time", return_value=now):
+        assert watcher.filter_eligible_claude_sessions(["sess-adv"]) == ["sess-adv"]
+    later = now + watcher._CLAUDE_SESSION_SNOOZE_SEC + 1
+    with patch("time.time", return_value=later):
+        assert watcher.filter_eligible_claude_sessions(["sess-adv"]) == []
+        _set_mtime(flag, now - 200)  # a new owner was added
+        assert watcher.filter_eligible_claude_sessions(["sess-adv"]) == ["sess-adv"]
+
+
+def test_unchanged_or_older_mtime_does_not_rearm(tmp_claude_dir):
+    flag = tmp_claude_dir / "sess-part"
+    flag.write_text("permission_prompt\nparent 1")
+    now = time.time()
+    _set_mtime(flag, now - 300)
+    with patch("time.time", return_value=now):
+        watcher.filter_eligible_claude_sessions(["sess-part"])
+    later = now + watcher._CLAUDE_SESSION_SNOOZE_SEC + 1
+    with patch("time.time", return_value=later):
+        assert watcher.filter_eligible_claude_sessions(["sess-part"]) == []
+        _set_mtime(flag, now - 400)  # partial clear: newest owner removed
+        assert watcher.filter_eligible_claude_sessions(["sess-part"]) == []
+        _set_mtime(flag, now - 300)  # back up to, but not past, the max seen
+        assert watcher.filter_eligible_claude_sessions(["sess-part"]) == []
+
+
+def test_manual_snooze_holds_until_a_new_add(tmp_claude_dir):
+    flag = tmp_claude_dir / "sess-calm"
+    flag.write_text("permission_prompt\nparent 1")
+    _set_mtime(flag, time.time() - 60)
+    watcher.snooze_all_awaiting_now()
+    assert watcher.count_currently_waving_sessions() == 0
+    assert watcher.count_currently_waving_sessions() == 0
+    _set_mtime(flag, time.time())
+    assert watcher.count_currently_waving_sessions() == 1
+
+
+def test_os_alert_refires_when_a_new_owner_is_added(tmp_claude_dir):
+    flag = tmp_claude_dir / "sess-two"
+    flag.write_text("permission_prompt\nparent 1")
+    _set_mtime(flag, time.time() - 60)
+    sm = watcher.StateMachine()
+    sm._compute_inner = lambda: watcher.PetState(state="idle", message="x")
+    with patch.object(watcher, "_fire_approval_notification") as mock_notify, \
+         _patched_config():
+        for _ in range(3):
+            assert sm.compute().state == "approval_needed"
+        assert mock_notify.call_count == 1
+        _set_mtime(flag, time.time() - 30)  # a helper's prompt was added
+        assert sm.compute().state == "approval_needed"
+        assert mock_notify.call_count == 2, "a new prompt must alert again"
+        for _ in range(3):
+            sm.compute()
+        assert mock_notify.call_count == 2
+
+
+def test_os_alert_does_not_refire_on_a_partial_clear(tmp_claude_dir):
+    flag = tmp_claude_dir / "sess-pc"
+    flag.write_text("permission_prompt\nparent 1\nagent:a 2")
+    _set_mtime(flag, time.time() - 60)
+    sm = watcher.StateMachine()
+    sm._compute_inner = lambda: watcher.PetState(state="idle", message="x")
+    with patch.object(watcher, "_fire_approval_notification") as mock_notify, \
+         _patched_config():
+        sm.compute()
+        flag.write_text("permission_prompt\nparent 1")
+        _set_mtime(flag, time.time() - 90)
+        sm.compute()
+        sm.compute()
+    assert mock_notify.call_count == 1
+
+
+# ── round 3 (review #4): self-heal vs the owner set ────────────────────────
+def _heal_tick(state="working", procs=("proc1",)):
+    sm = watcher.StateMachine()
+    sm._compute_inner = lambda: watcher.PetState(state=state, message="x")
+    with patch.object(watcher, "_fire_approval_notification"), \
+         patch.object(watcher, "find_claude_code_processes",
+                      return_value=list(procs)), \
+         _patched_config():
+        return sm.compute()
+
+
+def test_self_heal_never_deletes_a_flag_with_several_owners(tmp_claude_dir):
+    """Two owners = two independent pending prompts (the parent's and a
+    helper's). The session looking busy says nothing about BOTH of them."""
+    flag = tmp_claude_dir / "sess-multi"
+    flag.write_text("permission_prompt\nparent 1.0\nagent:abc 2.0")
+    _backdate(flag, watcher.SELF_HEAL_MIN_FLAG_AGE_SEC + 5)
+    st = _heal_tick()
+    assert flag.exists()
+    assert st.state == "approval_needed"
+
+
+def test_self_heal_still_clears_a_single_owner_flag(tmp_claude_dir):
+    flag = tmp_claude_dir / "sess-single"
+    flag.write_text("permission_prompt\nagent:abc 2.0")
+    _backdate(flag, watcher.SELF_HEAL_MIN_FLAG_AGE_SEC + 5)
+    assert _heal_tick().state == "working"
+    assert not flag.exists()
+
+
+def test_self_heal_skips_a_tick_while_the_hook_holds_the_lock(tmp_claude_dir):
+    import fcntl
+    flag = tmp_claude_dir / "sess-locked"
+    flag.write_text("permission_prompt\nparent 1.0")
+    _backdate(flag, watcher.SELF_HEAL_MIN_FLAG_AGE_SEC + 5)
+    with open(tmp_claude_dir / ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _heal_tick()
+        assert flag.exists(), "self-heal must not delete under the hook's feet"
+    _heal_tick()
+    assert not flag.exists()
+
+
+def test_self_heal_rechecks_age_after_taking_the_lock(tmp_claude_dir, monkeypatch):
+    """A prompt added while self-heal waited for the lock makes the flag
+    fresh again -- it must survive, like any freshly raised flag."""
+    import fcntl
+    import os
+    flag = tmp_claude_dir / "sess-raced"
+    flag.write_text("permission_prompt\nparent 1.0")
+    _backdate(flag, watcher.SELF_HEAL_MIN_FLAG_AGE_SEC + 5)
+    real_flock = fcntl.flock
+
+    def flock_then_add(fd, op):
+        os.utime(flag)  # the hook's add lands just before we get the lock
+        return real_flock(fd, op)
+    monkeypatch.setattr(watcher.fcntl, "flock", flock_then_add)
+    _heal_tick()
+    assert flag.exists()
+
+
+# ── round 4 #2: the stale sweep takes the hook's lock before deleting ─────
+# The hook re-raises a flag with a read-modify-write under its flock; a stale
+# eviction that unlinked without the lock could delete a flag the hook had
+# just re-raised (lost wave). Same own-lock-without-waiting pattern as the
+# self-heal: contended -> skip this tick; acquired -> re-check, then delete.
+def _make_stale(path):
+    import os
+    old = time.time() - watcher.CLAUDE_AWAITING_INPUT_STALE_SEC - 60
+    os.utime(path, (old, old))
+
+
+def test_stale_eviction_waits_for_the_hooks_lock(tmp_claude_dir):
+    import fcntl
+    flag = tmp_claude_dir / "sess-stale-locked"
+    flag.write_text("permission_prompt\nparent 1.0")
+    _make_stale(flag)
+    with open(tmp_claude_dir / ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert watcher.claude_sessions_awaiting_input() == []
+        assert flag.exists(), "must not delete under the hook's feet"
+    assert watcher.claude_sessions_awaiting_input() == []
+    assert not flag.exists(), "the next tick cleans it up"
+
+
+def test_stale_eviction_rechecks_the_mtime_under_the_lock(tmp_claude_dir,
+                                                           monkeypatch):
+    """A hook re-raise that lands while the sweep waits for the lock makes
+    the flag fresh: it must survive AND be reported as live."""
+    import fcntl
+    import os
+    flag = tmp_claude_dir / "sess-stale-raced"
+    flag.write_text("permission_prompt\nparent 1.0")
+    _make_stale(flag)
+    real_flock = fcntl.flock
+
+    def flock_then_raise(fd, op):
+        if op & fcntl.LOCK_EX:
+            os.utime(flag)  # the hook's re-raise lands just before we lock
+        return real_flock(fd, op)
+    monkeypatch.setattr(watcher.fcntl, "flock", flock_then_raise)
+    assert watcher.claude_sessions_awaiting_input() == ["sess-stale-raced"]
+    assert flag.exists()
+
+
+def test_stale_eviction_keeps_a_flag_with_a_live_owner_line(tmp_claude_dir):
+    """Belt and braces: the hook stamps the mtime from the newest owner, but a
+    flag whose mtime is stale while an owner line is fresh is not deleted."""
+    flag = tmp_claude_dir / "sess-stale-owner"
+    flag.write_text(f"permission_prompt\nagent:abc {time.time() - 5:.6f}")
+    _make_stale(flag)
+    watcher.claude_sessions_awaiting_input()
+    assert flag.exists()
+
+
+def test_other_flag_dirs_still_evict_without_a_lock(tmp_path):
+    """Only the awaiting-input dir has a hook lock; claude_finished/ and the
+    rest keep the plain unlink."""
+    import os
+    d = tmp_path / "plain"
+    d.mkdir()
+    f = d / "sess-x"
+    f.write_text("stop")
+    old = time.time() - 100
+    os.utime(f, (old, old))
+    assert watcher._scan_session_flag_dir(str(d), 50) == []
+    assert not f.exists()
+
+
+# ── round 4 #0: the pending-correlation sweep ────────────────────────────
+# PermissionRequest's attribution hints live in their own dir. SessionEnd
+# removes a session's file; this sweep bounds the leak from a crash / missing
+# SessionEnd. It deletes EVERY entry (dotfile tmps included) untouched for
+# CLAUDE_PERMISSION_PENDING_STALE_SEC, under the hook's lock.
+@pytest.fixture
+def tmp_pending_dir(tmp_path, monkeypatch, tmp_claude_dir):
+    d = tmp_path / "claude_permission_pending"
+    d.mkdir()
+    monkeypatch.setattr(watcher, "CLAUDE_PERMISSION_PENDING_DIR", str(d))
+    monkeypatch.setattr(watcher, "_CLAUDE_PENDING_LAST_SWEEP", 0.0)
+    return d
+
+
+def _age(path, seconds):
+    import os
+    t = time.time() - seconds
+    os.utime(path, (t, t))
+
+
+def test_pending_sweep_removes_an_old_entry_without_session_end(tmp_pending_dir):
+    old = tmp_pending_dir / "sess-gone"
+    old.write_text('{"agent_id": null, "tool_use_id": null, "ts": 1}\n')
+    _age(old, watcher.CLAUDE_PERMISSION_PENDING_STALE_SEC + 10)
+    orphan_tmp = tmp_pending_dir / ".sess-gone.123.tmp"
+    orphan_tmp.write_text("x")
+    _age(orphan_tmp, watcher.CLAUDE_PERMISSION_PENDING_STALE_SEC + 10)
+    fresh = tmp_pending_dir / "sess-live"
+    fresh.write_text('{"agent_id": null, "tool_use_id": null, "ts": 1}\n')
+    assert watcher.sweep_claude_permission_pending() == 2
+    assert not old.exists() and not orphan_tmp.exists()
+    assert fresh.exists()
+
+
+def test_pending_sweep_skips_while_the_hook_holds_the_lock(tmp_pending_dir,
+                                                           tmp_claude_dir):
+    import fcntl
+    old = tmp_pending_dir / "sess-gone"
+    old.write_text("x")
+    _age(old, watcher.CLAUDE_PERMISSION_PENDING_STALE_SEC + 10)
+    with open(tmp_claude_dir / ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert watcher.sweep_claude_permission_pending() is None
+        assert old.exists()
+    assert watcher.sweep_claude_permission_pending() == 1
+    assert not old.exists()
+
+
+def test_pending_sweep_is_throttled_off_the_1hz_scan(tmp_pending_dir):
+    """The awaiting-input scan runs every tick; the pending sweep piggybacks
+    on it at most once per _CLAUDE_PENDING_SWEEP_INTERVAL_SEC (no per-tick
+    listdir of a second dir)."""
+    calls = []
+    with patch.object(watcher, "sweep_claude_permission_pending",
+                      side_effect=lambda now=None: calls.append(now) or 0):
+        t0 = 1_000_000.0
+        with patch("time.time", return_value=t0):
+            watcher.claude_sessions_awaiting_input()
+            watcher.claude_sessions_awaiting_input()
+        with patch("time.time",
+                   return_value=t0 + watcher._CLAUDE_PENDING_SWEEP_INTERVAL_SEC + 1):
+            watcher.claude_sessions_awaiting_input()
+    assert len(calls) == 2
+
+
+def test_pending_sweep_throttle_advances_only_after_a_completed_pass(
+        tmp_pending_dir, tmp_claude_dir):
+    """Codex round 4 P3: the throttle used to be stamped BEFORE the lock was
+    tried, so a pass skipped because a hook held the lock still deferred the
+    next attempt a full interval -- under sustained contention, cleanup could
+    slip indefinitely past the 5x margin under the 300s staleness bound. The
+    stamp now moves only when a pass actually ran; a skipped pass is retried
+    on the very next tick."""
+    import fcntl
+    old = tmp_pending_dir / "sess-gone"
+    old.write_text("x")
+    _age(old, watcher.CLAUDE_PERMISSION_PENDING_STALE_SEC + 10)
+    interval = watcher._CLAUDE_PENDING_SWEEP_INTERVAL_SEC
+    t0 = time.time()
+    with open(tmp_claude_dir / ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for k in range(4):  # several sweep intervals, lock busy throughout
+            watcher._maybe_sweep_claude_permission_pending(t0 + k * interval)
+            assert watcher._CLAUDE_PENDING_LAST_SWEEP == 0.0
+            assert old.exists()
+    # Lock free: the very next tick (1s later, well inside an interval) sweeps.
+    watcher._maybe_sweep_claude_permission_pending(t0 + 3 * interval + 1)
+    assert not old.exists()
+    assert watcher._CLAUDE_PENDING_LAST_SWEEP == t0 + 3 * interval + 1
+    # ...and the throttle is back in force after that completed pass.
+    old.write_text("x")
+    _age(old, watcher.CLAUDE_PERMISSION_PENDING_STALE_SEC + 10)
+    watcher._maybe_sweep_claude_permission_pending(t0 + 3 * interval + 2)
+    assert old.exists()
+
+
+def test_pending_sweep_reports_a_skipped_pass_as_none(tmp_pending_dir,
+                                                     tmp_claude_dir):
+    """None = the pass did not run (lock busy) -- distinct from 0 = it ran and
+    found nothing stale -- so the throttle can tell the two apart."""
+    import fcntl
+    (tmp_pending_dir / "sess-live").write_text("x")
+    assert watcher.sweep_claude_permission_pending() == 0
+    with open(tmp_claude_dir / ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert watcher.sweep_claude_permission_pending() is None
+
+
+def test_pending_sweep_with_no_dir_is_a_noop(tmp_path, monkeypatch):
+    monkeypatch.setattr(watcher, "CLAUDE_PERMISSION_PENDING_DIR",
+                        str(tmp_path / "missing"))
+    assert watcher.sweep_claude_permission_pending() == 0

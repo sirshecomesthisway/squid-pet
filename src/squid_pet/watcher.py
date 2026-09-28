@@ -44,6 +44,7 @@ State is written to ~/.squid-pet/state.json every 1s, frontend polls it.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -563,10 +564,20 @@ _CLAUDE_SESSION_SNOOZE_SEC = 120.0  # once seen & deferred this long, quiet down
 # ticks (POLL_INTERVAL_SEC == 1.0) untouched.
 SELF_HEAL_MIN_FLAG_AGE_SEC = 3.0
 _CLAUDE_SESSION_FLAG_FIRST_SEEN: dict[str, float] = {}
+# Round 3 (review #3): the highest flag mtime seen per session. The hook's flag
+# is an owner set -- a second prompt in a session that is already waving adds
+# an owner line instead of making the file vanish and reappear, and it
+# ADVANCES the mtime (a clear never does). filter_eligible_claude_sessions
+# re-arms the snooze, and StateMachine the one-shot OS alert, on an advance.
+_CLAUDE_SESSION_FLAG_MTIME: dict[str, float] = {}
+# The hook's flock over the awaiting-input dir (scripts/claude_pet_hook.py
+# _FLAG_LOCK_NAME). Self-heal takes it before deleting a flag.
+_CLAUDE_AWAITING_LOCK_NAME = ".lock"
 
 
 def _scan_session_flag_dir(
     dir_path: str, stale_sec: float, fresh_sec: float | None = None,
+    *, lock_name: str | None = None,
 ) -> list[str]:
     """Shared scan/prune logic for the session-id-keyed flag directories
     (claude_awaiting_input/, claude_finished/): list entries, skip
@@ -580,7 +591,12 @@ def _scan_session_flag_dir(
     Returns sorted list (deterministic for tests). Missing dir or any OS
     error -> [] (signal is best-effort; never crash the tick) -- listdir's
     own FileNotFoundError is an OSError, so a missing dir needs no
-    separate pre-check."""
+    separate pre-check.
+
+    lock_name (round 4): the writer's flock file in dir_path. When given, a
+    stale entry is only deleted under that lock -- see
+    _evict_stale_flag_under_lock. The lock is touched only when an entry is
+    actually stale (rare), never on the ordinary per-tick path."""
     now = time.time()
     live: list[str] = []
     try:
@@ -596,15 +612,142 @@ def _scan_session_flag_dir(
         except OSError:
             continue
         if age > stale_sec:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-            continue
+            if lock_name is None:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                continue
+            kept_age = _evict_stale_flag_under_lock(
+                path, os.path.join(dir_path, lock_name), stale_sec)
+            if kept_age is None:
+                continue
+            age = kept_age
         if fresh_sec is not None and age > fresh_sec:
             continue
         live.append(name)
     return sorted(live)
+
+
+def _evict_stale_flag_under_lock(
+    path: str, lock_path: str, stale_sec: float,
+) -> float | None:
+    """Round 4 (Codex #5): delete a stale awaiting-input flag only under the
+    hook's own flock, re-checking once it is held -- the hook re-raises a flag
+    with a locked read-modify-write, and an unlocked unlink here could delete
+    a wave it had just re-raised. Mirrors _self_heal_unlink_single_owner_flag:
+    the lock is tried NON-blocking, and if a hook holds it this tick skips
+    the entry (not deleted, not reported; the next tick retries) rather than
+    stall the 1 Hz loop.
+
+    Under the lock the entry is kept if its mtime is fresh again OR any owner
+    line carries an add time within stale_sec (the hook stamps the mtime from
+    its newest owner, so this is belt and braces). Returns the kept entry's
+    age (so the caller reports it), or None if it was deleted / skipped."""
+    try:
+        with open(lock_path, "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return None
+            try:
+                now = time.time()
+                age = now - os.stat(path).st_mtime
+                if age <= stale_sec:
+                    return age
+                with open(path, errors="replace") as f:
+                    owner_lines = f.read().splitlines()[1:]
+                for line in owner_lines:
+                    parts = line.split()
+                    try:
+                        added = float(parts[1]) if len(parts) == 2 else None
+                    except ValueError:
+                        added = None
+                    if added is not None and now - added <= stale_sec:
+                        return max(0.0, now - added)
+                os.unlink(path)
+                return None
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    except OSError:
+        return None
+
+
+# Round 4: scripts/claude_pet_hook.py's PermissionRequest attribution hints
+# (PENDING_DIR there). NOT waves -- nothing here is ever reported; this module
+# only sweeps it. A hint is useful for 10s (the hook's TTL); a file untouched
+# for 5 minutes belongs to a session that crashed or ended without SessionEnd.
+CLAUDE_PERMISSION_PENDING_DIR = os.path.join(
+    os.path.expanduser("~"), ".squid-pet", "claude_permission_pending"
+)
+CLAUDE_PERMISSION_PENDING_STALE_SEC = 300.0
+# The sweep piggybacks on the 1 Hz awaiting-input scan, but at most this
+# often -- a second listdir every tick would be pure overhead for a dir that
+# is almost always empty.
+_CLAUDE_PENDING_SWEEP_INTERVAL_SEC = 60.0
+_CLAUDE_PENDING_LAST_SWEEP = 0.0
+
+
+def sweep_claude_permission_pending(now: float | None = None) -> int | None:
+    """Delete every entry in CLAUDE_PERMISSION_PENDING_DIR -- dotfile tmps
+    included, so a hook killed mid-write leaks nothing either -- untouched
+    for CLAUDE_PERMISSION_PENDING_STALE_SEC. Runs under the hook's flock
+    (the awaiting-input dir's lock, which guards the pending store too),
+    tried non-blocking: if a hook holds it, sweep nothing this pass. Returns
+    how many were removed (0 also when there is no dir or nothing in it),
+    or None when the pass did NOT run -- the lock was busy or could not be
+    opened -- so the caller retries on its next tick instead of waiting out
+    a full throttle interval. Best-effort: never raises."""
+    if now is None:
+        now = time.time()
+    try:
+        names = os.listdir(CLAUDE_PERMISSION_PENDING_DIR)
+    except OSError:
+        return 0
+    if not names:
+        return 0
+    removed = 0
+    ran = False
+    lock_path = os.path.join(CLAUDE_AWAITING_INPUT_DIR, _CLAUDE_AWAITING_LOCK_NAME)
+    try:
+        with open(lock_path, "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return None
+            try:
+                for name in names:
+                    path = os.path.join(CLAUDE_PERMISSION_PENDING_DIR, name)
+                    try:
+                        if now - os.stat(path).st_mtime > CLAUDE_PERMISSION_PENDING_STALE_SEC:
+                            os.unlink(path)
+                            removed += 1
+                    except OSError:
+                        continue
+                ran = True
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    # Not ran = the lock file could not be opened, or flock was busy.
+    return removed if ran else None
+
+
+def _maybe_sweep_claude_permission_pending(now: float | None = None) -> None:
+    """Round 5 (Codex round 4 P3): the throttle is stamped only after a pass
+    that actually RAN. Stamping before the lock attempt let a pass skipped
+    for a busy lock defer the next try a full interval, so sustained
+    contention could push cleanup past the ~5x margin under the 300s stale
+    bound. A skipped pass is retried on the next 1 Hz tick -- a listdir plus
+    a non-blocking flock, only while the dir holds files and the lock is
+    busy, so no per-tick cost in the common (empty or uncontended) case."""
+    global _CLAUDE_PENDING_LAST_SWEEP
+    if now is None:
+        now = time.time()
+    if now - _CLAUDE_PENDING_LAST_SWEEP < _CLAUDE_PENDING_SWEEP_INTERVAL_SEC:
+        return
+    if sweep_claude_permission_pending(now) is not None:
+        _CLAUDE_PENDING_LAST_SWEEP = now
 
 
 def claude_sessions_awaiting_input() -> list[str]:
@@ -614,9 +757,13 @@ def claude_sessions_awaiting_input() -> list[str]:
     Notification event (permission_prompt) and removes it
     on UserPromptSubmit/SessionEnd. Entries older than
     CLAUDE_AWAITING_INPUT_STALE_SEC are evicted here as a safety net for a
-    session that died without either firing (crash, force-kill).
+    session that died without either firing (crash, force-kill) -- under the
+    hook's lock (round 4). Also drives the throttled pending-hint sweep.
     """
-    return _scan_session_flag_dir(CLAUDE_AWAITING_INPUT_DIR, CLAUDE_AWAITING_INPUT_STALE_SEC)
+    _maybe_sweep_claude_permission_pending()
+    return _scan_session_flag_dir(
+        CLAUDE_AWAITING_INPUT_DIR, CLAUDE_AWAITING_INPUT_STALE_SEC,
+        lock_name=_CLAUDE_AWAITING_LOCK_NAME)
 
 
 CODEX_AWAITING_INPUT_DIR = os.path.expanduser("~/.squid-pet/codex_awaiting_input")
@@ -1235,6 +1382,37 @@ def claude_task_marked_complete_recently(now: float | None = None) -> bool:
     return bool(session_ids)
 
 
+def _self_heal_unlink_single_owner_flag(path: str, now: float) -> bool:
+    """Delete an awaiting-input flag for self-heal, but only if it holds at
+    most ONE pending prompt (one owner line, or a legacy flag with none), and
+    only under the hook's own flock -- re-checking the age once it is held,
+    since a prompt added while we waited makes the flag fresh again. Several
+    owner lines are several independent prompts (the parent's and helpers');
+    "the session looks busy" cannot prove all of them resolved. The lock is
+    tried NON-blocking: if a hook holds it, skip this tick (next one retries)
+    rather than stall the 1 Hz loop. Returns True iff the flag was deleted."""
+    lock_path = os.path.join(os.path.dirname(path), _CLAUDE_AWAITING_LOCK_NAME)
+    try:
+        with open(lock_path, "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return False
+            try:
+                if now - os.stat(path).st_mtime < SELF_HEAL_MIN_FLAG_AGE_SEC:
+                    return False
+                with open(path, errors="replace") as f:
+                    owner_lines = [ln for ln in f.read().splitlines()[1:] if ln.strip()]
+                if len(owner_lines) > 1:
+                    return False
+                os.unlink(path)
+                return True
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    except OSError:
+        return False
+
+
 def filter_eligible_claude_sessions(session_ids: list[str]) -> list[str]:
     """Filter direct-signal Claude Code session_ids down to those that
     deserve a flag-wave right now.
@@ -1248,8 +1426,42 @@ def filter_eligible_claude_sessions(session_ids: list[str]) -> list[str]:
 
     Also maintains _CLAUDE_SESSION_FLAG_FIRST_SEEN: records birth time for
     any new flag, evicts entries whose flag has gone away.
+
+    Round 3: also RE-ARMS (fresh birth time) a session whose flag mtime has
+    advanced past the highest value seen -- a new prompt added to a flag that
+    never went away. One stat per awaiting session per call (no fork; the
+    list is almost always empty).
     """
+    _note_claude_flag_mtimes(session_ids, rearm=True)
     return _filter_eligible_direct_signals(session_ids, _CLAUDE_SESSION_FLAG_FIRST_SEEN)
+
+
+def _claude_flag_mtime(sid: str) -> float | None:
+    try:
+        return os.stat(os.path.join(CLAUDE_AWAITING_INPUT_DIR, sid)).st_mtime
+    except OSError:
+        return None
+
+
+def _note_claude_flag_mtimes(session_ids: list[str], *, rearm: bool) -> None:
+    """Record each live flag's mtime in _CLAUDE_SESSION_FLAG_MTIME (keeping the
+    max: a partial clear can LOWER it, and must not look like a new add when
+    it later reads the same again), evicting sessions whose flag is gone.
+    With rearm=True, a session whose mtime advanced past the recorded max
+    loses its first-seen time, so the snooze window restarts. A first sighting
+    is not an advance (first-seen handles it)."""
+    live = set(session_ids)
+    for sid in [s for s in _CLAUDE_SESSION_FLAG_MTIME if s not in live]:
+        del _CLAUDE_SESSION_FLAG_MTIME[sid]
+    for sid in session_ids:
+        mtime = _claude_flag_mtime(sid)
+        if mtime is None:
+            continue
+        last = _CLAUDE_SESSION_FLAG_MTIME.get(sid)
+        if last is None or mtime > last:
+            if last is not None and rearm:
+                _CLAUDE_SESSION_FLAG_FIRST_SEEN.pop(sid, None)
+            _CLAUDE_SESSION_FLAG_MTIME[sid] = mtime
 
 
 def _filter_eligible_direct_signals(session_ids, first_seen_times) -> list[str]:
@@ -1292,6 +1504,9 @@ def snooze_all_awaiting_now() -> int:
     # Also cover any live flag we might have missed observing yet (the
     # scan of the awaiting dir is cheap enough to do inline).
     live_sessions = set(claude_sessions_awaiting_input())
+    # Record the current mtimes WITHOUT re-arming, so the snooze holds until
+    # a genuinely new prompt advances one.
+    _note_claude_flag_mtimes(sorted(live_sessions), rearm=False)
     for sid in live_sessions:
         _CLAUDE_SESSION_FLAG_FIRST_SEEN[sid] = claude_stale
 
@@ -1573,6 +1788,10 @@ class StateMachine:
         # episode (see the approval-needed block in compute()).
         self._approval_alert_fired: bool = False
         self._approval_alert_at: float = 0.0
+        # Round 3: flag mtime per Claude session as of the last alert. An
+        # advance past it (a new prompt added to a flag that never went away)
+        # fires a fresh alert; see _CLAUDE_SESSION_FLAG_MTIME.
+        self._approval_alert_mtimes: dict[str, float] = {}
 
 
     _AGENT_ACTIVE_STATES = frozenset({
@@ -1733,15 +1952,28 @@ class StateMachine:
                             continue  # too fresh -- let it be seen at least once
                     except OSError:
                         continue
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
-                    _CLAUDE_SESSION_FLAG_FIRST_SEEN.pop(sid, None)
+                    if _self_heal_unlink_single_owner_flag(path, now):
+                        _CLAUDE_SESSION_FLAG_FIRST_SEEN.pop(sid, None)
             except Exception:
                 pass
             awaiting_sessions_raw = claude_sessions_awaiting_input()
         return awaiting_sessions_raw
+
+    def _claude_alert_rearmed(self, awaiting_sessions: list[str]) -> bool:
+        """True if a Claude session already covered by the current alert has
+        had its flag mtime advance since (a new prompt added). Sessions first
+        seen while latched are recorded, not alerted (unchanged behaviour)."""
+        rearmed = False
+        for sid in awaiting_sessions:
+            mtime = _CLAUDE_SESSION_FLAG_MTIME.get(sid)
+            if mtime is None:
+                continue
+            seen = self._approval_alert_mtimes.get(sid)
+            if seen is None:
+                self._approval_alert_mtimes[sid] = mtime
+            elif mtime > seen:
+                rearmed = True
+        return rearmed
 
     def _apply_approval_override(
         self, st: PetState, now: float, awaiting_sessions_raw: list,
@@ -1806,10 +2038,16 @@ class StateMachine:
                     st.focus_target = {"agent": "codex", "request": request}
                 except OSError:
                     st.focus_target = None
-            # Fire OS notification ONCE per idle cycle
-            if not self._approval_alert_fired:
+            # Fire OS notification ONCE per idle cycle -- or again when a
+            # new prompt is added to a flag that never went away (round 3).
+            rearmed = self._claude_alert_rearmed(awaiting_sessions)
+            if not self._approval_alert_fired or rearmed:
                 self._approval_alert_fired = True
                 self._approval_alert_at = now
+                self._approval_alert_mtimes = {
+                    sid: _CLAUDE_SESSION_FLAG_MTIME[sid]
+                    for sid in awaiting_sessions
+                    if sid in _CLAUDE_SESSION_FLAG_MTIME}
                 _sound_label = _sound if _sound else "off"
                 log.info("approval alert fired (%s, sound=%s)", fired_reason, _sound_label)
                 if notify:
@@ -1836,6 +2074,7 @@ class StateMachine:
             # gets a fresh ping.
             self._approval_alert_fired = False
             self._approval_notification_token = None
+            self._approval_alert_mtimes = {}
 
     def _apply_failure_override(self, st: PetState, now: float) -> None:
         # ── CONCERNED OVERRIDE (Pink-2026-09-16) ─────────────────────
