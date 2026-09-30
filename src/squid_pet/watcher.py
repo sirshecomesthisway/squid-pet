@@ -563,6 +563,20 @@ _CLAUDE_SESSION_SNOOZE_SEC = 120.0  # once seen & deferred this long, quiet down
 # ago -- so it must not act until a flag has survived a few real poll
 # ticks (POLL_INTERVAL_SEC == 1.0) untouched.
 SELF_HEAL_MIN_FLAG_AGE_SEC = 3.0
+# 2026-09-30: self-heal's evidence (claude_newest_tool_shell_start, a full
+# process-table read on macOS) is re-read at most this often while a flag
+# stays pending -- which, now that background work no longer heals it, can be
+# the whole time a prompt waits for an answer. Worst case a heal lands this
+# much later; an approved short command's own PostToolUse clears it first.
+SELF_HEAL_EVIDENCE_REFRESH_SEC = 3.0
+# 2026-09-30 round 2: a helper (subagent) whose transcript was written since
+# (flag mtime - this) may own the new Bash call self-heal would cite, so the
+# flag is kept. A helper writes its tool_use entry BEFORE that Bash starts;
+# the gap is PreToolUse hooks plus auto mode's classifier (measured 1.37 s
+# live, Claude Code 2.1.284) -- this bounds it generously. A helper's own
+# permission wait is unbounded, but that prompt lands as an `agent:<id>`
+# owner line, so the single-owner guard keeps the flag, not this window.
+SELF_HEAL_HELPER_QUIET_SEC = 60.0
 _CLAUDE_SESSION_FLAG_FIRST_SEEN: dict[str, float] = {}
 # Round 3 (review #3): the highest flag mtime seen per session. The hook's flag
 # is an owner set -- a second prompt in a session that is already waving adds
@@ -1382,7 +1396,9 @@ def claude_task_marked_complete_recently(now: float | None = None) -> bool:
     return bool(session_ids)
 
 
-def _self_heal_unlink_single_owner_flag(path: str, now: float) -> bool:
+def _self_heal_unlink_single_owner_flag(
+    path: str, now: float, *, evidence_after: float, helper_write: float | None,
+) -> bool:
     """Delete an awaiting-input flag for self-heal, but only if it holds at
     most ONE pending prompt (one owner line, or a legacy flag with none), and
     only under the hook's own flock -- re-checking the age once it is held,
@@ -1390,7 +1406,15 @@ def _self_heal_unlink_single_owner_flag(path: str, now: float) -> bool:
     owner lines are several independent prompts (the parent's and helpers');
     "the session looks busy" cannot prove all of them resolved. The lock is
     tried NON-blocking: if a hook holds it, skip this tick (next one retries)
-    rather than stall the 1 Hz loop. Returns True iff the flag was deleted."""
+    rather than stall the 1 Hz loop. Returns True iff the flag was deleted.
+
+    evidence_after (2026-09-30): the start time of the tool call self-heal
+    cites as proof the prompt was answered. Re-checked under the lock too: a
+    prompt (re-)raised after that tool call started is not answered by it.
+
+    helper_write (round 2): the session's newest subagent-transcript write
+    (claude_session_newest_helper_write), re-checked against the mtime held
+    under the lock -- a partial resolve can LOWER the mtime in between."""
     lock_path = os.path.join(os.path.dirname(path), _CLAUDE_AWAITING_LOCK_NAME)
     try:
         with open(lock_path, "a") as lock:
@@ -1399,7 +1423,13 @@ def _self_heal_unlink_single_owner_flag(path: str, now: float) -> bool:
             except OSError:
                 return False
             try:
-                if now - os.stat(path).st_mtime < SELF_HEAL_MIN_FLAG_AGE_SEC:
+                mtime = os.stat(path).st_mtime
+                if now - mtime < SELF_HEAL_MIN_FLAG_AGE_SEC:
+                    return False
+                if mtime >= evidence_after:
+                    return False
+                if (helper_write is not None
+                        and helper_write >= mtime - SELF_HEAL_HELPER_QUIET_SEC):
                     return False
                 with open(path, errors="replace") as f:
                     owner_lines = [ln for ln in f.read().splitlines()[1:] if ln.strip()]
@@ -1658,6 +1688,129 @@ def latest_shell_child_cmdline(procs) -> list[str] | None:
     return shell_child_activity(procs)[1]
 
 
+# Claude Code's Bash tool runs each command in a wrapper shell that is a
+# DIRECT child of `claude` and lives for the whole command (confirmed live):
+#   <shell> -c 'source ~/.claude/shell-snapshots/snapshot-... && ...
+#              && eval '<CMD>' < /dev/null && pwd -P >| ...'
+# Either marker identifies it; see observer._EVAL_RE for the eval shape.
+_CLAUDE_SHELL_SNAPSHOT_MARKER = "/shell-snapshots/snapshot-"
+_CLAUDE_EVAL_MARKERS = ("eval '", "< /dev/null")
+
+
+def _is_claude_bash_tool_wrapper(cmdline: list[str]) -> bool:
+    script = " ".join(cmdline[1:])
+    return (_CLAUDE_SHELL_SNAPSHOT_MARKER in script
+            or all(m in script for m in _CLAUDE_EVAL_MARKERS))
+
+
+def claude_newest_tool_shell_start(procs) -> float | None:
+    """Start time of the newest Bash-tool call still running under the given
+    `claude` processes, or None if there is none (or it cannot be read).
+
+    Self-heal's evidence that a pending prompt was answered (2026-09-30): a
+    tool call that STARTED after the prompt was raised -- Claude is blocked
+    at the prompt until it is answered. Only direct-child wrapper shells
+    carrying the Bash-tool signature count, which rules out everything that
+    is merely new-looking: grandchildren of an older tool call (a background
+    loop's `sleep`, a forked subshell -- which carries its parent's exact
+    argv), periodically re-spawned helpers (caffeinate), MCP servers, and
+    hooks run via `sh -c`.
+
+    NOT attributable on its own: a subagent's Bash is ALSO a direct child of
+    the parent `claude`, so self-heal vets this evidence against the
+    session's helper activity (claude_session_newest_helper_write,
+    SELF_HEAL_HELPER_QUIET_SEC) before citing it.
+
+    Accepted limitation (round 2, 2026-09-30 review P1-1): only Bash leaves
+    this evidence. An approved NON-Bash tool (an MCP call, Task/Agent,
+    WebFetch) runs in-process: no wrapper shell, and no transcript entry
+    until its result -- and no hook fires when a prompt is APPROVED, only
+    when the tool finishes (PostToolUse / PostToolUseFailure) or is denied.
+    So after approving one, the wave (approval_needed takes prime over the
+    cascade) stays until that tool's PostToolUse, even if it runs for
+    minutes; before 2026-09-30 working/thinking cleared it after
+    SELF_HEAL_MIN_FLAG_AGE_SEC. Kept deliberately: every signal that could
+    mark it (activity, streaming, input events) also occurs while Claude is
+    blocked at the prompt -- the very bug this fixes -- and a stuck wave
+    during a slow approved call is the safe direction.
+
+    Cost: one non-recursive children() per process, plus name(), and
+    cmdline() for wrapper shells only. psutil has no native ppid_map on
+    macOS, so children() still reads every pid's ppid -- measured ~11 ms
+    with ~470 processes, the same as the detector's per-tick tree walk.
+    Self-heal therefore calls it only while a flag is pending past
+    SELF_HEAL_MIN_FLAG_AGE_SEC during working/thinking with one `claude`
+    alive, and then at most once per SELF_HEAL_EVIDENCE_REFRESH_SEC (see
+    StateMachine._self_heal_tool_start) -- that window can last as long as
+    the prompt stays unanswered. Reads the cmdline only to test for the two
+    markers above; nothing is stored or logged. Best-effort: any failure
+    means "no evidence" (never heal on a guess)."""
+    newest: float | None = None
+    for p in procs:
+        try:
+            children = p.children()
+        except Exception:
+            continue
+        for ch in children:
+            try:
+                if (ch.name() or "").lower() not in SHELL_WRAPPER_NAMES:
+                    continue
+                if not _is_claude_bash_tool_wrapper(ch.cmdline()):
+                    continue
+                started = float(ch.create_time())
+            except Exception:
+                continue
+            if newest is None or started > newest:
+                newest = started
+    return newest
+
+
+def claude_session_newest_helper_write(session_id: str) -> float | None:
+    """Newest mtime of this session's subagent transcripts
+    (<CLAUDE_PROJECTS_DIR>/<enc>/<session_id>/subagents/agent-*.jsonl, the
+    layout ClaudeCodeDetector globs), None if it has none, or +inf if they
+    could not be read.
+
+    Round 2 (2026-09-30 review P1-2): a helper writes its tool_use entry
+    before its Bash starts, so a helper that owns a Bash call newer than a
+    flag wrote its transcript no earlier than (tool start - the PreToolUse
+    gap); see SELF_HEAL_HELPER_QUIET_SEC. Unlike the process evidence,
+    failure here must BLOCK a heal ("could not tell" is not "no helper"):
+    only a missing dir means no helpers. Assumes helpers keep that layout
+    (confirmed live, 2.1.282-2.1.284); a helper transcript stored elsewhere
+    would go unseen, as before round 2.
+
+    Cost: one scandir of the projects root plus a failed scandir per project
+    dir, and one stat per helper transcript of this session. Called only by
+    self-heal once it already holds new-tool-call evidence, and throttled
+    with it (StateMachine._self_heal_helper_write). Paths and mtimes only --
+    no transcript is opened."""
+    newest: float | None = None
+    try:
+        with os.scandir(CLAUDE_PROJECTS_DIR) as projects:
+            for enc in projects:
+                sub = os.path.join(enc.path, session_id, "subagents")
+                try:
+                    it = os.scandir(sub)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                with it:
+                    for e in it:
+                        if not (e.name.startswith("agent-")
+                                and e.name.endswith(".jsonl")):
+                            continue
+                        try:
+                            m = e.stat().st_mtime
+                        except FileNotFoundError:
+                            continue
+                        newest = m if newest is None else max(newest, m)
+    except FileNotFoundError:
+        return newest
+    except OSError:
+        return float("inf")
+    return newest
+
+
 class StateMachine:
     """
     Computes the pet's emotional state each tick by querying a list of
@@ -1792,6 +1945,11 @@ class StateMachine:
         # advance past it (a new prompt added to a flag that never went away)
         # fires a fresh alert; see _CLAUDE_SESSION_FLAG_MTIME.
         self._approval_alert_mtimes: dict[str, float] = {}
+        # 2026-09-30: (read_at, tool_start, {sid: newest helper write}) --
+        # the throttled self-heal evidence; see SELF_HEAL_EVIDENCE_REFRESH_SEC.
+        # The helper reads are dropped with the process read they vet.
+        self._self_heal_evidence: tuple[
+            float, float | None, dict[str, float | None]] | None = None
 
 
     _AGENT_ACTIVE_STATES = frozenset({
@@ -1913,11 +2071,9 @@ class StateMachine:
         # you're actively watching it work.
         #
         # Self-heal: our OWN independently-verified activity signal
-        # (st.state == working/thinking, from real shell/file/streaming
-        # evidence -- nothing to do with the hook) is proof any pending
-        # wait has been resolved, regardless of which mechanism resolved
-        # it. Coarse -- aggregate across all Claude Code processes, not
-        # per-session, since the hook payload carries no PID to
+        # (st.state == working/thinking -- nothing to do with the hook)
+        # gates it. Coarse -- aggregate across all Claude Code processes,
+        # not per-session, since the hook payload carries no PID to
         # disambiguate which session is the one now active -- but far
         # better than trusting a hook event that may simply never fire.
         #
@@ -1933,31 +2089,107 @@ class StateMachine:
         # single-session case ("you're actively watching it work",
         # singular) it was designed for.
         #
-        # awaiting_sessions_raw is only re-scanned from disk (a second
-        # syscall) when self-heal actually had something to clean up --
-        # the common case (nothing awaiting, or not working/thinking)
-        # needs just the one scan above. The re-scan itself is NOT
-        # optional when self-heal does run: individual os.unlink calls
-        # below can silently fail (caught per-file), so re-deriving from
-        # disk -- rather than assuming the whole loop succeeded and
-        # setting the list to [] -- is what keeps the APPROVAL-NEEDED
-        # block below correct if some entries didn't actually clear.
-        if (st.state in ("working", "thinking") and awaiting_sessions_raw
-                and len(find_claude_code_processes()) <= 1):
+        # 2026-09-30: "working/thinking" alone is NOT proof either --
+        # caught live twice in one day. A long turn had earlier background
+        # tool calls still running (detached test runs, `while kill -0 ...;
+        # do sleep` wait loops); they kept the cascade on "working" ("shell
+        # child active (claude_code)") while Claude sat blocked at a
+        # permission prompt / AskUserQuestion, so the flag was deleted
+        # SELF_HEAL_MIN_FLAG_AGE_SEC after it was raised: one OS alert,
+        # then no wave (the hook log's next PostToolUse found "no flag"
+        # although no hook had cleared it). Streaming is no better: a
+        # background subagent keeps writing its transcript while the parent
+        # is blocked. Evidence must be NEWER than the flag and imply the
+        # wait ended: a Bash-tool call that STARTED after the flag's mtime
+        # (claude_newest_tool_shell_start) -- Claude cannot start one while
+        # blocked at the prompt. That still covers the case self-heal was
+        # built for, an approved long-running command whose PostToolUse has
+        # not fired yet; the hook's own PostToolUse / PostToolUseFailure /
+        # PermissionDenied / Stop / UserPromptSubmit clears cover the rest.
+        #
+        # Round 2 (review P1-2): a helper's Bash is ALSO a direct child of
+        # the parent `claude`, so a background subagent starting a command
+        # after the parent's prompt looked like that proof. The evidence is
+        # now discounted whenever one of the session's subagent transcripts
+        # was written since flag mtime - SELF_HEAL_HELPER_QUIET_SEC (a
+        # helper writes its tool_use before its Bash starts): a session with
+        # a recently active helper gets no Bash self-heal, and its flag
+        # waits for the hook's own clears -- the safe direction. Accepted
+        # limitation (P1-1): an approved NON-Bash tool leaves no evidence;
+        # see claude_newest_tool_shell_start.
+        #
+        # The evidence (a full process-table read on macOS, ~11 ms) is
+        # fetched lazily, at most once a tick and once per
+        # SELF_HEAL_EVIDENCE_REFRESH_SEC, and only when some flag is past
+        # the too-fresh guard -- never on the common path (nothing
+        # awaiting, or not working/thinking).
+        if (st.state in ("working", "thinking") and awaiting_sessions_raw):
+            procs = find_claude_code_processes()
+            if len(procs) > 1:
+                return awaiting_sessions_raw
+            healed: set[str] = set()
+            tool_start: float | None = None
+            evidence_read = False
             try:
                 for sid in awaiting_sessions_raw:
                     path = os.path.join(CLAUDE_AWAITING_INPUT_DIR, sid)
                     try:
-                        if now - os.stat(path).st_mtime < SELF_HEAL_MIN_FLAG_AGE_SEC:
-                            continue  # too fresh -- let it be seen at least once
+                        mtime = os.stat(path).st_mtime
                     except OSError:
                         continue
-                    if _self_heal_unlink_single_owner_flag(path, now):
+                    if now - mtime < SELF_HEAL_MIN_FLAG_AGE_SEC:
+                        continue  # too fresh -- let it be seen at least once
+                    if not evidence_read:
+                        tool_start = self._self_heal_tool_start(procs, now)
+                        evidence_read = True
+                    if tool_start is None or tool_start <= mtime:
+                        continue  # nothing started since the prompt was raised
+                    helper_write = self._self_heal_helper_write(sid)
+                    if (helper_write is not None and helper_write
+                            >= mtime - SELF_HEAL_HELPER_QUIET_SEC):
+                        continue  # the new tool call may be a helper's
+                    if _self_heal_unlink_single_owner_flag(
+                            path, now, evidence_after=tool_start,
+                            helper_write=helper_write):
                         _CLAUDE_SESSION_FLAG_FIRST_SEEN.pop(sid, None)
+                        healed.add(sid)
             except Exception:
                 pass
-            awaiting_sessions_raw = claude_sessions_awaiting_input()
+            if healed:
+                awaiting_sessions_raw = [
+                    s for s in awaiting_sessions_raw if s not in healed]
         return awaiting_sessions_raw
+
+    def _self_heal_tool_start(self, procs, now: float) -> float | None:
+        """claude_newest_tool_shell_start, re-read at most once per
+        SELF_HEAL_EVIDENCE_REFRESH_SEC. A cached value can only be OLDER
+        than the truth (a tool call started since is missed until the next
+        read), so the worst case is a later heal, never a wrong one: it is
+        still compared against each flag's current mtime, here and again
+        under the hook's lock."""
+        cached = self._self_heal_evidence
+        if (cached is not None
+                and 0.0 <= now - cached[0] < SELF_HEAL_EVIDENCE_REFRESH_SEC):
+            return cached[1]
+        tool_start = claude_newest_tool_shell_start(procs)
+        self._self_heal_evidence = (now, tool_start, {})
+        return tool_start
+
+    def _self_heal_helper_write(self, sid: str) -> float | None:
+        """claude_session_newest_helper_write for `sid`, cached alongside the
+        CURRENT process read and read only after it (call
+        _self_heal_tool_start first). That order is load-bearing: every Bash
+        in the process snapshot had already written its tool_use when the
+        snapshot was taken, so a helper read taken later sees it. A stale
+        helper read is the UNSAFE direction (it can miss a helper), which is
+        why it never outlives the process read it vets."""
+        cached = self._self_heal_evidence
+        if cached is None:
+            return float("inf")  # no process read to vet: never heal
+        helpers = cached[2]
+        if sid not in helpers:
+            helpers[sid] = claude_session_newest_helper_write(sid)
+        return helpers[sid]
 
     def _claude_alert_rearmed(self, awaiting_sessions: list[str]) -> bool:
         """True if a Claude session already covered by the current alert has
