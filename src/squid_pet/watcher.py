@@ -15,6 +15,13 @@ State model:
                    see the sleeping branch in _compute_inner)
   - approval_needed : Claude Code's Notification hook (scripts/
                    claude_pet_hook.py) reports a session is waiting on you
+  - concerned    : Claude Code's StopFailure hook or Codex's failed turn
+                   record reports that the turn ended
+                   on an API error (usage/rate limit, overload, auth,
+                   billing, ...). Driven by that explicit hook signal,
+                   never inferred from a stalled/silent turn -- see
+                   claude_freshest_failure(), codex_freshest_failure(),
+                   and _apply_failure_override().
 
   Pink-2026-08-27: the legacy agent (a third-party CLI coding agent
   this project originally watched) has been fully removed, including the
@@ -25,23 +32,29 @@ State model:
   2026-08-26. "grooving" now has a real
   Claude Code path (Stop hook, no resumed work yet -- see
   claude_grooving_now below) and other-detector paths (e.g. IDE).
-  "concerned" still has no Claude Code/Codex equivalent and remains
-  unreachable via natural detection (still settable via the
-  ~/.squid-pet/force_state debug override for testing/demos).
+  Pink-2026-09-16: "concerned" now has a real Claude Code path too --
+  the StopFailure hook (turn ended on an API error) -- so it is no
+  longer force_state-only. Codex uses a read-only SQLite adapter for
+  explicit failed turns; validated with CLI/app-server 0.153.4. No
+  transcript or free-text error fields are returned by the adapter.
+  Still settable via the ~/.squid-pet/force_state debug override too.
 
 State is written to ~/.squid-pet/state.json every 1s, frontend polls it.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import re
+import sqlite3
 import stat as stat_module
 import subprocess
 import time
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -130,6 +143,7 @@ class PetState:
     claude_code_running: bool = False
     codex_running: bool = False
     timestamp: float = 0.0
+    work_seconds: float = 0.0  # accumulated agent-work wall-clock seconds
     message: str = ""             # short caption shown under the pet
     concern_reason: str = ""      # short headline of why concerned (for tooltip)
     concern_severity: str = ""    # "transient" (network) or "hard" (code crash)
@@ -137,6 +151,7 @@ class PetState:
     # state fired this tick. Surfaced in `squid why` + optionally used
     # as the bubble.
     state_reason: str = ""
+    focus_target: dict | None = None  # provenance of this snapshot, never a guessed workspace
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -455,26 +470,47 @@ def find_terminal_app_bundle_for_claude_code() -> str | None:
     different apps, this returns whichever is found first -- the hook
     payload carries no PID to disambiguate. Returns None if no claude
     process is found or its ancestry hits no app within a few hops.
+
+    When the caller knows WHICH session it means (a session-id-keyed flag
+    dir named it), focus._focus_claude_state resolves that session's process
+    (claude_session_proc) once and derives both its tab and its app from it
+    via _terminal_app_bundle_for_proc, which is what makes "take me there"
+    land in the right app when sessions run in different hosts.
     """
     for proc in find_claude_code_processes():
-        try:
-            cur = proc
-            depth = 0
-            while cur is not None and depth < 10:
-                name = cur.name()
-                if name in _TERMINAL_APP_BUNDLE_IDS:
-                    return _TERMINAL_APP_BUNDLE_IDS[name]
-                try:
-                    exe = cur.exe()
-                except Exception:
-                    exe = None
-                bid = _bundle_id_from_exe_path(exe)
-                if bid:
-                    return bid
-                cur = cur.parent()
-                depth += 1
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+        bundle = _terminal_app_bundle_for_proc(proc)
+        if bundle:
+            return bundle
+    return None
+
+
+def _terminal_app_bundle_for_proc(proc: "psutil.Process | None") -> str | None:
+    """Walk one process's parent chain to the terminal/IDE app hosting it.
+
+    The per-process half of find_terminal_app_bundle_for_claude_code, split
+    out so a specific session's process can be resolved to its own host app
+    rather than whichever claude process happens to be found first.
+    """
+    if proc is None:
+        return None
+    try:
+        cur = proc
+        depth = 0
+        while cur is not None and depth < 10:
+            name = cur.name()
+            if name in _TERMINAL_APP_BUNDLE_IDS:
+                return _TERMINAL_APP_BUNDLE_IDS[name]
+            try:
+                exe = cur.exe()
+            except Exception:
+                exe = None
+            bid = _bundle_id_from_exe_path(exe)
+            if bid:
+                return bid
+            cur = cur.parent()
+            depth += 1
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return None
     return None
 
 
@@ -516,14 +552,48 @@ CLAUDE_AWAITING_INPUT_DIR = os.path.join(
 )
 CLAUDE_AWAITING_INPUT_STALE_SEC = 7200.0  # 2h -- crashed-session disk cleanup only
 _CLAUDE_SESSION_SNOOZE_SEC = 120.0  # once seen & deferred this long, quiet down until it re-arms
-# Activity in another session (or a parallel tool) cannot resolve a wait.
-# Keep direct signals until a lifecycle event clears them, they are snoozed,
-# or their crash-safety expiry is reached.
+# Pink-2026-08-31: minimum flag age before self-heal (below) may reap it.
+# Real bug caught live during a demo: a flag written THIS tick (e.g. from
+# a permission_prompt Notification) could be self-healed away on the SAME
+# tick if the underlying cascade state already read working/thinking --
+# e.g. Claude Code still visibly streaming/active right as the prompt is
+# raised. Result: approval_needed never fired even once, not even for a
+# single tick -- the "your turn" wave and OS notification silently never
+# happened for a genuinely-pending, freshly-raised prompt. Self-heal's
+# actual job is clearing a flag that's been stuck while Pink is ACTIVELY
+# WATCHING ongoing work resume -- not reaping something raised a moment
+# ago -- so it must not act until a flag has survived a few real poll
+# ticks (POLL_INTERVAL_SEC == 1.0) untouched.
+SELF_HEAL_MIN_FLAG_AGE_SEC = 3.0
+# 2026-09-30: self-heal's evidence (claude_newest_tool_shell_start, a full
+# process-table read on macOS) is re-read at most this often while a flag
+# stays pending -- which, now that background work no longer heals it, can be
+# the whole time a prompt waits for an answer. Worst case a heal lands this
+# much later; an approved short command's own PostToolUse clears it first.
+SELF_HEAL_EVIDENCE_REFRESH_SEC = 3.0
+# 2026-09-30 round 2: a helper (subagent) whose transcript was written since
+# (flag mtime - this) may own the new Bash call self-heal would cite, so the
+# flag is kept. A helper writes its tool_use entry BEFORE that Bash starts;
+# the gap is PreToolUse hooks plus auto mode's classifier (measured 1.37 s
+# live, Claude Code 2.1.284) -- this bounds it generously. A helper's own
+# permission wait is unbounded, but that prompt lands as an `agent:<id>`
+# owner line, so the single-owner guard keeps the flag, not this window.
+SELF_HEAL_HELPER_QUIET_SEC = 60.0
 _CLAUDE_SESSION_FLAG_FIRST_SEEN: dict[str, float] = {}
+# Round 3 (review #3): the highest flag mtime seen per session. The hook's flag
+# is an owner set -- a second prompt in a session that is already waving adds
+# an owner line instead of making the file vanish and reappear, and it
+# ADVANCES the mtime (a clear never does). filter_eligible_claude_sessions
+# re-arms the snooze, and StateMachine the one-shot OS alert, on an advance.
+_CLAUDE_SESSION_FLAG_MTIME: dict[str, float] = {}
+# The hook's flock over the awaiting-input dir (scripts/claude_pet_hook.py
+# _FLAG_LOCK_NAME). Self-heal takes it before deleting a flag.
+_CLAUDE_AWAITING_LOCK_NAME = ".lock"
 
 
 def _scan_session_flag_dir(
     dir_path: str, stale_sec: float, fresh_sec: float | None = None,
+    *, lock_name: str | None = None, now: float | None = None,
 ) -> list[str]:
     """Shared scan/prune logic for the session-id-keyed flag directories
     (claude_awaiting_input/, claude_finished/): list entries, skip
@@ -537,8 +607,14 @@ def _scan_session_flag_dir(
     Returns sorted list (deterministic for tests). Missing dir or any OS
     error -> [] (signal is best-effort; never crash the tick) -- listdir's
     own FileNotFoundError is an OSError, so a missing dir needs no
-    separate pre-check."""
-    now = time.time()
+    separate pre-check.
+
+    lock_name (round 4): the writer's flock file in dir_path. When given, a
+    stale entry is only deleted under that lock -- see
+    _evict_stale_flag_under_lock. The lock is touched only when an entry is
+    actually stale (rare), never on the ordinary per-tick path."""
+    if now is None:
+        now = time.time()
     live: list[str] = []
     try:
         names = os.listdir(dir_path)
@@ -558,15 +634,142 @@ def _scan_session_flag_dir(
         if age < 0:
             continue
         if age > stale_sec:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-            continue
+            if lock_name is None:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                continue
+            kept_age = _evict_stale_flag_under_lock(
+                path, os.path.join(dir_path, lock_name), stale_sec)
+            if kept_age is None:
+                continue
+            age = kept_age
         if fresh_sec is not None and age > fresh_sec:
             continue
         live.append(name)
     return sorted(live)
+
+
+def _evict_stale_flag_under_lock(
+    path: str, lock_path: str, stale_sec: float,
+) -> float | None:
+    """Round 4 (Codex #5): delete a stale awaiting-input flag only under the
+    hook's own flock, re-checking once it is held -- the hook re-raises a flag
+    with a locked read-modify-write, and an unlocked unlink here could delete
+    a wave it had just re-raised. Mirrors _self_heal_unlink_single_owner_flag:
+    the lock is tried NON-blocking, and if a hook holds it this tick skips
+    the entry (not deleted, not reported; the next tick retries) rather than
+    stall the 1 Hz loop.
+
+    Under the lock the entry is kept if its mtime is fresh again OR any owner
+    line carries an add time within stale_sec (the hook stamps the mtime from
+    its newest owner, so this is belt and braces). Returns the kept entry's
+    age (so the caller reports it), or None if it was deleted / skipped."""
+    try:
+        with open(lock_path, "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return None
+            try:
+                now = time.time()
+                age = now - os.stat(path).st_mtime
+                if age <= stale_sec:
+                    return age
+                with open(path, errors="replace") as f:
+                    owner_lines = f.read().splitlines()[1:]
+                for line in owner_lines:
+                    parts = line.split()
+                    try:
+                        added = float(parts[1]) if len(parts) == 2 else None
+                    except ValueError:
+                        added = None
+                    if added is not None and now - added <= stale_sec:
+                        return max(0.0, now - added)
+                os.unlink(path)
+                return None
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    except OSError:
+        return None
+
+
+# Round 4: scripts/claude_pet_hook.py's PermissionRequest attribution hints
+# (PENDING_DIR there). NOT waves -- nothing here is ever reported; this module
+# only sweeps it. A hint is useful for 10s (the hook's TTL); a file untouched
+# for 5 minutes belongs to a session that crashed or ended without SessionEnd.
+CLAUDE_PERMISSION_PENDING_DIR = os.path.join(
+    os.path.expanduser("~"), ".squid-pet", "claude_permission_pending"
+)
+CLAUDE_PERMISSION_PENDING_STALE_SEC = 300.0
+# The sweep piggybacks on the 1 Hz awaiting-input scan, but at most this
+# often -- a second listdir every tick would be pure overhead for a dir that
+# is almost always empty.
+_CLAUDE_PENDING_SWEEP_INTERVAL_SEC = 60.0
+_CLAUDE_PENDING_LAST_SWEEP = 0.0
+
+
+def sweep_claude_permission_pending(now: float | None = None) -> int | None:
+    """Delete every entry in CLAUDE_PERMISSION_PENDING_DIR -- dotfile tmps
+    included, so a hook killed mid-write leaks nothing either -- untouched
+    for CLAUDE_PERMISSION_PENDING_STALE_SEC. Runs under the hook's flock
+    (the awaiting-input dir's lock, which guards the pending store too),
+    tried non-blocking: if a hook holds it, sweep nothing this pass. Returns
+    how many were removed (0 also when there is no dir or nothing in it),
+    or None when the pass did NOT run -- the lock was busy or could not be
+    opened -- so the caller retries on its next tick instead of waiting out
+    a full throttle interval. Best-effort: never raises."""
+    if now is None:
+        now = time.time()
+    try:
+        names = os.listdir(CLAUDE_PERMISSION_PENDING_DIR)
+    except OSError:
+        return 0
+    if not names:
+        return 0
+    removed = 0
+    ran = False
+    lock_path = os.path.join(CLAUDE_AWAITING_INPUT_DIR, _CLAUDE_AWAITING_LOCK_NAME)
+    try:
+        with open(lock_path, "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return None
+            try:
+                for name in names:
+                    path = os.path.join(CLAUDE_PERMISSION_PENDING_DIR, name)
+                    try:
+                        if now - os.stat(path).st_mtime > CLAUDE_PERMISSION_PENDING_STALE_SEC:
+                            os.unlink(path)
+                            removed += 1
+                    except OSError:
+                        continue
+                ran = True
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    # Not ran = the lock file could not be opened, or flock was busy.
+    return removed if ran else None
+
+
+def _maybe_sweep_claude_permission_pending(now: float | None = None) -> None:
+    """Round 5 (Codex round 4 P3): the throttle is stamped only after a pass
+    that actually RAN. Stamping before the lock attempt let a pass skipped
+    for a busy lock defer the next try a full interval, so sustained
+    contention could push cleanup past the ~5x margin under the 300s stale
+    bound. A skipped pass is retried on the next 1 Hz tick -- a listdir plus
+    a non-blocking flock, only while the dir holds files and the lock is
+    busy, so no per-tick cost in the common (empty or uncontended) case."""
+    global _CLAUDE_PENDING_LAST_SWEEP
+    if now is None:
+        now = time.time()
+    if now - _CLAUDE_PENDING_LAST_SWEEP < _CLAUDE_PENDING_SWEEP_INTERVAL_SEC:
+        return
+    if sweep_claude_permission_pending(now) is not None:
+        _CLAUDE_PENDING_LAST_SWEEP = now
 
 
 def claude_sessions_awaiting_input() -> list[str]:
@@ -576,9 +779,13 @@ def claude_sessions_awaiting_input() -> list[str]:
     Notification event (permission_prompt) and removes it
     on UserPromptSubmit/SessionEnd. Entries older than
     CLAUDE_AWAITING_INPUT_STALE_SEC are evicted here as a safety net for a
-    session that died without either firing (crash, force-kill).
+    session that died without either firing (crash, force-kill) -- under the
+    hook's lock (round 4). Also drives the throttled pending-hint sweep.
     """
-    return _scan_session_flag_dir(CLAUDE_AWAITING_INPUT_DIR, CLAUDE_AWAITING_INPUT_STALE_SEC)
+    _maybe_sweep_claude_permission_pending()
+    return _scan_session_flag_dir(
+        CLAUDE_AWAITING_INPUT_DIR, CLAUDE_AWAITING_INPUT_STALE_SEC,
+        lock_name=_CLAUDE_AWAITING_LOCK_NAME)
 
 
 CODEX_AWAITING_INPUT_DIR = os.path.expanduser("~/.squid-pet/codex_awaiting_input")
@@ -588,8 +795,12 @@ _DIRECT_SIGNAL_VERSIONS: dict[tuple[str, str], tuple[int, int]] = {}
 
 def codex_requests_awaiting_input() -> list[str]:
     """Opaque per-request markers from Codex's advisory lifecycle hooks."""
-    return _scan_session_flag_dir(
+    from pathlib import Path
+
+    from .codex_approvals import filter_resolved_requests
+    names = _scan_session_flag_dir(
         CODEX_AWAITING_INPUT_DIR, CLAUDE_AWAITING_INPUT_STALE_SEC)
+    return filter_resolved_requests(Path(CODEX_AWAITING_INPUT_DIR), names)
 
 
 def filter_eligible_codex_requests(request_ids: list[str]) -> list[str]:
@@ -687,6 +898,221 @@ def claude_sessions_recapping() -> list[str]:
     return _scan_session_flag_dir(
         CLAUDE_RECAPPING_DIR, CLAUDE_RECAPPING_STALE_SEC, CLAUDE_RECAPPING_FRESH_SEC
     )
+
+
+# ── "turn failed" flag → concerned (Pink-2026-09-16) ────────────────────
+# Claude Code fires the StopFailure hook (NOT Stop) when a turn ends because
+# of an API error, carrying a machine-readable error_type (rate_limit,
+# overloaded, authentication_failed, billing_error, ...). scripts/
+# claude_pet_hook.py writes <dir>/<session_id> holding just that error_type
+# CATEGORY. This is the ONLY inference-free signal that Squid is BLOCKED by
+# an error rather than merely quiet -- Pink explicitly rejected inferring
+# "concerned" from a stalled/silent turn, since a false worried face is
+# worse than none. Cleared by the hook on UserPromptSubmit (retry) or
+# SessionEnd; the fresh window below bounds how long a failure shows even if
+# neither fires. Unlike the awaiting/finished dirs' mtime-only readers, this
+# one reads the flag's CONTENT -- but that content is a bounded error
+# CATEGORY, never message text, so it holds the same privacy line.
+CLAUDE_FAILED_DIR = os.path.join(
+    os.path.expanduser("~"), ".squid-pet", "claude_failed"
+)
+CLAUDE_FAILED_STALE_SEC = 7200.0  # 2h -- crashed-session disk cleanup only
+# How long a StopFailure keeps her concerned when nothing clears it sooner.
+# Long enough that a real usage-limit block stays visible while Pink is away,
+# short enough that a flag orphaned by a missed clear-event can't sulk
+# forever (the 2h stale sweep is only disk cleanup, far too long for a mood).
+CLAUDE_FAILED_FRESH_SEC = 300.0
+
+# error_type category -> (human reason headline, severity). "transient" marks
+# a self-resolving network/server condition (the frontend tooltip tints these
+# differently); "hard" marks anything that needs Pink to actually do
+# something -- sign in, fix billing, wait out a quota. Values are Claude
+# Code's StopFailure error_type set (see its hooks reference); an
+# unrecognized value falls back to the generic "hard" entry so a newly-added
+# error type still surfaces rather than silently vanishing.
+_CONCERN_BY_ERROR_TYPE: dict[str, tuple[str, str]] = {
+    "rate_limit": ("Usage limit reached", "transient"),
+    "overloaded": ("Claude's servers are overloaded", "transient"),
+    "server_error": ("Claude's servers hit an error", "transient"),
+    "authentication_failed": ("Sign-in expired — re-authenticate", "hard"),
+    "oauth_org_not_allowed": ("Your org isn't allowed here", "hard"),
+    "account_on_hold": ("Account is on hold", "hard"),
+    "billing_error": ("Billing needs attention", "hard"),
+    "invalid_request": ("The request was rejected", "hard"),
+    "model_not_found": ("That model isn't available", "hard"),
+    "max_output_tokens": ("Hit the max response length", "hard"),
+    "cloud_credential_error": ("Cloud credentials failed", "hard"),
+    "unknown": ("Something went wrong", "hard"),
+    "usage_limited": ("Usage limit reached", "hard"),
+    "codex_overloaded": ("Codex servers are overloaded", "transient"),
+    "codex_server_error": ("Codex servers hit an error", "transient"),
+    "codex_connection_error": ("Codex connection failed", "transient"),
+}
+_CONCERN_FALLBACK: tuple[str, str] = ("Something went wrong", "hard")
+
+
+def concern_for_error_type(error_type: str) -> tuple[str, str]:
+    """Map a Claude or normalized Codex error category to (reason headline, severity).
+    Unrecognized categories fall back to a generic hard error."""
+    return _CONCERN_BY_ERROR_TYPE.get(error_type, _CONCERN_FALLBACK)
+
+
+# ── "I saw the error" dismiss (Pink-2026-09-16) ─────────────────────────
+# A dblclick while she's showing concerned calms the worried face (see
+# window.PetApi.acknowledge_concern), mirroring acknowledge_approval. Like
+# that path, it does NOT delete the underlying failed flag -- the SAME
+# gesture's take_me_there still needs it to resolve the errored session --
+# it snoozes the concerned override instead. The window equals the flag's
+# fresh window, so a Claude flag goes stale before the snooze lifts and
+# won't re-assert; a Codex-sourced concern (no flag to delete) is covered by
+# the same snooze. Trade-off: a genuinely NEW failure within the window is
+# suppressed too -- acceptable, since you just acknowledged an error and a
+# fast retry that fails again is the same story, not news.
+CONCERN_DISMISS_SEC = CLAUDE_FAILED_FRESH_SEC
+_concern_dismissed_until: float = 0.0
+
+
+def dismiss_concern(now: float | None = None) -> None:
+    """Snooze the concerned override for CONCERN_DISMISS_SEC from now."""
+    global _concern_dismissed_until
+    if now is None:
+        now = time.time()
+    _concern_dismissed_until = now + CONCERN_DISMISS_SEC
+
+
+def claude_freshest_failure_with_session(
+    now: float | None = None,
+) -> tuple[str, str] | None:
+    """(error_type, session_id) of the most-recently-written, still-fresh
+    StopFailure flag, or None if no Claude Code session failed within
+    CLAUDE_FAILED_FRESH_SEC.
+
+    Pink-2026-09-24: returns the sid too, so _apply_failure_override can pin
+    take-me-there to the EXACT session that failed. Without it, a second
+    session failing before the double-click would move the freshest flag and
+    send you to the wrong window.
+
+    Reads the freshest flag's content (an error CATEGORY, not message text).
+    """
+    if now is None:
+        now = time.time()
+    session_ids = _scan_session_flag_dir(
+        CLAUDE_FAILED_DIR, CLAUDE_FAILED_STALE_SEC, CLAUDE_FAILED_FRESH_SEC,
+        now=now,
+    )
+    if not session_ids:
+        return None
+    freshest_sid: str | None = None
+    freshest_age: float | None = None
+    for sid in session_ids:
+        try:
+            age = now - os.stat(os.path.join(CLAUDE_FAILED_DIR, sid)).st_mtime
+        except OSError:
+            continue
+        if freshest_age is None or age < freshest_age:
+            freshest_age = age
+            freshest_sid = sid
+    if freshest_sid is None:
+        return None
+    try:
+        with open(os.path.join(CLAUDE_FAILED_DIR, freshest_sid)) as f:
+            return (f.read().strip() or "unknown", freshest_sid)
+    except OSError:
+        return None
+
+
+def claude_freshest_failure(now: float | None = None) -> str | None:
+    """error_type of the most-recently-written, still-fresh StopFailure flag,
+    or None if no Claude Code session failed within CLAUDE_FAILED_FRESH_SEC.
+
+    Reads the freshest flag's content (an error CATEGORY, not message text).
+    """
+    hit = claude_freshest_failure_with_session(now)
+    return hit[0] if hit else None
+
+
+# Versioned internal schema, verified against installed codex-cli 0.153.4.
+CODEX_THREAD_HISTORY_DB = Path(
+    os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
+) / "thread_history_1.sqlite"
+CODEX_FAILED_FRESH_SEC = 300.0
+
+
+def codex_freshest_failure(now: float | None = None) -> str | None:
+    """Return only a bounded category from the freshest unresolved failed turn.
+
+    Validated 2026-09-16 with genuine failed turns from both `codex exec`
+    and `codex app-server` 0.153.4 in a throwaway CODEX_HOME: an invalid
+    provider URL produced status='failed', codexErrorInfo='other', and
+    Unix-second started_at/completed_at. The real ~/.codex schema matched.
+    App-server coverage applies to IDEs using this same local history DB;
+    remote/ephemeral sessions and other versions are not guaranteed.
+
+    SQLite projects allowlisted constants from error_json.codexErrorInfo
+    (string enum or tagged object). Never SELECT error_json itself, message,
+    additionalDetails, thread_items, or transcripts. Unknown categories on
+    explicit failures become 'unknown'; so does a failed row with missing or
+    malformed error_json (Pink-2026-09-24: an ELSE-less outer CASE projected
+    NULL there, so a malformed NEWEST row hid every older fresh failure under
+    ORDER BY completed_at DESC LIMIT 1). A newer turn in the same thread
+    suppresses its previous failure; ties conservatively suppress it too.
+    Silence never creates a failure.
+
+    mode=ro preserves WAL visibility (immutable=1 would miss live WAL rows).
+    No writes, migrations, explicit locks, or busy waits; the short SQLite
+    read transaction closes each tick. Missing schema/JSON support, locks,
+    corruption, or any other exception must never break the watcher.
+    """
+    try:
+        if now is None:
+            now = time.time()
+        uri = Path(CODEX_THREAD_HISTORY_DB).absolute().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0)) as conn:
+            # Bound work on unexpectedly large/internal-schema databases.
+            conn.set_progress_handler(lambda: 1, 2_000_000)
+            row = conn.execute(
+                """
+                SELECT CASE WHEN json_valid(f.error_json) THEN
+                    CASE json_extract(f.error_json, '$.codexErrorInfo')
+                        WHEN 'usageLimitExceeded' THEN 'usage_limited'
+                        WHEN 'rateLimitExceeded' THEN 'rate_limit'
+                        WHEN 'badRequest' THEN 'invalid_request'
+                        WHEN 'unauthorized' THEN 'authentication_failed'
+                        WHEN 'serverOverloaded' THEN 'codex_overloaded'
+                        WHEN 'internalServerError' THEN 'codex_server_error'
+                        ELSE CASE WHEN
+                            json_type(f.error_json,
+                                '$.codexErrorInfo.httpConnectionFailed') = 'object'
+                            OR json_type(f.error_json,
+                                '$.codexErrorInfo.responseStreamConnectionFailed') = 'object'
+                            OR json_type(f.error_json,
+                                '$.codexErrorInfo.responseStreamDisconnected') = 'object'
+                            OR json_type(f.error_json,
+                                '$.codexErrorInfo.responseTooManyFailedAttempts') = 'object'
+                            THEN 'codex_connection_error' ELSE 'unknown' END
+                    END
+                ELSE 'unknown' END
+                FROM thread_turns AS f
+                WHERE f.status = 'failed'
+                  AND typeof(f.completed_at) = 'integer'
+                  AND typeof(f.started_at) = 'integer'
+                  AND f.started_at <= f.completed_at
+                  AND f.completed_at BETWEEN ? AND ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM thread_turns AS newer
+                      WHERE newer.thread_id = f.thread_id
+                        AND newer.turn_id != f.turn_id
+                        AND (newer.started_at >= f.started_at
+                             OR newer.started_at IS NULL)
+                  )
+                ORDER BY f.completed_at DESC, f.thread_id, f.turn_id
+                LIMIT 1
+                """,
+                (now - CODEX_FAILED_FRESH_SEC, now),
+            ).fetchone()
+            return str(row[0]) if row and row[0] is not None else None
+    except Exception:
+        return None
 
 
 # ── "task complete" flag (Pink-2026-08-30) ──────────────────────────────
@@ -813,24 +1239,120 @@ def claude_session_label(session_id: str) -> str | None:
     return tail or None
 
 
-def claude_session_tty(session_id: str) -> str | None:
-    """Controlling terminal of the process running this session.
+CLAUDE_SESSION_TTY_DIR = os.path.join(
+    os.path.expanduser("~"), ".squid-pet", "claude_session_tty"
+)
+CLAUDE_SESSION_TTY_STALE_SEC = 7200.0  # 2h -- crashed-session disk cleanup only
 
-    Matches by comparing each live claude process's encoded cwd against the
-    session's project directory -- which is what makes "take me to it"
-    correct with several sessions running, where the hook payload's missing
-    PID otherwise leaves it guessing.
+
+def sweep_stale_session_ttys(now: float | None = None) -> None:
+    """Evict tty entries a crashed/killed session left behind.
+
+    Pink-2026-09-24: unlike every other flag dir, claude_session_tty/ is only
+    ever read by exact session_id (claude_session_recorded_tty), never listed,
+    so nothing pruned it -- SessionEnd was its ONLY removal path. A session
+    that died without firing SessionEnd leaked its entry forever, and because
+    /dev/ttysNNN numbers are reused, that stale tty could later match an
+    UNRELATED live process and send take-me-there to the wrong window (the very
+    class of bug this registry exists to prevent). Evict entries past the same
+    2h crash-safety window the other flag dirs use (_scan_session_flag_dir); a
+    live session re-stamps its entry on its next turn (_record_session_tty) or
+    touches it on any other event (claude_pet_hook._touch_session_tty), so the
+    only cost of an over-eager prune is one turn of cwd-guess fallback.
     """
+    if now is None:
+        now = time.time()
+    try:
+        names = os.listdir(CLAUDE_SESSION_TTY_DIR)
+    except OSError:
+        return
+    for name in names:
+        if name.startswith("."):
+            continue
+        path = os.path.join(CLAUDE_SESSION_TTY_DIR, name)
+        try:
+            if now - os.stat(path).st_mtime > CLAUDE_SESSION_TTY_STALE_SEC:
+                # Re-stat immediately before unlink: a hook may have re-stamped
+                # (os.replace / _touch_session_tty) this entry since the listing
+                # above. Skip if it is fresh again, so we never delete a just-
+                # refreshed entry. A microsecond residual race remains (a
+                # re-stamp between this stat and the unlink); its only cost is
+                # one turn of cwd-guess fallback, so it is accepted.
+                if now - os.stat(path).st_mtime <= CLAUDE_SESSION_TTY_STALE_SEC:
+                    continue
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+def claude_session_recorded_tty(session_id: str) -> str | None:
+    """The controlling tty the hook recorded for this session, or None.
+
+    Authoritative: the hook that writes it is a child of the exact session
+    process, so it shares that session's controlling terminal. This is what
+    disambiguates two sessions sharing a cwd (one in Terminal, one in
+    Cursor) that the cwd match below cannot. Best-effort -- a session
+    whose tty was never recorded (older session, detached spawn) just
+    returns None and the caller falls back to the cwd match."""
+    if not session_id:
+        return None
+    try:
+        with open(os.path.join(CLAUDE_SESSION_TTY_DIR, session_id)) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def claude_session_proc(session_id: str) -> "psutil.Process | None":
+    """The live claude process running this session.
+
+    Two matches, strongest first, because "which process is this session"
+    is the crux of taking you to the right window with several sessions
+    running:
+
+      1. RECORDED TTY (authoritative). The hook stamped this session's
+         controlling terminal; the one live claude process on that tty IS
+         this session. Exact even when two sessions share a directory --
+         the Pink-2026-09-16 wrong-window bug (a failed Cursor turn's
+         concerned double-click raised a same-cwd Terminal session).
+      2. ENCODED CWD (fallback). No recorded tty (older/detached session):
+         match the session's project directory. Correct whenever sessions
+         live in distinct directories; ambiguous only in the same-cwd case
+         (1) is there to resolve.
+
+    Both the session's tty and the app hosting it are resolved through this
+    one process, so they can never disagree about which session they mean.
+    """
+    procs = find_claude_code_processes()
+    rec_tty = claude_session_recorded_tty(session_id)
+    if rec_tty:
+        for proc in procs:
+            try:
+                if proc.terminal() == rec_tty:
+                    return proc
+            except Exception:
+                continue
     enc = claude_session_project_dir(session_id)
     if not enc:
         return None
-    for proc in find_claude_code_processes():
+    for proc in procs:
         try:
             if encode_project_dir(proc.cwd()) == enc:
-                return proc.terminal()
+                return proc
         except Exception:
             continue
     return None
+
+
+def claude_session_tty(session_id: str) -> str | None:
+    """Controlling terminal of the process running this session."""
+    proc = claude_session_proc(session_id)
+    if proc is None:
+        return None
+    try:
+        return proc.terminal()
+    except Exception:
+        return None
 
 
 def describe_waiting_sessions(session_ids: list[str]) -> str | None:
@@ -885,6 +1407,53 @@ def claude_task_marked_complete_recently(now: float | None = None) -> bool:
     return bool(session_ids)
 
 
+def _self_heal_unlink_single_owner_flag(
+    path: str, now: float, *, evidence_after: float, helper_write: float | None,
+) -> bool:
+    """Delete an awaiting-input flag for self-heal, but only if it holds at
+    most ONE pending prompt (one owner line, or a legacy flag with none), and
+    only under the hook's own flock -- re-checking the age once it is held,
+    since a prompt added while we waited makes the flag fresh again. Several
+    owner lines are several independent prompts (the parent's and helpers');
+    "the session looks busy" cannot prove all of them resolved. The lock is
+    tried NON-blocking: if a hook holds it, skip this tick (next one retries)
+    rather than stall the 1 Hz loop. Returns True iff the flag was deleted.
+
+    evidence_after (2026-09-30): the start time of the tool call self-heal
+    cites as proof the prompt was answered. Re-checked under the lock too: a
+    prompt (re-)raised after that tool call started is not answered by it.
+
+    helper_write (round 2): the session's newest subagent-transcript write
+    (claude_session_newest_helper_write), re-checked against the mtime held
+    under the lock -- a partial resolve can LOWER the mtime in between."""
+    lock_path = os.path.join(os.path.dirname(path), _CLAUDE_AWAITING_LOCK_NAME)
+    try:
+        with open(lock_path, "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return False
+            try:
+                mtime = os.stat(path).st_mtime
+                if now - mtime < SELF_HEAL_MIN_FLAG_AGE_SEC:
+                    return False
+                if mtime >= evidence_after:
+                    return False
+                if (helper_write is not None
+                        and helper_write >= mtime - SELF_HEAL_HELPER_QUIET_SEC):
+                    return False
+                with open(path, errors="replace") as f:
+                    owner_lines = [ln for ln in f.read().splitlines()[1:] if ln.strip()]
+                if len(owner_lines) > 1:
+                    return False
+                os.unlink(path)
+                return True
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    except OSError:
+        return False
+
+
 def filter_eligible_claude_sessions(session_ids: list[str]) -> list[str]:
     """Filter direct-signal Claude Code session_ids down to those that
     deserve a flag-wave right now.
@@ -898,12 +1467,47 @@ def filter_eligible_claude_sessions(session_ids: list[str]) -> list[str]:
 
     Also maintains _CLAUDE_SESSION_FLAG_FIRST_SEEN: records birth time for
     any new flag, evicts entries whose flag has gone away.
+
+    Round 3: also RE-ARMS (fresh birth time) a session whose flag mtime has
+    advanced past the highest value seen -- a new prompt added to a flag that
+    never went away. One stat per awaiting session per call (no fork; the
+    list is almost always empty).
     """
+    _note_claude_flag_mtimes(session_ids, rearm=True)
     return _filter_eligible_direct_signals(
         session_ids, _CLAUDE_SESSION_FLAG_FIRST_SEEN, CLAUDE_AWAITING_INPUT_DIR)
 
 
-def _filter_eligible_direct_signals(session_ids, first_seen_times, directory: str) -> list[str]:
+def _claude_flag_mtime(sid: str) -> float | None:
+    try:
+        return os.stat(os.path.join(CLAUDE_AWAITING_INPUT_DIR, sid)).st_mtime
+    except OSError:
+        return None
+
+
+def _note_claude_flag_mtimes(session_ids: list[str], *, rearm: bool) -> None:
+    """Record each live flag's mtime in _CLAUDE_SESSION_FLAG_MTIME (keeping the
+    max: a partial clear can LOWER it, and must not look like a new add when
+    it later reads the same again), evicting sessions whose flag is gone.
+    With rearm=True, a session whose mtime advanced past the recorded max
+    loses its first-seen time, so the snooze window restarts. A first sighting
+    is not an advance (first-seen handles it)."""
+    live = set(session_ids)
+    for sid in [s for s in _CLAUDE_SESSION_FLAG_MTIME if s not in live]:
+        del _CLAUDE_SESSION_FLAG_MTIME[sid]
+    for sid in session_ids:
+        mtime = _claude_flag_mtime(sid)
+        if mtime is None:
+            continue
+        last = _CLAUDE_SESSION_FLAG_MTIME.get(sid)
+        if last is None or mtime > last:
+            if last is not None and rearm:
+                _CLAUDE_SESSION_FLAG_FIRST_SEEN.pop(sid, None)
+            _CLAUDE_SESSION_FLAG_MTIME[sid] = mtime
+
+
+def _filter_eligible_direct_signals(
+        session_ids, first_seen_times, directory: str) -> list[str]:
     now = time.time()
     live = set(session_ids)
 
@@ -924,9 +1528,12 @@ def _filter_eligible_direct_signals(session_ids, first_seen_times, directory: st
             key = (directory, sid)
             version = (metadata.st_ino, metadata.st_mtime_ns)
             previous = _DIRECT_SIGNAL_VERSIONS.get(key)
-            if previous is not None and previous != version:
+            if previous is None:
+                _DIRECT_SIGNAL_VERSIONS[key] = version
+            elif (metadata.st_ino != previous[0]
+                  or metadata.st_mtime_ns > previous[1]):
                 first_seen_times.pop(sid, None)
-            _DIRECT_SIGNAL_VERSIONS[key] = version
+                _DIRECT_SIGNAL_VERSIONS[key] = version
         first_seen = first_seen_times.setdefault(sid, now)
         if now - first_seen > _CLAUDE_SESSION_SNOOZE_SEC:
             continue
@@ -957,6 +1564,9 @@ def snooze_all_awaiting_now() -> int:
     # Also cover any live flag we might have missed observing yet (the
     # scan of the awaiting dir is cheap enough to do inline).
     live_sessions = set(claude_sessions_awaiting_input())
+    # Record the current mtimes WITHOUT re-arming, so the snooze holds until
+    # a genuinely new prompt advances one.
+    _note_claude_flag_mtimes(sorted(live_sessions), rearm=False)
     for sid in live_sessions:
         _CLAUDE_SESSION_FLAG_FIRST_SEEN[sid] = claude_stale
 
@@ -991,7 +1601,7 @@ def count_currently_waving_sessions() -> int:
 # Live tool-activity detection
 # ────────────────────────────────────────────────────────────────────────
 
-def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
+def shell_child_activity(procs, *, owner_out: dict | None = None) -> tuple[bool, list[str] | None]:
     """One descendant-tree walk yielding BOTH tool-activity signals:
     ``(shell_active, cmdline)``.
 
@@ -1022,9 +1632,21 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
     immediate child and the tool is a grandchild. Best-effort throughout:
     any failure returns what was already proven rather than raising.
     """
+    if owner_out is not None:
+        owner_out.clear()
+
+    def record_owner(proc) -> None:
+        if owner_out is not None and proc is not None:
+            try:
+                owner_out.update(pid=proc.pid, created=proc.create_time())
+            except Exception:
+                owner_out.clear()
+
     if not procs:
         return False, None
     active = False
+    any_owner = None
+    wrapper_owner = None
     wrapper_cmdline = None  # fallback when no real tool grandchild is caught
     try:
         import psutil
@@ -1048,12 +1670,16 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
                             # is also alive (a cleaner, bare cmdline).
                             cmd = ch.cmdline()
                             active = True
+                            any_owner = p
                             if cmd:
                                 wrapper_cmdline = cmd
+                                wrapper_owner = p
                             continue
                         cmdline = ch.cmdline()
                         active = True
+                        any_owner = p
                         if cmdline:
+                            record_owner(p)
                             return True, cmdline
                     except psutil.AccessDenied:
                         # A readable matching name still proves existence when
@@ -1072,7 +1698,9 @@ def shell_child_activity(procs) -> tuple[bool, list[str] | None]:
         # Keep what we already proved -- the old bool function returned
         # True the instant it matched, so a broken process object later
         # in the list could never undo it.
+        record_owner(wrapper_owner or any_owner)
         return active, wrapper_cmdline
+    record_owner(wrapper_owner or any_owner)
     return active, wrapper_cmdline
 
 
@@ -1100,6 +1728,129 @@ def latest_shell_child_cmdline(procs) -> list[str] | None:
     Kept as a named function for the same seam reason as its sibling.
     """
     return shell_child_activity(procs)[1]
+
+
+# Claude Code's Bash tool runs each command in a wrapper shell that is a
+# DIRECT child of `claude` and lives for the whole command (confirmed live):
+#   <shell> -c 'source ~/.claude/shell-snapshots/snapshot-... && ...
+#              && eval '<CMD>' < /dev/null && pwd -P >| ...'
+# Either marker identifies it; see observer._EVAL_RE for the eval shape.
+_CLAUDE_SHELL_SNAPSHOT_MARKER = "/shell-snapshots/snapshot-"
+_CLAUDE_EVAL_MARKERS = ("eval '", "< /dev/null")
+
+
+def _is_claude_bash_tool_wrapper(cmdline: list[str]) -> bool:
+    script = " ".join(cmdline[1:])
+    return (_CLAUDE_SHELL_SNAPSHOT_MARKER in script
+            or all(m in script for m in _CLAUDE_EVAL_MARKERS))
+
+
+def claude_newest_tool_shell_start(procs) -> float | None:
+    """Start time of the newest Bash-tool call still running under the given
+    `claude` processes, or None if there is none (or it cannot be read).
+
+    Self-heal's evidence that a pending prompt was answered (2026-09-30): a
+    tool call that STARTED after the prompt was raised -- Claude is blocked
+    at the prompt until it is answered. Only direct-child wrapper shells
+    carrying the Bash-tool signature count, which rules out everything that
+    is merely new-looking: grandchildren of an older tool call (a background
+    loop's `sleep`, a forked subshell -- which carries its parent's exact
+    argv), periodically re-spawned helpers (caffeinate), MCP servers, and
+    hooks run via `sh -c`.
+
+    NOT attributable on its own: a subagent's Bash is ALSO a direct child of
+    the parent `claude`, so self-heal vets this evidence against the
+    session's helper activity (claude_session_newest_helper_write,
+    SELF_HEAL_HELPER_QUIET_SEC) before citing it.
+
+    Accepted limitation (round 2, 2026-09-30 review P1-1): only Bash leaves
+    this evidence. An approved NON-Bash tool (an MCP call, Task/Agent,
+    WebFetch) runs in-process: no wrapper shell, and no transcript entry
+    until its result -- and no hook fires when a prompt is APPROVED, only
+    when the tool finishes (PostToolUse / PostToolUseFailure) or is denied.
+    So after approving one, the wave (approval_needed takes prime over the
+    cascade) stays until that tool's PostToolUse, even if it runs for
+    minutes; before 2026-09-30 working/thinking cleared it after
+    SELF_HEAL_MIN_FLAG_AGE_SEC. Kept deliberately: every signal that could
+    mark it (activity, streaming, input events) also occurs while Claude is
+    blocked at the prompt -- the very bug this fixes -- and a stuck wave
+    during a slow approved call is the safe direction.
+
+    Cost: one non-recursive children() per process, plus name(), and
+    cmdline() for wrapper shells only. psutil has no native ppid_map on
+    macOS, so children() still reads every pid's ppid -- measured ~11 ms
+    with ~470 processes, the same as the detector's per-tick tree walk.
+    Self-heal therefore calls it only while a flag is pending past
+    SELF_HEAL_MIN_FLAG_AGE_SEC during working/thinking with one `claude`
+    alive, and then at most once per SELF_HEAL_EVIDENCE_REFRESH_SEC (see
+    StateMachine._self_heal_tool_start) -- that window can last as long as
+    the prompt stays unanswered. Reads the cmdline only to test for the two
+    markers above; nothing is stored or logged. Best-effort: any failure
+    means "no evidence" (never heal on a guess)."""
+    newest: float | None = None
+    for p in procs:
+        try:
+            children = p.children()
+        except Exception:
+            continue
+        for ch in children:
+            try:
+                if (ch.name() or "").lower() not in SHELL_WRAPPER_NAMES:
+                    continue
+                if not _is_claude_bash_tool_wrapper(ch.cmdline()):
+                    continue
+                started = float(ch.create_time())
+            except Exception:
+                continue
+            if newest is None or started > newest:
+                newest = started
+    return newest
+
+
+def claude_session_newest_helper_write(session_id: str) -> float | None:
+    """Newest mtime of this session's subagent transcripts
+    (<CLAUDE_PROJECTS_DIR>/<enc>/<session_id>/subagents/agent-*.jsonl, the
+    layout ClaudeCodeDetector globs), None if it has none, or +inf if they
+    could not be read.
+
+    Round 2 (2026-09-30 review P1-2): a helper writes its tool_use entry
+    before its Bash starts, so a helper that owns a Bash call newer than a
+    flag wrote its transcript no earlier than (tool start - the PreToolUse
+    gap); see SELF_HEAL_HELPER_QUIET_SEC. Unlike the process evidence,
+    failure here must BLOCK a heal ("could not tell" is not "no helper"):
+    only a missing dir means no helpers. Assumes helpers keep that layout
+    (confirmed live, 2.1.282-2.1.284); a helper transcript stored elsewhere
+    would go unseen, as before round 2.
+
+    Cost: one scandir of the projects root plus a failed scandir per project
+    dir, and one stat per helper transcript of this session. Called only by
+    self-heal once it already holds new-tool-call evidence, and throttled
+    with it (StateMachine._self_heal_helper_write). Paths and mtimes only --
+    no transcript is opened."""
+    newest: float | None = None
+    try:
+        with os.scandir(CLAUDE_PROJECTS_DIR) as projects:
+            for enc in projects:
+                sub = os.path.join(enc.path, session_id, "subagents")
+                try:
+                    it = os.scandir(sub)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                with it:
+                    for e in it:
+                        if not (e.name.startswith("agent-")
+                                and e.name.endswith(".jsonl")):
+                            continue
+                        try:
+                            m = e.stat().st_mtime
+                        except FileNotFoundError:
+                            continue
+                        newest = m if newest is None else max(newest, m)
+    except FileNotFoundError:
+        return newest
+    except OSError:
+        return float("inf")
+    return newest
 
 
 class StateMachine:
@@ -1199,6 +1950,17 @@ class StateMachine:
         # Hold "working" for working_hold_sec between tool calls
         # so Squid does not flicker to "thinking" in LLM-gen gaps.
         self.working_hold_until = 0.0
+        # Keep the exact owner that caused the working stretch available
+        # through the short hold after its shell child exits. Without this,
+        # a double-click during that generation gap can lose provenance and
+        # return no destination even though the agent is still active.
+        self._working_focus_target: dict | None = None
+        self._work_seconds: float = 0.0
+        self._work_clock_last_at: float | None = None
+        self._work_session_open: bool = False
+        self._work_clock_billable: bool = False
+        self._work_signal_agents: frozenset[str] = frozenset()
+        self._approval_pending_agents: frozenset[str] = frozenset()
         # Pink-2026-09-04: awake hold. A wake -- poke, sprint, or the
         # 15-min periodic auto-wake -- used to live entirely in PetApi
         # (wake_trigger_seq + user_wake_until), which only the frontend
@@ -1221,6 +1983,15 @@ class StateMachine:
         # episode (see the approval-needed block in compute()).
         self._approval_alert_fired: bool = False
         self._approval_alert_at: float = 0.0
+        # Round 3: flag mtime per Claude session as of the last alert. An
+        # advance past it (a new prompt added to a flag that never went away)
+        # fires a fresh alert; see _CLAUDE_SESSION_FLAG_MTIME.
+        self._approval_alert_mtimes: dict[str, float] = {}
+        # 2026-09-30: (read_at, tool_start, {sid: newest helper write}) --
+        # the throttled self-heal evidence; see SELF_HEAL_EVIDENCE_REFRESH_SEC.
+        # The helper reads are dropped with the process read they vet.
+        self._self_heal_evidence: tuple[
+            float, float | None, dict[str, float | None]] | None = None
 
 
     _AGENT_ACTIVE_STATES = frozenset({
@@ -1252,6 +2023,9 @@ class StateMachine:
         st = self._compute_inner()
         now = time.time()
         self._track_agent_idle(st, now)
+        # Prune tty entries crashed sessions leaked -- this dir is read only by
+        # exact key, never listed, so it has no read-time prune of its own.
+        sweep_stale_session_ttys(now)
 
         # Approval-needed is layered on AFTER the cascade, from Claude Code's
         # and Codex's own hook-written flag files. It OVERRIDES whatever the
@@ -1259,9 +2033,13 @@ class StateMachine:
         # Aggregate activity cannot prove which permission/question resolved.
         # Only the correlated hook lifecycle, snooze, or expiry may clear waits.
         awaiting_sessions_raw = claude_sessions_awaiting_input()
+        awaiting_sessions_raw = self._self_heal_stale_claude_flags(
+            st, now, awaiting_sessions_raw)
+        self._apply_failure_override(st, now)
         self._apply_approval_override(
             st, now, awaiting_sessions_raw, notify=notify)
         self._apply_force_state_override(st)
+        self._update_work_clock(st, now)
         return st
 
     # ── compute() helpers (extracted for readability + unit testing) ──
@@ -1284,6 +2062,192 @@ class StateMachine:
             st.agent_idle_seconds = 0.0
             self._agent_idle_since = 0.0
         self._last_state = st.state
+
+    def _update_work_clock(self, st: PetState, now: float) -> None:
+        """Accumulate active Claude/Codex wall time, pausing for approval.
+
+        The previous sample owns the interval that just elapsed. This avoids
+        charging an approval wait when the next sample sees that approval has
+        cleared, and also avoids losing the work interval when a wait starts.
+        Raw pending approval markers pause only their own agent, so a second
+        concurrent agent can continue contributing time.
+        """
+        previous = self._work_clock_last_at
+        self._work_clock_last_at = now
+        pending = self._approval_pending_agents
+        billable = bool(self._work_signal_agents - pending)
+        if previous is None:
+            self._work_session_open = billable
+            self._work_clock_billable = billable
+            st.work_seconds = self._work_seconds
+            return
+        delta = max(0.0, now - previous)
+        if self._work_clock_billable and self._work_session_open:
+            self._work_seconds += delta
+        if billable:
+            self._work_session_open = True
+        elif pending and self._work_session_open:
+            # Preserve the accumulated session while an approval is pending,
+            # even after its agent's active-turn signal goes quiet.
+            pass
+        else:
+            self._work_session_open = False
+            self._work_seconds = 0.0
+        self._work_clock_billable = billable
+        st.work_seconds = round(self._work_seconds, 3)
+
+    def _self_heal_stale_claude_flags(
+        self, st: PetState, now: float, awaiting_sessions_raw: list
+    ) -> list:
+        """Clear a Claude Code awaiting-input flag that a hook failed to clear,
+        returning the (possibly re-scanned) awaiting list."""
+        # ── STALE-FLAG SELF-HEAL ─────────────────────────────────────
+        # Pink-2026-08-27, real bug caught via live use: Claude Code's
+        # Notification hook fires permission_prompt and we
+        # latch a flag file, but if Claude resumes work WITHOUT the user
+        # submitting a fresh top-level prompt (approval granted some
+        # other way, auto-mode proceeding on its own, a multi-step
+        # agentic task continuing unattended), UserPromptSubmit/
+        # SessionEnd never fires to clear it -- the flag (and the wave +
+        # OS notification) stays stuck showing "your turn" even while
+        # you're actively watching it work.
+        #
+        # Self-heal: our OWN independently-verified activity signal
+        # (st.state == working/thinking -- nothing to do with the hook)
+        # gates it. Coarse -- aggregate across all Claude Code processes,
+        # not per-session, since the hook payload carries no PID to
+        # disambiguate which session is the one now active -- but far
+        # better than trusting a hook event that may simply never fire.
+        #
+        # Pink-2026-08-30: that coarseness has a real failure mode with
+        # multiple concurrent Claude Code sessions -- caught live: session
+        # A asked for a decision and was genuinely waiting, but session B
+        # (a different window, actively being used) was "working", so
+        # self-heal cleared session A's flag before approval_needed ever
+        # got a chance to fire (attention_needed should take PRIME, not
+        # get silently eaten). With 2+ processes alive there's no way to
+        # tell whose activity resolved whose wait, so self-heal now only
+        # runs when at most one Claude Code process is alive -- the exact
+        # single-session case ("you're actively watching it work",
+        # singular) it was designed for.
+        #
+        # 2026-09-30: "working/thinking" alone is NOT proof either --
+        # caught live twice in one day. A long turn had earlier background
+        # tool calls still running (detached test runs, `while kill -0 ...;
+        # do sleep` wait loops); they kept the cascade on "working" ("shell
+        # child active (claude_code)") while Claude sat blocked at a
+        # permission prompt / AskUserQuestion, so the flag was deleted
+        # SELF_HEAL_MIN_FLAG_AGE_SEC after it was raised: one OS alert,
+        # then no wave (the hook log's next PostToolUse found "no flag"
+        # although no hook had cleared it). Streaming is no better: a
+        # background subagent keeps writing its transcript while the parent
+        # is blocked. Evidence must be NEWER than the flag and imply the
+        # wait ended: a Bash-tool call that STARTED after the flag's mtime
+        # (claude_newest_tool_shell_start) -- Claude cannot start one while
+        # blocked at the prompt. That still covers the case self-heal was
+        # built for, an approved long-running command whose PostToolUse has
+        # not fired yet; the hook's own PostToolUse / PostToolUseFailure /
+        # PermissionDenied / Stop / UserPromptSubmit clears cover the rest.
+        #
+        # Round 2 (review P1-2): a helper's Bash is ALSO a direct child of
+        # the parent `claude`, so a background subagent starting a command
+        # after the parent's prompt looked like that proof. The evidence is
+        # now discounted whenever one of the session's subagent transcripts
+        # was written since flag mtime - SELF_HEAL_HELPER_QUIET_SEC (a
+        # helper writes its tool_use before its Bash starts): a session with
+        # a recently active helper gets no Bash self-heal, and its flag
+        # waits for the hook's own clears -- the safe direction. Accepted
+        # limitation (P1-1): an approved NON-Bash tool leaves no evidence;
+        # see claude_newest_tool_shell_start.
+        #
+        # The evidence (a full process-table read on macOS, ~11 ms) is
+        # fetched lazily, at most once a tick and once per
+        # SELF_HEAL_EVIDENCE_REFRESH_SEC, and only when some flag is past
+        # the too-fresh guard -- never on the common path (nothing
+        # awaiting, or not working/thinking).
+        if (st.state in ("working", "thinking") and awaiting_sessions_raw):
+            procs = find_claude_code_processes()
+            if len(procs) > 1:
+                return awaiting_sessions_raw
+            healed: set[str] = set()
+            tool_start: float | None = None
+            evidence_read = False
+            try:
+                for sid in awaiting_sessions_raw:
+                    path = os.path.join(CLAUDE_AWAITING_INPUT_DIR, sid)
+                    try:
+                        mtime = os.stat(path).st_mtime
+                    except OSError:
+                        continue
+                    if now - mtime < SELF_HEAL_MIN_FLAG_AGE_SEC:
+                        continue  # too fresh -- let it be seen at least once
+                    if not evidence_read:
+                        tool_start = self._self_heal_tool_start(procs, now)
+                        evidence_read = True
+                    if tool_start is None or tool_start <= mtime:
+                        continue  # nothing started since the prompt was raised
+                    helper_write = self._self_heal_helper_write(sid)
+                    if (helper_write is not None and helper_write
+                            >= mtime - SELF_HEAL_HELPER_QUIET_SEC):
+                        continue  # the new tool call may be a helper's
+                    if _self_heal_unlink_single_owner_flag(
+                            path, now, evidence_after=tool_start,
+                            helper_write=helper_write):
+                        _CLAUDE_SESSION_FLAG_FIRST_SEEN.pop(sid, None)
+                        healed.add(sid)
+            except Exception:
+                pass
+            if healed:
+                awaiting_sessions_raw = [
+                    s for s in awaiting_sessions_raw if s not in healed]
+        return awaiting_sessions_raw
+
+    def _self_heal_tool_start(self, procs, now: float) -> float | None:
+        """claude_newest_tool_shell_start, re-read at most once per
+        SELF_HEAL_EVIDENCE_REFRESH_SEC. A cached value can only be OLDER
+        than the truth (a tool call started since is missed until the next
+        read), so the worst case is a later heal, never a wrong one: it is
+        still compared against each flag's current mtime, here and again
+        under the hook's lock."""
+        cached = self._self_heal_evidence
+        if (cached is not None
+                and 0.0 <= now - cached[0] < SELF_HEAL_EVIDENCE_REFRESH_SEC):
+            return cached[1]
+        tool_start = claude_newest_tool_shell_start(procs)
+        self._self_heal_evidence = (now, tool_start, {})
+        return tool_start
+
+    def _self_heal_helper_write(self, sid: str) -> float | None:
+        """claude_session_newest_helper_write for `sid`, cached alongside the
+        CURRENT process read and read only after it (call
+        _self_heal_tool_start first). That order is load-bearing: every Bash
+        in the process snapshot had already written its tool_use when the
+        snapshot was taken, so a helper read taken later sees it. A stale
+        helper read is the UNSAFE direction (it can miss a helper), which is
+        why it never outlives the process read it vets."""
+        cached = self._self_heal_evidence
+        if cached is None:
+            return float("inf")  # no process read to vet: never heal
+        helpers = cached[2]
+        if sid not in helpers:
+            helpers[sid] = claude_session_newest_helper_write(sid)
+        return helpers[sid]
+
+    def _claude_alert_rearmed(self, awaiting_sessions: list[str]) -> bool:
+        """True if a Claude session already covered by the current alert has
+        had its flag mtime advance since (a new prompt added). Sessions first
+        seen while latched are recorded, not alerted (unchanged behaviour)."""
+        rearmed = False
+        for sid in awaiting_sessions:
+            mtime = _CLAUDE_SESSION_FLAG_MTIME.get(sid)
+            if mtime is None:
+                continue
+            seen = self._approval_alert_mtimes.get(sid)
+            if seen is None:
+                self._approval_alert_mtimes[sid] = mtime
+            elif mtime > seen:
+                rearmed = True
+        return rearmed
 
     def _apply_approval_override(
         self, st: PetState, now: float, awaiting_sessions_raw: list,
@@ -1308,13 +2272,24 @@ class StateMachine:
         except Exception:
             _enabled, _sound, _text = True, "Glass", "your turn"
 
+        # Pause accounting from the raw hook markers, independently of the
+        # notification eligibility/snooze policy below. A user may dismiss
+        # the wave while the underlying permission request is still pending.
+        codex_waits_raw = codex_requests_awaiting_input()
+        pending_agents = set()
+        if awaiting_sessions_raw:
+            pending_agents.add("claude")
+        if codex_waits_raw:
+            pending_agents.add("codex")
+        self._approval_pending_agents = frozenset(pending_agents)
+
         # Pink-2026-08-26: no engagement gate needed (see
         # filter_eligible_claude_sessions's docstring for why).
         awaiting_sessions = filter_eligible_claude_sessions(
             awaiting_sessions_raw if _enabled else []
         )
         codex_waits = filter_eligible_codex_requests(
-            codex_requests_awaiting_input() if _enabled else [])
+            codex_waits_raw if _enabled else [])
         fired_reason: str | None = None
         if awaiting_sessions:
             fired_reason = ("awaiting_input flag from Claude Code session(s) "
@@ -1330,23 +2305,96 @@ class StateMachine:
             st.state = "approval_needed"
             st.message = _text
             st.state_reason = fired_reason
-            # Fire OS notification ONCE per idle cycle
-            if not self._approval_alert_fired:
+            st.focus_target = {"agent": "claude"}
+            if codex_waits:
+                try:
+                    request = max(codex_waits, key=lambda name: os.stat(os.path.join(CODEX_AWAITING_INPUT_DIR, name)).st_mtime)
+                    st.focus_target = {"agent": "codex", "request": request}
+                except OSError:
+                    st.focus_target = None
+            # Fire OS notification ONCE per idle cycle -- or again when a
+            # new prompt is added to a flag that never went away (round 3).
+            rearmed = self._claude_alert_rearmed(awaiting_sessions)
+            if not self._approval_alert_fired or rearmed:
                 self._approval_alert_fired = True
                 self._approval_alert_at = now
+                self._approval_alert_mtimes = {
+                    sid: _CLAUDE_SESSION_FLAG_MTIME[sid]
+                    for sid in awaiting_sessions
+                    if sid in _CLAUDE_SESSION_FLAG_MTIME}
                 _sound_label = _sound if _sound else "off"
                 log.info("approval alert fired (%s, sound=%s)", fired_reason, _sound_label)
                 if notify:
+                    token = object()
+                    self._approval_notification_token = token
+                    claude_episode = set(awaiting_sessions)
+                    codex_episode = set(codex_waits)
+
+                    def still_pending() -> bool:
+                        # Re-read direct signals before dispatch, not a stale state snapshot.
+                        return (self._approval_notification_token is token and bool(
+                            claude_episode.intersection(claude_sessions_awaiting_input())
+                            or codex_episode.intersection(codex_requests_awaiting_input())))
+
                     if codex_waits:
                         source = "Claude Code and Codex" if awaiting_sessions else "Codex"
-                        _fire_approval_notification(_text, _sound, source_label=source)
+                        _fire_approval_notification(_text, _sound, source_label=source,
+                                                    still_pending=still_pending)
                     else:
-                        _fire_approval_notification(_text, _sound)
+                        _fire_approval_notification(_text, _sound, still_pending=still_pending)
         else:
             # No alert is fired this tick. Reset the OS-notification latch
             # so the next genuine alert (after Pink replies + new response)
             # gets a fresh ping.
             self._approval_alert_fired = False
+            self._approval_notification_token = None
+            self._approval_alert_mtimes = {}
+
+    def _apply_failure_override(self, st: PetState, now: float) -> None:
+        # ── CONCERNED OVERRIDE (Pink-2026-09-16) ─────────────────────
+        # Claude Code's StopFailure hook reported the current turn ended on
+        # an API error (usage/rate limit, overload, auth/billing, ...).
+        # Layer "concerned" over whatever the cascade picked, from the
+        # hook-written flag file -- the same override shape as
+        # approval_needed, and applied JUST BEFORE it so a genuine pending
+        # approval still wins (an errored turn and a pending permission
+        # prompt are near-mutually-exclusive, but approval stays the prime
+        # "act now" state). Never inferred from silence: only a real
+        # StopFailure flag or explicit Codex failed-turn row reaches here.
+        # A dblclick "I saw it" (acknowledge_concern -> dismiss_concern)
+        # snoozes this override for CONCERN_DISMISS_SEC.
+        if now < _concern_dismissed_until:
+            return
+        claude_hit = claude_freshest_failure_with_session(now)
+        error_type = claude_hit[0] if claude_hit else None
+        source = "claude StopFailure"
+        # Pink-2026-09-24: name the source of the concern so take-me-there
+        # follows THIS override rather than inheriting the underlying state's
+        # target (e.g. a Codex working owner) and raising the wrong window.
+        # Carry the EXACT failing session id, so a second session failing
+        # before the double-click cannot move focus to its newer flag.
+        focus_target: dict | None = (
+            {"agent": "claude", "session": claude_hit[1]} if claude_hit
+            else {"agent": "claude"})
+        # Preserve Claude priority; only consult Codex when its detector is
+        # enabled. The process may already have exited after the failure.
+        if (error_type is None and self._codex_detector is not None
+                and getattr(self._codex_detector, "enabled", False)):
+            error_type = codex_freshest_failure(now)
+            source = "codex failed turn"
+            # A Codex failed-turn row carries no reliable process owner, so
+            # there is no session to raise; focus_for_snapshot falls through
+            # to "resting" rather than guessing a window.
+            focus_target = None
+        if error_type is None:
+            return
+        reason, severity = concern_for_error_type(error_type)
+        st.state = "concerned"
+        st.concern_reason = reason
+        st.concern_severity = severity
+        st.state_reason = f"{source} ({error_type})"
+        st.message = f"⚠️ {reason}"
+        st.focus_target = focus_target
 
     def _apply_force_state_override(self, st: PetState) -> None:
         # ── FORCE-STATE OVERRIDE (test/demo) ─────────────────────────
@@ -1362,6 +2410,7 @@ class StateMachine:
                 _forced = _force_file.read_text().strip()
                 if _forced:
                     st.state = _forced
+                    st.focus_target = None
                     st.state_reason = "force_state override (" + _forced + ")"
         except Exception:
             pass
@@ -1442,6 +2491,73 @@ class StateMachine:
             codex_streaming = False
             codex_celebrating = False
 
+        from .codex_approvals import digest
+        from .codex_turns import active_turns
+        codex_turn_records = active_turns(now) if codex_running else []
+        codex_turn_active = bool(codex_turn_records)
+        turn_in_flight = claude_turn_in_flight(now)
+        try:
+            from . import config as _work_cfg
+            _turn_stall = float(_work_cfg.get(
+                "turn_stall_sec", TURN_STALL_SEC_DEFAULT))
+        except Exception:
+            _turn_stall = TURN_STALL_SEC_DEFAULT
+        # A turn marker is useful evidence only while its owning detector is
+        # enabled/running and its transcript heartbeat is still inside the
+        # same stall boundary used by the visible thinking branch. This keeps
+        # usage-limit and exited-session markers from accruing work forever.
+        claude_turn_active = bool(
+            claude is not None and claude.enabled and claude_running
+            and turn_in_flight and claude_transcript_age <= _turn_stall
+        )
+
+        def codex_target(record) -> dict | None:
+            if not record:
+                return None
+            return {"agent": "codex", "owner": {"pid": record['pid'], "created": record['created']}}
+
+        def _claude_focus_session() -> str | None:
+            # A2 (2026-09-24): the owning session id derived from the live
+            # transcript path, so "take me there" can resolve the right tab
+            # even when a background subagent is driving the state after the
+            # parent's Stop cleared the turn-active flag (which the turn_active
+            # signal dir would otherwise have named). For a subagent transcript
+            # this is the PARENT session -- see
+            # detectors.claude_session_id_from_transcript.
+            from .detectors import claude_session_id_from_transcript
+            return claude_session_id_from_transcript(
+                getattr(claude, 'transcript_path', None))
+
+        def streaming_target() -> dict | None:
+            if claude_streaming:
+                target: dict = {"agent": "claude"}
+                sid = _claude_focus_session()
+                if sid:
+                    target["session"] = sid
+                return target
+            path = getattr(codex, 'transcript_path', None)
+            matches = [r for r in codex_turn_records if path and r.get('transcript_key') == digest(path)]
+            owners = {(r['pid'], r['created']) for r in matches}
+            return codex_target(matches[0]) if len(owners) == 1 else None
+
+        def working_target() -> dict | None:
+            detector = claude if claude_shell_active else codex if codex_shell_active else None
+            owner = getattr(detector, 'shell_owner', None)
+            if not owner:
+                return None
+            # finding 2 (2026-09-24): the shell OWNER is authoritative for a
+            # working target -- it is the exact process running the tool
+            # subprocess. Deliberately NOT stamped with a transcript-derived
+            # session here: the newest transcript can belong to a DIFFERENT
+            # session than the one running the shell (session A runs a command
+            # while session B has the freshest transcript), and attaching B's
+            # session would make focus raise B's tab. The transcript-derived
+            # session is only trustworthy where the transcript IS the winning
+            # source -- see streaming_target. A helper's Bash runs as a child of
+            # the PARENT claude process, so this owner already maps to the right
+            # terminal via its parent chain (focus._focus_claude_state).
+            return {"agent": "claude" if claude_shell_active else "codex", "owner": dict(owner)}
+
         # Merged signals feeding branch 4 below.
         #
         # working_evidence_merged covers two kinds of "hard" evidence a
@@ -1456,6 +2572,16 @@ class StateMachine:
             or claude_file_active or codex_file_active
         )
         streaming_merged = claude_streaming or codex_streaming
+        work_signal_agents: set[str] = set()
+        if (claude is not None and claude.enabled and claude_running
+                and (claude_shell_active or claude_file_active or claude_streaming
+                     or claude_turn_active)):
+            work_signal_agents.add("claude")
+        if (codex is not None and codex.enabled and codex_running
+                and (codex_shell_active or codex_file_active or codex_streaming
+                     or codex_turn_active)):
+            work_signal_agents.add("codex")
+        self._work_signal_agents = frozenset(work_signal_agents)
 
         def _working_reason() -> str:
             """Which agent's hard evidence (shell/file) earns credit in
@@ -1559,7 +2685,6 @@ class StateMachine:
         # when anything held for the boundary is released. Doing this here,
         # before any branch runs, means every branch below sees a
         # consistent view of "which turn are we in".
-        turn_in_flight = claude_turn_in_flight(now)
         try:
             from . import config as _cfg2
             _celebrate_hold = float(_cfg2.get(
@@ -1609,6 +2734,7 @@ class StateMachine:
             st.state = "celebrating"
             if claude_task_complete:
                 st.state_reason = "claude celebrating"
+                st.focus_target = {"agent": "claude"}
             elif codex_celebrating:
                 st.state_reason = "codex celebrating"
             elif _other_celebrates and other_celebrating_name():
@@ -1638,6 +2764,7 @@ class StateMachine:
         ):
             st.state = "grooving"
             st.state_reason = "claude grooving" if claude_grooving_now else "creative burst"
+            st.focus_target = {"agent": "claude"} if claude_grooving_now else None
             st.message = "🤸 creative burst"
             return st
 
@@ -1651,6 +2778,7 @@ class StateMachine:
         if claude is not None and claude.enabled and claude_sessions_recapping():
             st.state = "thinking"
             st.state_reason = "claude recapping"
+            st.focus_target = {"agent": "claude"}
             st.message = "📝 recapping..."
             return st
 
@@ -1662,10 +2790,8 @@ class StateMachine:
             try:
                 from . import config as _cfg
                 _work_hold = float(_cfg.get('working_hold_sec', 25))
-                _turn_stall = float(_cfg.get('turn_stall_sec', TURN_STALL_SEC_DEFAULT))
             except Exception:
                 _work_hold = 25.0
-                _turn_stall = TURN_STALL_SEC_DEFAULT
             # 4a. WORKING -- actively running tool / shell command, or a
             # project file was just written (catches in-process
             # Edit/Write/apply_patch calls that never spawn a
@@ -1674,6 +2800,12 @@ class StateMachine:
                 self.working_hold_until = now + _work_hold
                 st.state = "working"
                 st.state_reason = _working_reason()
+                target = working_target()
+                if target is not None:
+                    self._working_focus_target = target
+                else:
+                    self._working_focus_target = None
+                st.focus_target = target
                 st.message = "🛠️ running shell"
                 return st
             # 4a-prime: STICKY WORKING -- LLM-gen gap, recent work + still busy.
@@ -1682,6 +2814,12 @@ class StateMachine:
             ):
                 st.state = "working"
                 st.state_reason = f"working hold ({int(self.working_hold_until - now)}s left)"
+                target = streaming_target()
+                if target is not None:
+                    self._working_focus_target = target
+                elif self._last_state != "working":
+                    self._working_focus_target = None
+                st.focus_target = target or self._working_focus_target
                 st.message = "✨ working"
                 return st
             # 4b. THINKING -- Claude Code's / Codex's transcript-write-
@@ -1689,6 +2827,13 @@ class StateMachine:
             if streaming_merged:
                 st.state = "thinking"
                 st.state_reason = _streaming_reason()
+                st.focus_target = streaming_target()
+                st.message = "🤔 thinking"
+                return st
+            if codex_turn_active:
+                st.state = "thinking"
+                st.state_reason = "codex turn in flight"
+                st.focus_target = codex_target(max(codex_turn_records, key=lambda r: (r['updated'], r['key'])))
                 st.message = "🤔 thinking"
                 return st
             # 4c. THINKING (turn in flight) -- the hook bracket says Claude
@@ -1717,6 +2862,7 @@ class StateMachine:
             ):
                 st.state = "thinking"
                 st.state_reason = "claude turn in flight"
+                st.focus_target = {"agent": "claude"}
                 st.message = "🤔 thinking"
                 return st
 
@@ -1756,10 +2902,15 @@ def _applescript_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _fire_approval_notification(text: str, sound: str, source_label: str = "Claude Code") -> None:
+def _fire_approval_notification(
+    text: str, sound: str, source_label: str = "Claude Code", *,
+    still_pending: Callable[[], bool] | None = None,
+) -> None:
     """Fire a macOS notification banner in a background thread.
 
-    Runs in ~50ms so we do not block the watcher loop. Silent on failure
+    Revalidates the originating wait before dispatch and fallback. macOS owns
+    banner delivery after submission; AppleScript cannot retract that queue.
+    Runs off the watcher loop. Silent on failure
     (notification is supplementary; the bubble is the primary signal).
 
     source_label names which agent is actually waiting (Claude Code or Codex); kept
@@ -1784,7 +2935,15 @@ def _fire_approval_notification(text: str, sound: str, source_label: str = "Clau
     import subprocess
     import threading
 
+    def valid() -> bool:
+        try:
+            return still_pending is None or still_pending()
+        except Exception:
+            return False  # Never send an alert we cannot establish is current.
+
     def _go():
+        if not valid():
+            return
         title = "Squid"
         body = source_label + ": " + text
         notifier = shutil.which("terminal-notifier")
@@ -1800,11 +2959,15 @@ def _fire_approval_notification(text: str, sound: str, source_label: str = "Clau
             if bundle_id:
                 cmd += ["-activate", bundle_id]
             try:
+                if not valid():
+                    return
                 subprocess.run(cmd, timeout=3, capture_output=True)
                 return
             except Exception as e:
                 log.warning("terminal-notifier failed, falling back to osascript: %s", e)
         try:
+            if not valid():
+                return
             body_escaped = _applescript_escape(body)
             sound_clause = (
                 ' sound name "' + _applescript_escape(sound) + '"' if sound else ""

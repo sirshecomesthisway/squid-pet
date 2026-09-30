@@ -10,8 +10,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   test:
+    timeout-minutes: 15
     # squid-pet is a macOS desktop app (PyObjC / pywebview / Quartz), so the
     # test suite must run on real macOS -- the Cocoa frameworks the modules
     # import at load time do not exist on Linux runners.
@@ -37,10 +41,16 @@ jobs:
         run: uv sync --python ${{ matrix.python-version }} --dev --frozen
 
       - name: Lint (ruff)
-        run: uv run --python ${{ matrix.python-version }} ruff check src/ scripts/ tools/ tests/
+        run: uv run --frozen --python ${{ matrix.python-version }} ruff check .
 
       - name: Type-check (mypy)
-        run: uv run --python ${{ matrix.python-version }} mypy --config-file pyproject.toml
+        run: uv run --frozen --python ${{ matrix.python-version }} mypy --config-file pyproject.toml
 
       - name: Test (pytest)
-        run: uv run --python ${{ matrix.python-version }} pytest
+        run: uv run --frozen --python ${{ matrix.python-version }} pytest
+
+      - name: Verify sprite assets
+        run: uv run --frozen --python ${{ matrix.python-version }} python tools/verify_sprites.py
+
+      - name: Audit Cocoa main-thread calls
+        run: uv run --frozen --python ${{ matrix.python-version }} python scripts/check_cocoa_main_thread.py src/squid_pet/*.py

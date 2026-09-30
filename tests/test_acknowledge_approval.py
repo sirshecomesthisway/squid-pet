@@ -148,3 +148,54 @@ def test_acknowledge_does_not_publish_bubble_when_observer_returns_none(monkeypa
     # Calm is still scheduled even when there's no bubble to show.
     assert len(fake.instances) == 1
 
+
+# ── acknowledge_concern (Pink-2026-09-16): dblclick while state=="concerned"
+# is "I saw the error" -- calm the worried face, same shape as
+# acknowledge_approval. Focusing the errored terminal lives in take_me_there
+# (called for every active state), so this only calms. Uses a dismiss-snooze
+# rather than deleting the failed flag, so the same gesture's take_me_there
+# can still resolve the session. ─────────────────────────────────────────
+def test_acknowledge_concern_noop_when_not_concerned(monkeypatch):
+    from squid_pet import watcher as _w
+    dismiss = MagicMock()
+    monkeypatch.setattr(_w, "dismiss_concern", dismiss)
+
+    api = _make_api()
+    api._latest = PetState(state="working")
+
+    result = api.acknowledge_concern()
+
+    assert result == {"status": "not-concerned", "bubble": None}
+    dismiss.assert_not_called()
+    api._observer.on_interaction.assert_not_called()
+
+
+def test_acknowledge_concern_calms_and_dismisses(monkeypatch):
+    from squid_pet import watcher as _w
+    dismiss = MagicMock()
+    monkeypatch.setattr(_w, "dismiss_concern", dismiss)
+    fake = _patch_timer(monkeypatch)
+
+    api = _make_api()
+    api._latest = PetState(state="concerned")
+    api._observer.on_interaction.return_value = "phew"
+
+    result = api.acknowledge_concern()
+
+    # Bubble + return value land immediately.
+    assert result == {"status": "calmed", "bubble": "phew"}
+    api._observer.on_interaction.assert_called_once_with("like")
+    assert api._pending_bubble == "phew"
+
+    # Mirrors acknowledge_approval: the dismiss is deferred by
+    # ACKNOWLEDGE_DISMISS_DELAY_SEC, so the worried face lingers a beat.
+    dismiss.assert_not_called()
+    assert len(fake.instances) == 1
+    timer = fake.instances[0]
+    assert timer.delay == ACKNOWLEDGE_DISMISS_DELAY_SEC
+    assert timer.started is True
+
+    # Simulate the timer firing after the delay.
+    timer.fn()
+    dismiss.assert_called_once()
+

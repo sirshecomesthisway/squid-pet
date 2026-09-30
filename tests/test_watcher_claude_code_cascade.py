@@ -705,3 +705,149 @@ def test_turn_stall_sec_is_config_tunable(monkeypatch, tmp_path):
     # 60s silent > 30s configured stall -> idle
     st = sm.compute()
     assert st.state == "idle"
+
+
+# ── subagent (Task-tool helper) transcripts keep her out of idle (2026-09-24) ─
+# A helper writes its OWN transcript under <enc>/<session_id>/subagents/ while
+# the parent's stays quiet. Because ClaudeCodeDetector now globs those too,
+# transcript_age / streaming reflect helper activity through the SAME cascade
+# (no new state). See _default_claude_transcript_glob and detectors.py.
+def _machine_with_transcripts(monkeypatch, mtimes, *, turn_active_dir="/nonexistent",
+                              shell_active=False, file_ages=None):
+    """Build a StateMachine whose ClaudeCodeDetector sees the given
+    {path: mtime} transcript set -- lets a test mix a stale parent
+    transcript with a fresh subagent one."""
+    install_world(monkeypatch, turn_active_dir=turn_active_dir)
+    now_ref = {"v": 1_000_000.0}
+
+    def _stat(p):
+        # Mirror os.stat: an unknown path (e.g. the incremental subagent-scan's
+        # derived subagents/ dir, finding 3) raises OSError, not KeyError.
+        try:
+            mtime = mtimes[str(p)]
+        except KeyError:
+            raise OSError(f"no such file: {p}") from None
+
+        class _S:
+            st_mtime = mtime
+        return _S()
+
+    claude = ClaudeCodeDetector(
+        find_processes_fn=lambda: ["fake-claude-proc"],
+        aggregate_cpu_fn=lambda p: 0.0,
+        has_active_shell_children_fn=lambda p: shell_active,
+        projects_dir=Path("/fake/.claude/projects"),
+        glob_fn=lambda root: iter([Path(p) for p in mtimes]),
+        stat_fn=_stat,
+        recent_file_ages_fn=lambda: list(file_ages or []),
+    )
+    sm = StateMachine(detectors=[claude])
+    monkeypatch.setattr(watcher.time, "time", lambda: now_ref["v"])
+    return sm
+
+
+_PARENT = "/fake/.claude/projects/-Users-me-proj/sess.jsonl"
+_SUBAGENT = "/fake/.claude/projects/-Users-me-proj/sess/subagents/agent-a0e3.jsonl"
+
+
+def test_a_quiet_parent_fresh_subagent_after_turn_close_is_thinking(monkeypatch):
+    """Requirement (a): turn closed (no turn_active flag) with a quiet parent
+    transcript and a fresh subagent transcript -> thinking, not idle. The
+    background/long helper is the only thing writing, and she follows it."""
+    now = 1_000_000.0
+    sm = _machine_with_transcripts(monkeypatch, {
+        _PARENT: now - 300.0,     # parent quiet
+        _SUBAGENT: now - 2.0,     # helper actively writing
+    })
+    st = sm.compute()
+    assert st.state == "thinking"
+    assert st.state_reason == "claude streaming"
+
+
+def test_a_quiet_parent_no_subagent_is_idle(monkeypatch):
+    """Control: with no fresh subagent transcript she still drops to idle --
+    the new signal is doing the work above, not a blanket 'never idle'."""
+    now = 1_000_000.0
+    sm = _machine_with_transcripts(monkeypatch, {_PARENT: now - 300.0})
+    st = sm.compute()
+    assert st.state == "idle"
+
+
+def test_b_open_turn_fresh_subagent_past_stall_not_idle(monkeypatch, tmp_path):
+    """Requirement (b): during an OPEN turn, a parent transcript silent past
+    turn_stall used to fall to idle (4c usage-limit guard). A fresh subagent
+    transcript keeps transcript_age young, so streaming (4b) holds her at
+    thinking instead of the stall dropping her to idle."""
+    from squid_pet import config
+    monkeypatch.setattr(config, "_load_raw", lambda: {})  # default 180s stall
+    now = 1_000_000.0
+    turn_dir = tmp_path / "claude_turn_active"
+    sm = _machine_with_transcripts(monkeypatch, {
+        _PARENT: now - 300.0,     # parent silent > 180s stall
+        _SUBAGENT: now - 3.0,     # helper still writing
+    }, turn_active_dir=str(turn_dir))
+    _write_flag(turn_dir, "sess-1", now - 30.0)
+
+    st = sm.compute()
+    assert st.state != "idle"
+    assert st.state == "thinking"
+
+
+def test_a_stop_beat_grooves_then_thinks_while_helper_writes(monkeypatch, tmp_path):
+    """Documents the Stop -> grooving/finished beat when a background helper
+    is still writing (no shell/file resume): for the finished-freshness window
+    she shows the normal 'grooving' beat (pre-existing behaviour, unchanged),
+    and once that decays she falls through to 'thinking' on the still-fresh
+    subagent transcript -- never idle. This is why requirement (a) holds even
+    across the celebrate/groove beat."""
+    from squid_pet import config
+    monkeypatch.setattr(config, "_load_raw", lambda: {})  # default 20s finished-fresh
+    now = 1_000_000.0
+    finished_dir = tmp_path / "claude_finished"
+    sm = _machine_with_transcripts_finished(monkeypatch, {
+        _PARENT: now - 300.0,
+        _SUBAGENT: now - 2.0,
+    }, finished_dir=str(finished_dir))
+
+    # Stop just fired -> grooving beat (the normal per-turn beat).
+    _write_flag(finished_dir, "sess-1", now - 1.0)
+    st = sm.compute()
+    assert st.state == "grooving"
+
+    # After the finished-freshness window decays, the helper's fresh
+    # transcript keeps her at thinking, not idle.
+    _write_flag(finished_dir, "sess-1", now - 100.0)
+    st = sm.compute()
+    assert st.state == "thinking"
+
+
+def _machine_with_transcripts_finished(monkeypatch, mtimes, *, finished_dir,
+                                       turn_active_dir="/nonexistent"):
+    install_world(monkeypatch, finished_dir=finished_dir,
+                  turn_active_dir=turn_active_dir)
+    now_ref = {"v": 1_000_000.0}
+
+    def _stat(p):
+        # Mirror os.stat: an unknown path (e.g. the incremental subagent-scan's
+        # derived subagents/ dir, finding 3) raises OSError, not KeyError.
+        try:
+            mtime = mtimes[str(p)]
+        except KeyError:
+            raise OSError(f"no such file: {p}") from None
+
+        class _S:
+            st_mtime = mtime
+        return _S()
+
+    claude = ClaudeCodeDetector(
+        find_processes_fn=lambda: ["fake-claude-proc"],
+        aggregate_cpu_fn=lambda p: 0.0,
+        has_active_shell_children_fn=lambda p: False,
+        projects_dir=Path("/fake/.claude/projects"),
+        glob_fn=lambda root: iter([Path(p) for p in mtimes]),
+        stat_fn=_stat,
+        recent_file_ages_fn=lambda: [],
+    )
+    sm = StateMachine(detectors=[claude])
+    monkeypatch.setattr(watcher.time, "time", lambda: now_ref["v"])
+    return sm

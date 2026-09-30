@@ -25,6 +25,9 @@ state.json
 .indigo-pet-state.json
 ~/.indigo-pet/
 
+# Secrets
+.env
+
 # Editor
 .vscode/
 .idea/

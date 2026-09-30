@@ -91,3 +91,17 @@ def test_unwritable_logdir_degrades_to_stdout(tmp_path, monkeypatch):
                        for h in result.handlers)
     finally:
         _clear_handlers()
+
+
+def test_startup_markers_reach_the_stdout_log_doctor_reads(tmp_logdir, capsys):
+    from squid_pet.doctor import REQUIRED_STARTUP_MARKERS, check_startup_log_complete
+
+    logger = logging_setup.setup_logging(force=True)
+    for marker in REQUIRED_STARTUP_MARKERS:
+        logger.info(marker)
+    captured = capsys.readouterr()
+    launchd_stdout = tmp_logdir / "launchd-stdout.log"
+    launchd_stdout.write_text(captured.out)
+    result = check_startup_log_complete(launchd_stdout)
+    assert result.passed, result.diagnostic
+    assert captured.err == ""

@@ -29,8 +29,12 @@ def test_codex_wait_overrides_work_and_clears(flags):
     with patch.object(watcher, '_fire_approval_notification') as notify:
         assert sm.compute().state == 'approval_needed'
         assert 'Codex' in sm.compute().state_reason
-        notify.assert_called_once_with('your turn', 'Glass', source_label='Codex')
+        pending = notify.call_args.kwargs['still_pending']
+        notify.assert_called_once_with('your turn', 'Glass', source_label='Codex',
+                                       still_pending=pending)
+        assert pending()
         marker.unlink()
+        assert not pending()  # no watcher tick needed to invalidate the queued send
         assert sm.compute().state == 'working'
 
 
@@ -69,9 +73,8 @@ def _codex_detector(shell_active):
     return type('FakeCodex', (), {'name': 'codex', 'shell_active': shell_active})()
 
 
-def test_codex_wait_survives_unrelated_command_activity(flags):
-    # A shell child can belong to another request/session. Wait for the
-    # matching completion hook rather than erase an unrelated pending wait.
+def test_unrelated_codex_command_does_not_clear_permission(flags):
+    # Aggregate shell activity does not identify which request was approved.
     import os
     marker = flags / 'request-a'
     marker.touch()
@@ -105,3 +108,19 @@ def test_fresh_codex_wait_not_reaped_even_if_shell_active(flags):
     sm._codex_detector = _codex_detector(shell_active=True)
     assert sm.compute(notify=False).state == 'approval_needed'
     assert marker.exists()
+
+
+def test_new_episode_cannot_revive_old_notification_callback(flags):
+    marker = flags / 'request-a'
+    marker.touch()
+    sm = machine()
+    with patch.object(watcher, '_fire_approval_notification') as notify:
+        sm.compute()
+        old = notify.call_args.kwargs['still_pending']
+        marker.unlink()
+        sm.compute()
+        marker.touch()
+        sm.compute()
+        current = notify.call_args.kwargs['still_pending']
+        assert not old()
+        assert current()

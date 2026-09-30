@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -72,7 +73,7 @@ def setup_logging(*, force: bool = False) -> logging.Logger:
     )
 
     # stdout -- keeps launchd capture + doctor's marker parsing working.
-    stream = logging.StreamHandler()
+    stream = logging.StreamHandler(sys.stdout)
     stream.setFormatter(fmt)
     logger.addHandler(stream)
 

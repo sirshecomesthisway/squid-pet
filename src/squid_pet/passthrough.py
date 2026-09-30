@@ -274,7 +274,7 @@ def load_alpha_masks() -> dict[str, "Image.Image"]:
         try:
             img = Image.open(png).convert("RGBA")
             alpha = img.split()[3]  # alpha channel
-            alpha = alpha.resize((SPRITE_WIDTH, SPRITE_HEIGHT), Image.NEAREST)
+            alpha = alpha.resize((SPRITE_WIDTH, SPRITE_HEIGHT), Image.NEAREST)  # type: ignore[attr-defined]
             # Dilate the alpha mask by ~6 pixels using MaxFilter so the hit-target
             # extends a few pixels beyond the visible silhouette. Without this,
             # clicks on the very edge of an irregular sprite (e.g. tip of head,

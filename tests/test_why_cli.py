@@ -7,18 +7,37 @@ parseable output containing the expected sections.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 PROJECT = Path(__file__).parent.parent
 
+# Hermeticity (2026-09-24): the subprocess builds watcher's flag-dir constants
+# from expanduser("~") at import time, so it otherwise reads the developer's
+# real ~/.squid-pet (a live approval_needed flag there made these `squid why`
+# runs non-deterministic and could stall). Point HOME at an empty throwaway dir
+# so every ~/.squid-pet and ~/.claude read resolves to nothing -- the smoke
+# assertions below only care about structural sections, which are state-blind.
+_ISOLATED_HOME = tempfile.mkdtemp(prefix="squid-why-home-")
+
 
 def _run(*flags) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env["HOME"] = _ISOLATED_HOME
+    env["SQUID_PET_HOME"] = str(Path(_ISOLATED_HOME) / ".squid-pet")
     return subprocess.run(
-        [sys.executable, "-m", "squid_pet", *flags],
+        # Exercise the real module entry point, isolating only the OS idle
+        # call: Quartz can block indefinitely without WindowServer access.
+        [sys.executable, "-c",
+         "from squid_pet import watcher; "
+         "watcher.macos_idle_seconds = lambda: 0.0; "
+         "import runpy; runpy.run_module('squid_pet', run_name='__main__')",
+         *flags],
         capture_output=True, text=True, timeout=15,
-        cwd=str(PROJECT),
+        cwd=str(PROJECT), env=env,
     )
 
 
@@ -114,6 +133,8 @@ def test_why_json_stays_valid_json_when_approval_needed_is_live(monkeypatch, cap
 
     from squid_pet import watcher
     from squid_pet.__main__ import _run_why
+
+    monkeypatch.setattr(watcher, "macos_idle_seconds", lambda: 0.0)
 
     with patch.object(watcher, "claude_sessions_awaiting_input",
                       return_value=["sess-regression-test"]), \

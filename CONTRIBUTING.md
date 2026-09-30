@@ -8,6 +8,8 @@ If you want to write code, the contribution I most want is **a detector
 for an agent Squid doesn't watch yet**. That's a self-contained change:
 one class, one test file, one line in `build_detectors()`.
 
+Using a coding agent (Claude Code, Codex, ...)? Point it at [`AGENTS.md`](AGENTS.md).
+
 ---
 
 ## Setup
@@ -29,16 +31,26 @@ squid stop                       # or: launchctl bootout gui/$UID/com.pink.squid
 .venv/bin/python -m squid_pet --watcher-only   # no window, detection only
 ```
 
-## Tests
+## Verification
+
+Set up development dependencies without installing or starting the pet:
 
 ```bash
-.venv/bin/pytest
+uv sync --dev --frozen --python 3.13
+uv run --frozen ruff check .
+uv run --frozen mypy --config-file pyproject.toml
+uv run --frozen pytest
+uv run --frozen python tools/verify_sprites.py
+uv run --frozen python scripts/check_cocoa_main_thread.py src/squid_pet/*.py
 ```
 
+See [Verification harness](docs/VERIFICATION.md) for scope, sprite contracts,
+and the manual macOS release checklist.
+
 Every detector is tested in isolation with its I/O dependency-injected,
-so the suite never touches psutil, the filesystem, or `ioreg` for real.
-Keep it that way — a test that reads your actual `~/.claude/` will pass
-on your machine and fail on everyone else's.
+so detector tests should not depend on live processes or user sessions.
+Other tests use temporary files and subprocesses. Keep those isolated — a test
+that reads your actual `~/.claude/` can fail on someone else's machine.
 
 `squid doctor` runs a separate 6-check end-to-end self-test against the
 *installed* copy. That one does touch the real system.
@@ -109,7 +121,7 @@ The failures I most expect and least can test:
 ## Pull requests
 
 - Branch off `main`, keep the change focused on one thing.
-- `.venv/bin/pytest` passes before you open it.
+- All verification commands above pass before you open it.
 - Say what you observed, not just what you changed — for a detector,
   paste the `squid why` output showing it firing.
 

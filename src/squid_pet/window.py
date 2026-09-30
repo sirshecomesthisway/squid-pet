@@ -16,6 +16,7 @@ import sys
 import threading
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import webview
 
@@ -80,7 +81,6 @@ BUBBLE_PRIO_MOOD = 0      # drowsy / waking emotes (on_mood_change)
 BUBBLE_PRIO_AMBIENT = 1   # idle chatter, "still working" reannounce
 BUBBLE_PRIO_STATE = 2     # state-transition "why" + user interactions
 
-POSITION_FILE = Path.home() / ".squid-pet" / "position.json"
 SETTINGS_FILE = Path.home() / ".squid-pet" / "settings.json"
 # Presence == intentionally hidden via the menu bar toggle. Written by
 # _apply_hide_state() so `squid doctor` (a separate CLI process with no
@@ -294,7 +294,7 @@ def _sync_edge_for_corner(wanderer, corner: str, context: str) -> str | None:
     (authoritative from the corner name), not refresh_edge()'s distance
     heuristic -- see _edge_for_corner's docstring for why the latter
     reliably misses corner-snapped positions. Shared by every corner-snap
-    call site (next_corner, _menu_snap, _menu_recenter, startup) instead
+    call site (next_corner, _menu_snap, startup) instead
     of duplicating this try/except + log at each one. Returns the edge
     now in effect, or None if there's no wanderer yet (e.g. a startup
     race) or the sync itself failed -- both logged, neither raises."""
@@ -348,44 +348,47 @@ def move_window_by_delta(dx: float, dy: float) -> tuple[float, float] | None:
 # ──────────────────────────────────────────────────────────────────
 # Persistent corner
 # ──────────────────────────────────────────────────────────────────
-def load_corner() -> str:
-    """Resolve which corner Squid should start in.
+def _resolve_starting_corner(starting_corner: str | None) -> str:
+    """Pure startup corner-resolution policy, split out of load_corner()'s file
+    IO so the rule is unit-testable without touching disk.
 
-    Priority: position.json (last saved location) -> settings.json
-    starting_corner (user-configured intent) -> "bottom-right"
-    (Pink-blessed default 2026-06-25; feels more natural than top-right
-    because the dock + macOS menu bar already crowd the top edge)."""
-    try:
-        if POSITION_FILE.exists():
-            data = json.loads(POSITION_FILE.read_text())
-            c = data.get("corner")
-            if c in CORNERS:
-                return c
-    except Exception:
-        pass
-    # Fall back to user-configured starting_corner from settings.json.
-    try:
-        settings_file = Path.home() / ".squid-pet" / "settings.json"
-        if settings_file.exists():
-            s = json.loads(settings_file.read_text())
-            c = s.get("starting_corner")
-            if c in CORNERS:
-                return c
-    except Exception:
-        pass
+    Rule: the settings.json `starting_corner` power-user override wins IF it is a
+    valid corner; otherwise "bottom-right" (Pink-blessed default -- feels more
+    natural than top-right because the dock + macOS menu bar already crowd the
+    top edge).
+
+    Pink-2026-09-23: squid now ALWAYS starts bottom-right -- there is no
+    cross-restart corner memory. The right-click Position menu / corner cycling
+    are for in-session moves only and no longer persist anywhere. This dropped
+    the former position.json "resume last corner" path entirely (Option A);
+    `starting_corner` remains only as an optional, hand-edited override in
+    settings.json. Only values in CORNERS are honored; everything else (unset,
+    typo, wrong type) falls through to the default. This is a resolution-policy
+    choice, not a coordinate one -- the Cocoa bottom-left origin math in
+    corner_origin()/_char_bounds() is pinned by test_window_constants_agree.py."""
+    if starting_corner in CORNERS:
+        return starting_corner  # type: ignore[return-value]
     return "bottom-right"
 
 
-def save_corner(corner: str) -> None:
-    POSITION_FILE.parent.mkdir(parents=True, exist_ok=True)
-    POSITION_FILE.write_text(json.dumps({"corner": corner}, indent=2))
+def load_corner() -> str:
+    """Resolve which corner Squid should start in. See _resolve_starting_corner
+    for the policy; this only reads the optional settings.json override. Squid
+    no longer remembers her last position across restarts (position.json is not
+    consulted) -- she always starts bottom-right unless starting_corner overrides
+    it."""
+    return _resolve_starting_corner(load_settings().get("starting_corner"))
 
 
 def load_settings() -> dict:
     """Persistent settings (stroll mode, future toggles). Safe defaults."""
     try:
         if SETTINGS_FILE.exists():
-            return json.loads(SETTINGS_FILE.read_text())
+            data = json.loads(SETTINGS_FILE.read_text())
+            # Hand-edited file: every caller does .get(), so a list/null/
+            # string here must not crash startup.
+            if isinstance(data, dict):
+                return data
     except Exception:
         pass
     return {}
@@ -633,13 +636,6 @@ def get_visible_frame() -> tuple[float, float, float, float] | None:
 
 
 class PetApi:
-    # CLASS-level default so instances built via PetApi.__new__() -- the
-    # fixture pattern used across tests/ to skip the real __init__ (which
-    # would spin up a window/menu/watcher thread) -- still carry it.
-    # update() reads it on EVERY tick, so without this default every such
-    # test AttributeErrors. __init__ still sets the instance attribute.
-    _working_since: float | None = None
-
     def __init__(self) -> None:
         self._latest = watcher.PetState()
         self._lock = threading.Lock()
@@ -664,7 +660,7 @@ class PetApi:
         # "Take me to the window that's waiting" -- see acknowledge_approval.
         # Bound here (not imported at call time) so tests constructing
         # PetApi via __new__ simply never have it.
-        from .focus import focus_for_state as _focus
+        from .focus import focus_for_snapshot as _focus
         self._focus_fn = _focus
         self._sprint_fast_transition: bool = False  # frontend uses 0.2s CSS transition when True
         # Stroll mode: "edges" (hug border) or "anywhere" (free roam).
@@ -680,9 +676,9 @@ class PetApi:
             self._stroll_mode = "edges"
         self._hint_text: str = ""              # one-shot hint shown via #hint
         self._hint_seq: int = 0                # increments per hint; JS dedupes
-        self._menu = None                      # SquidMenu instance (set in on_loaded)
-        self._wanderer = None                  # WanderController (set in on_loaded)
-        self._routine = None                   # RoutineController (set in on_loaded)
+        self._menu: Any | None = None          # SquidMenu instance (set in on_loaded)
+        self._wanderer: Any | None = None      # WanderController (set in on_loaded)
+        self._routine: Any | None = None       # RoutineController (set in on_loaded)
         # Live StateMachine ref (set by watcher_thread() via
         # set_state_machine()). Read by _wake() to hand the state machine
         # an awake hold, and by _current_shell_cmdline() for the live
@@ -709,15 +705,6 @@ class PetApi:
         # "Still working on X" periodic refresh (see _maybe_reannounce_working).
         self._last_working_bubble_at: float = 0.0
         self._last_working_bubble_text: str = ""
-        # Timestamp (PetState.timestamp) at which the CURRENT continuous
-        # working stretch began, or None when not working. Drives the
-        # long-running "pancake flip" presentation variant of `working`
-        # (see _is_long_working / get_state's long_working field). Set only
-        # on an actual transition INTO working and cleared on the transition
-        # OUT -- the periodic "still working" reannounce refresh runs on the
-        # same-state branch below and deliberately never touches it, so a
-        # long stretch keeps counting from its true start.
-        self._working_since: float | None = None
         self._observer = observer.Observer(get_muted=config.is_muted)
 
     def signal_ready(self) -> dict:
@@ -748,17 +735,6 @@ class PetApi:
             shown = self._forced_state or state.state
         if self._passthrough:
             self._passthrough.set_state(shown)
-        # Continuous-working duration tracking for the pancake-flip variant.
-        # Only actual transitions touch _working_since: entering working
-        # stamps the start, leaving working clears it. The "still working"
-        # reannounce refresh takes the same-state branch below and never
-        # runs this, so it can't reset the clock (that distinction is the
-        # whole point -- a reannounce is not a new working stretch).
-        if prev_state != state.state:
-            if state.state == "working":
-                self._working_since = state.timestamp
-            elif prev_state == "working":
-                self._working_since = None
         # Observer: fire on actual state transitions only
         if prev_state != state.state:
             # Pink-2026-08-27k: was hardcoded None -- the original wiring
@@ -843,24 +819,19 @@ class PetApi:
         self._set_pending_bubble(bubble, BUBBLE_PRIO_AMBIENT)
 
     def _is_long_working(self) -> bool:
-        """True when the CURRENT continuous working stretch has lasted at
-        least config.long_working_threshold_sec(). Surfaced to the frontend
-        as get_state()['long_working']; the frontend uses it to swap the
-        static working sprite for the pancake-flip animation. Purely a
-        presentation signal -- it never changes which backend state is
-        reported, only how `working` is drawn.
+        """True when accumulated agent-work time reaches the threshold.
 
-        Duration is measured from PetState timestamps (entry stamp vs the
-        latest tick's stamp), the same monotonic clock the reannounce
-        throttle uses, so it needs no wall-clock read and stays trivially
-        testable."""
-        if self._working_since is None:
-            return False
+        Surfaced to the frontend as ``get_state()['long_working']``; the
+        frontend uses it to swap the static working sprite for the pancake-
+        flip animation. This presentation flag never changes the backend
+        state. ``PetState.work_seconds`` is maintained by the watcher so
+        thinking, tool activity, and approval pauses retain their real timing
+        semantics across state transitions.
+        """
         latest = self._latest
         if latest.state != "working":
             return False
-        elapsed = latest.timestamp - self._working_since
-        return elapsed >= config.long_working_threshold_sec()
+        return latest.work_seconds >= config.long_working_threshold_sec()
 
     def _wake(self, duration_sec: float) -> None:
         """Force a wake-from-drowsy/sleeping stretch transition (frontend
@@ -925,9 +896,7 @@ class PetApi:
             d["wrapper_deg"] = self._wrapper_deg_override
         d["wake_trigger_seq"] = self._wake_trigger_seq
         # Presentation flag for the pancake-flip variant of `working`: True
-        # once the current continuous working stretch passes the threshold.
-        # Computed under the same lock context as the state read above via
-        # _is_long_working (reads self._latest/_working_since only).
+        # once accumulated agent-work time passes the threshold.
         d["long_working"] = self._is_long_working()
         # User-interaction wake override (poke/sprint take prime over agent-idle counter)
         d["user_wake_remaining"] = max(0.0, self._user_wake_until - _time.time())
@@ -1044,10 +1013,11 @@ class PetApi:
         self._forced_state = None
 
     def next_corner(self) -> str:
-        """Snap to next corner via NSWindow."""
+        """Snap to next corner via NSWindow. In-session only: the cycle advances
+        in-memory (self._corner) and is NOT persisted -- she always relaunches
+        bottom-right (see load_corner)."""
         idx = CORNERS.index(self._corner)
         self._corner = CORNERS[(idx + 1) % len(CORNERS)]
-        save_corner(self._corner)
         ok = move_to_corner(self._corner)
         _sync_edge_for_corner(self._wanderer, self._corner, "corner snap")
         log.info(f"corner snap -> {self._corner} (ok={ok})")
@@ -1115,7 +1085,10 @@ class PetApi:
     # ─── Position ───
     def _menu_snap(self, corner: str) -> None:
         if move_to_corner(corner):
-            save_corner(corner)
+            # In-session only: track the corner in memory so next_corner()
+            # cycling continues from here, but do NOT persist -- she always
+            # relaunches bottom-right (see load_corner).
+            self._corner = corner
             # Sync sprite rotation + passthrough's edge-aware hit-test
             # offset to the new position, same fix next_corner()/
             # startup/drag's _on_end apply.
@@ -1400,6 +1373,51 @@ class PetApi:
         timer.start()
         return {"status": "calmed", "bubble": bubble}
 
+    def acknowledge_concern(self) -> dict:
+        """JS-exposed: dblclick while state=="concerned" is "I saw the error"
+        -- calm the worried face. Mirrors acknowledge_approval: the same
+        dblclick's take_me_there() raises the errored session's terminal, so
+        this does only the calm. No-ops (status "not-concerned") at any other
+        state, leaving the plain poke+heart untouched.
+
+        Calms by SNOOZING the concerned override (watcher.dismiss_concern),
+        not by deleting the failed flag -- take_me_there, which runs right
+        after this in the same gesture, still needs that flag to resolve the
+        session (same reason acknowledge_approval snoozes rather than deletes
+        the awaiting flag). Covers a Codex-sourced concern too, which has no
+        flag to delete. Returns the bubble on the RPC response so it shows
+        immediately instead of racing the ~1s poll -- see the dblclick
+        handler in index.html.
+
+        Pink-2026-09-24: the dismiss is DEFERRED by ACKNOWLEDGE_DISMISS_DELAY_SEC
+        via a background timer, matching acknowledge_approval -- the bubble
+        appears instantly but the worried face settles a beat later, reading as
+        her having noticed rather than a hard cut. take_me_there in the same
+        gesture cannot lose the race here regardless of the delay: it navigates
+        off the state SNAPSHOT (focus_for_snapshot reads snapshot.focus_target
+        and the on-disk failed flag), and dismiss_concern only snoozes the
+        override for future compute() ticks -- it mutates neither self._latest
+        nor the flag file, so the session stays resolvable."""
+        with self._lock:
+            current_state = self._latest.state
+        if current_state != "concerned":
+            return {"status": "not-concerned", "bubble": None}
+        bubble = self._observer.on_interaction("like")
+        if bubble is not None:
+            self._set_pending_bubble(bubble, BUBBLE_PRIO_STATE)
+
+        def _dismiss() -> None:
+            from . import watcher as _w
+            try:
+                _w.dismiss_concern()
+            except Exception as e:
+                log.warning(f"dismiss_concern failed: {e}")
+
+        timer = threading.Timer(ACKNOWLEDGE_DISMISS_DELAY_SEC, _dismiss)
+        timer.daemon = True
+        timer.start()
+        return {"status": "calmed", "bubble": bubble}
+
     def take_me_there(self) -> dict:
         """JS-exposed: dblclick -> raise the window responsible for whatever
         she is currently showing.
@@ -1419,12 +1437,13 @@ class PetApi:
         never raise a real window.
         """
         with self._lock:
-            state = self._latest.state
+            snapshot = self._latest
+            state = snapshot.state
         focus_fn = getattr(self, "_focus_fn", None)
         if focus_fn is None:
             return {"status": "skipped", "state": state}
         try:
-            status = focus_fn(state)
+            status = focus_fn(snapshot)
         except Exception as e:
             # A failed window raise must never break the gesture; the
             # poke and heart already happened.
@@ -1453,12 +1472,6 @@ class PetApi:
             self._emit_hint("🏃‍♀️ sprinting!")
         except Exception as e:
             self._emit_hint(f"⚠ sprint failed: {e}")
-
-    def _menu_recenter(self) -> None:
-        corner = load_corner()
-        if move_to_corner(corner):
-            _sync_edge_for_corner(self._wanderer, corner, "recenter")
-            self._emit_hint(f"🎯 recentered → {corner}")
 
     # ─── Mood ───
     def _menu_force(self, name: str) -> None:
@@ -1612,6 +1625,7 @@ def main() -> None:
         background_color="#FFFFFF",
         js_api=api,
     )
+    assert window is not None
 
     stop_event = threading.Event()
     t = threading.Thread(

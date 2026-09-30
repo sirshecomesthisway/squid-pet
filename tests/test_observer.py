@@ -163,17 +163,28 @@ def test_concerned_with_reason_prefers_reason_verbatim(obs):
         concern_reason="ConnectionRefused: peer closed",
     )
     assert result is not None
-    # Should be lowercased and prefix-trimmed
-    assert "connectionrefused" in result.lower()
+    # Prefix-trimmed; casing preserved (see below).
+    assert "ConnectionRefused" in result
 
 
 def test_concern_reason_strips_module_prefixes():
+    # Pink-2026-09-24: casing is preserved now (concern_reason is a curated
+    # headline whose deliberate casing must not be mangled) -- only the noisy
+    # module prefix is trimmed.
     assert _format_concern_reason("anthropic.APIError: rate limit") == \
-        "apierror: rate limit"
+        "APIError: rate limit"
     assert _format_concern_reason("httpx.ConnectError: refused") == \
-        "connecterror: refused"
+        "ConnectError: refused"
     assert _format_concern_reason("pydantic_ai.UsageError: bad") == \
-        "usageerror: bad"
+        "UsageError: bad"
+
+
+def test_concern_reason_preserves_curated_headline_casing():
+    # The exact bug item 10 fixes: a curated headline must not be lowercased.
+    # (A short one, so truncation doesn't cloud the casing assertion.)
+    assert _format_concern_reason("Billing needs attention") == \
+        "Billing needs attention"
+    assert _format_concern_reason("Account is on hold") == "Account is on hold"
 
 
 def test_concern_reason_truncates_long():

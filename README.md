@@ -247,12 +247,40 @@ repo's `scripts/claude_pet_hook.py`:
 ```json
 {
   "hooks": {
-    "Notification":     [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
-    "UserPromptSubmit": [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
-    "SessionEnd":       [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}]
+    "Notification":      [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
+    "PermissionRequest": [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
+    "PermissionDenied":  [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
+    "UserPromptSubmit":  [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
+    "PreToolUse":        [{"matcher": "AskUserQuestion|ExitPlanMode", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
+    "PostToolUse":       [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
+    "PostToolUseFailure": [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
+    "Stop":              [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
+    "StopFailure":       [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
+    "SubagentStop":      [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
+    "PreCompact":        [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
+    "PostCompact":       [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}],
+    "SessionEnd":        [{"matcher": "", "hooks": [{"type": "command", "command": "/absolute/path/to/squid-pet/scripts/claude_pet_hook.py", "timeout": 5}]}]
   }
 }
 ```
+
+Only `Notification` (`permission_prompt`) raises the wave: it is the one
+event that means a prompt is actually on screen. `PermissionRequest` also
+fires for calls that auto mode approves or denies on its own, so it never
+raises anything -- it only leaves a short-lived hint (in
+`~/.squid-pet/claude_permission_pending/`) saying which agent asked. A real
+`Notification` never says which agent raised it, so it uses the hints from
+the last 10 seconds to tell a subagent's prompt apart from the main session's.
+Every such hint is used up and adds its own owner: with one, that agent owns
+the prompt; with several (it cannot tell which prompt is on screen, so it
+does not guess), each of them co-owns it and the wave stays up until every
+one of them has resolved. With no hint, the prompt counts as the main
+session's and clears at the main session's next turn event.
+`PostToolUse` / `PostToolUseFailure` (the tool ran, or ran and failed),
+`PermissionDenied` (auto mode said no) and `SubagentStop` are how a prompt
+clears on its own; without them a subagent's wave can stay up until the
+main session's next turn. Hints are removed as they are used, on
+`SessionEnd`, or by a sweep after 5 minutes.
 
 Merge this into your existing `hooks` key if you already have one, rather
 than overwriting the whole file. New Claude Code sessions (and, in
@@ -265,13 +293,17 @@ pick this up automatically; no restart required.
 <summary>Self-healing and notification behavior</summary>
 
 Two self-healing layers guard against a stuck flag: a 2h staleness prune
-in `watcher.py` for a session that crashes without firing either hook, and
+in `watcher.py` for a session that crashes without firing either hook (it
+takes the hook's lock file before deleting, so it can never remove a wave
+the hook is re-raising at that moment), and
 (2026-08-27) a same-tick check that deletes the flag outright the moment
 Squid's own independent activity signal (real shell/file/streaming
 evidence, nothing to do with the hook) sees the session genuinely working
 again — covers Claude resuming on its own (approval granted some other
 way, an agentic task continuing unattended) without a fresh top-level
-prompt ever being submitted.
+prompt ever being submitted. That check only runs with a single Claude Code
+session alive, only touches a flag holding a single pending prompt, and
+takes the hook's lock file first.
 
 A 120s "seen it, deferred" snooze (fires once, then quiets down until you
 reply and it fires again for genuinely new work) is enforced by
@@ -322,7 +354,7 @@ tick, so list only roots you actively work in. Paths may use `~`.
 
 | Detector | Signal | Feeds |
 |---|---|---|
-| `claude_code` | `claude` process presence, live tool subprocess, recent writes under `project_dirs`, `~/.claude/projects/*/*.jsonl` write recency | working / thinking / celebrating |
+| `claude_code` | `claude` process presence, live tool subprocess, recent writes under `project_dirs`, `~/.claude/projects/*/*.jsonl` and subagent `*/*/subagents/agent-*.jsonl` write recency | working / thinking / celebrating |
 | `codex` | `codex`/`codex-tui` process presence, live tool subprocess, recent writes under `project_dirs`, `~/.codex/sessions/**/*.jsonl` write recency | working / thinking |
 | `git` | `.git/{HEAD,index,refs/heads/}` mtimes under `project_dirs` | busy / celebrating |
 | `terminal` | any shell with a long-lived non-shell child | busy (off by default — misfires on any dev machine with a long-running foreground process, e.g. an editor or a REPL) |

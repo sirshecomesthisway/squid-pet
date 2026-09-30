@@ -42,7 +42,6 @@ EMO_ZZZ = "💤"
 EMO_MUTE = "🔇"
 EMO_PIN_LOC = "📍"
 EMO_ANCHOR = "⚓"
-EMO_CROSSHAIR = "🎯"
 EMO_MASK = "🎭"
 EMO_PAUSE = "⏸"
 EMO_PLAY = "▶"
@@ -114,7 +113,6 @@ class _MenuTarget(NSObject):
     def snapBL_(self, s): self.api._menu_snap("bottom-left")
     def snapBR_(self, s): self.api._menu_snap("bottom-right")
     def togglePin_(self, s): self.api._menu_toggle_pin()
-    def recenter_(self, s): self.api._menu_recenter()
     def strollAnywhere_(self, s): self.api._menu_set_stroll_mode("anywhere")
     def strollEdges_(self, s):    self.api._menu_set_stroll_mode("edges")
 
@@ -221,7 +219,6 @@ def _populate_menu(menu, target, api) -> None:
         else f"{EMO_ANCHOR}  Pin in place"
     )
     _add(pos, pin_label, target, "togglePin:", checked=pinned)
-    _add(pos, f"{EMO_CROSSHAIR}  Recenter", target, "recenter:")
     pos.addItem_(NSMenuItem.separatorItem())
     stroll_mode = getattr(api, "_stroll_mode", "edges")
     _add(pos, "Stroll: anywhere", target, "strollAnywhere:",

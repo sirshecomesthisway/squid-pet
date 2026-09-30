@@ -23,7 +23,7 @@ def _api(state: str, focus_fn=None):
     api._lock = threading.Lock()
     api._latest = PetState(state=state)
     if focus_fn is not None:
-        api._focus_fn = focus_fn
+        api._focus_fn = lambda snapshot: focus_fn(snapshot.state)
     return api
 
 
@@ -57,3 +57,13 @@ def test_inert_without_a_focus_callable():
     raise a window."""
     api = _api("working")
     assert api.take_me_there()["status"] == "skipped"
+
+
+def test_navigation_receives_the_state_and_its_exact_source_snapshot():
+    api = _api('working')
+    api._latest.focus_target = {'agent': 'codex', 'owner': {'pid': 123, 'created': 50}}
+    seen = []
+    api._focus_fn = lambda snapshot: seen.append(snapshot) or 'matched'
+    assert api.take_me_there()['status'] == 'matched'
+    assert seen == [api._latest]
+    assert seen[0].focus_target['owner']['pid'] == 123

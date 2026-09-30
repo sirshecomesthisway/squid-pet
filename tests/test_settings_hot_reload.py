@@ -118,8 +118,15 @@ def test_reload_refreshes_claude_detector_ref(isolated_settings):
     assert new_claude is not old_claude, "Claude detector should be a fresh instance"
 
 
-def test_compute_invokes_reload(isolated_settings):
+def test_compute_invokes_reload(isolated_settings, monkeypatch):
     """End-to-end: compute() actually calls reload as part of its tick."""
+    # This checks reload dispatch, not the desktop's idle time or live agents.
+    monkeypatch.setattr(watcher, "macos_idle_seconds", lambda: 0.0)
+    monkeypatch.setattr(watcher, "claude_sessions_awaiting_input", lambda: [])
+    _write(isolated_settings, {"triggers": {
+        "claude_code": False, "codex": False, "git": False,
+        "terminal": False, "ide": False,
+    }})
     sm = watcher.StateMachine()
     calls = [0]
     original = sm._maybe_reload_settings
@@ -129,7 +136,7 @@ def test_compute_invokes_reload(isolated_settings):
         original()
 
     sm._maybe_reload_settings = counting
-    sm.compute()
+    sm.compute(notify=False)
     assert calls[0] == 1
 
 

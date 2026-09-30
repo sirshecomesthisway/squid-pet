@@ -3,6 +3,7 @@ style. All psutil / filesystem dependencies are injected so no real
 process table or disk is touched."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from squid_pet.detectors import ClaudeCodeDetector
@@ -199,6 +200,98 @@ def test_disabled_detector_always_returns_false():
     assert d.is_grooving(now=1000.0) is False
 
 
+# ── subagent transcripts (2026-09-24) ─────────────────────────────────
+# A Task-tool helper (foreground or background) writes its OWN transcript
+# at <enc>/<session_id>/subagents/agent-<id>.jsonl while the parent's stays
+# quiet. The default discovery glob must pick those up so transcript_age /
+# streaming reflect helper activity through the existing cascade.
+def _write(path: Path, mtime: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n")
+    os.utime(path, (mtime, mtime))
+
+
+def test_default_glob_discovers_subagent_transcripts(tmp_path):
+    """No glob_fn injected: the real default glob must find a subagent
+    transcript nested under <enc>/<session_id>/subagents/, not just the
+    parent-level */*.jsonl file."""
+
+    now = 1000.0
+    projects = tmp_path / "projects"
+    enc = projects / "-Users-me-proj"
+    # quiet parent transcript, fresh subagent transcript
+    _write(enc / "sess.jsonl", now - 300.0)
+    sub = enc / "sess" / "subagents" / "agent-a0e33328136f521e9.jsonl"
+    _write(sub, now - 2.0)
+    # a .meta.json sibling must NOT be matched
+    meta = enc / "sess" / "subagents" / "agent-a0e33328136f521e9.meta.json"
+    meta.write_text("{}")
+
+    d = ClaudeCodeDetector(
+        find_processes_fn=lambda: [_FakeProc()],
+        aggregate_cpu_fn=lambda p: 0.0,
+        has_active_shell_children_fn=lambda p: False,
+        projects_dir=projects,
+        stat_fn=os.stat,
+        recent_file_ages_fn=lambda: [],
+    )
+    assert d.is_busy(now=now) is True
+    assert d.streaming is True
+    assert d.transcript_age == 2.0
+    # the freshest candidate (the subagent file) is what she locked onto
+    assert d.transcript_path is not None
+    assert d.transcript_path.endswith(
+        "sess/subagents/agent-a0e33328136f521e9.jsonl")
+
+
+def test_meta_json_sibling_is_not_discovered(tmp_path):
+    """Only agent-*.jsonl subagent transcripts count -- never the
+    agent-<id>.meta.json sidecar."""
+
+    now = 1000.0
+    projects = tmp_path / "projects"
+    sub = projects / "-Users-me-proj" / "sess" / "subagents"
+    sub.mkdir(parents=True)
+    (sub / "agent-abc.meta.json").write_text("{}")
+    os.utime(sub / "agent-abc.meta.json", (now - 1.0, now - 1.0))
+
+    d = ClaudeCodeDetector(
+        find_processes_fn=lambda: [_FakeProc()],
+        aggregate_cpu_fn=lambda p: 0.0,
+        has_active_shell_children_fn=lambda p: False,
+        projects_dir=projects,
+        stat_fn=os.stat,
+        recent_file_ages_fn=lambda: [],
+    )
+    assert d.is_busy(now=now) is False
+    assert d.transcript_age == float("inf")
+
+
+def test_subagent_transcript_activity_tail_is_read(tmp_path):
+    """The bounded-tail ledger logic must apply to subagent files too: a
+    fresh mtime whose only tail record is a background artifact ledger line
+    contributes NO activity (same content-blind rule as the parent)."""
+
+    now = 1000.0
+    projects = tmp_path / "projects"
+    sub = projects / "-Users-me-proj" / "sess" / "subagents" / "agent-x.jsonl"
+    sub.parent.mkdir(parents=True)
+    sub.write_text('{"type": "artifact-autoreact-ledger"}\n')
+    os.utime(sub, (now - 2.0, now - 2.0))
+
+    d = ClaudeCodeDetector(
+        find_processes_fn=lambda: [_FakeProc()],
+        aggregate_cpu_fn=lambda p: 0.0,
+        has_active_shell_children_fn=lambda p: False,
+        projects_dir=projects,
+        stat_fn=os.stat,
+        recent_file_ages_fn=lambda: [],
+    )
+    # mtime is fresh (2s) but the only record is a ledger line -> no activity
+    assert d.is_busy(now=now) is False
+    assert d.streaming is False
+
+
 def test_diagnostic_contains_required_keys():
     d = _make(procs=[_FakeProc()], cpu=12.5)
     d.is_busy(now=1000.0)
@@ -253,6 +346,10 @@ def test_discovery_cache_reused_within_window():
         glob_fn=glob_fn,
         stat_fn=lambda p: _FakeStat(995.0),
         recent_file_ages_fn=lambda: [],
+        # Hermetic: no active-turn flag read from the real ~/.squid-pet (a live
+        # turn whose session isn't in this fake candidate set would otherwise
+        # force a rediscovery -- finding B). This test pins the cache window.
+        active_sessions_fn=lambda: set(),
     )
     d.is_busy(now=1000.0)
     d.is_busy(now=1010.0)
@@ -327,3 +424,181 @@ def test_uninjected_wrapper_only_child_reports_the_wrapper_cmdline():
     assert proc.walks == 1
     assert d.shell_active is True
     assert d.shell_cmdline == args
+
+
+# ── finding 3: a subagent created mid-cache is seen on the next tick ────
+# _discover caches candidates for DISCOVERY_CACHE_SEC (60s). A subagent
+# transcript created AFTER the last full discovery must not stay invisible for
+# up to 60s -- after the parent's Stop + 20s groove beat that would read as idle
+# for ~40s while a helper works. A new file bumps its subagents/ dir mtime, so a
+# cheap per-tick stat of the cached parents' subagents/ dirs surfaces it fast.
+def test_new_subagent_seen_before_discovery_cache_expires(tmp_path):
+    now = 1000.0
+    projects = tmp_path / "projects"
+    enc = projects / "-Users-me-proj"
+    # A parent transcript exists at first discovery: old enough that it alone is
+    # NOT streaming (100s > STREAMING_STALE_SEC) but young enough to be a cached
+    # candidate (< CANDIDATE_MAX_AGE_SEC). This is the post-Stop state.
+    _write(enc / "sess.jsonl", now - 100.0)
+
+    d = ClaudeCodeDetector(
+        find_processes_fn=lambda: [_FakeProc()],
+        aggregate_cpu_fn=lambda p: 0.0,
+        has_active_shell_children_fn=lambda p: False,
+        projects_dir=projects,
+        stat_fn=os.stat,
+        recent_file_ages_fn=lambda: [],
+        active_sessions_fn=lambda: set(),
+    )
+    # First tick: full discovery, parent alone -> not streaming -> idle.
+    assert d.is_busy(now=now) is False
+    assert d.streaming is False
+
+    # A helper starts writing 30s later -- still inside the 60s discovery cache.
+    later = now + 30.0
+    sub = enc / "sess" / "subagents" / "agent-a0e3.jsonl"
+    _write(sub, later - 2.0)
+    # .meta.json sidecar must still be excluded even on the incremental path.
+    (sub.parent / "agent-a0e3.meta.json").write_text("{}")
+
+    # Next tick, WITHOUT a full rediscovery (30s < 60s): the new subagent must
+    # already be visible.
+    assert d.is_busy(now=later) is True
+    assert d.streaming is True
+    assert d.transcript_path is not None
+    assert d.transcript_path.endswith("sess/subagents/agent-a0e3.jsonl")
+
+
+def test_incremental_subagent_scan_ignores_meta_sidecar(tmp_path):
+    """On the incremental (within-cache) path, a NEW .meta.json sidecar
+    appearing in a cached parent's subagents/ dir must not be discovered."""
+    now = 1000.0
+    projects = tmp_path / "projects"
+    enc = projects / "-Users-me-proj"
+    _write(enc / "sess.jsonl", now - 100.0)
+
+    d = ClaudeCodeDetector(
+        find_processes_fn=lambda: [_FakeProc()],
+        aggregate_cpu_fn=lambda p: 0.0,
+        has_active_shell_children_fn=lambda p: False,
+        projects_dir=projects,
+        stat_fn=os.stat,
+        recent_file_ages_fn=lambda: [],
+        active_sessions_fn=lambda: set(),
+    )
+    assert d.is_busy(now=now) is False
+
+    later = now + 30.0
+    meta = enc / "sess" / "subagents" / "agent-a0e3.meta.json"
+    _write(meta, later - 1.0)
+
+    assert d.is_busy(now=later) is False
+    assert d.streaming is False
+
+
+# ── finding B: a resumed stale parent's helper is seen via the active flag ─
+# The incremental top-up only watches subagents/ dirs of parents ALREADY in
+# _candidates. If parent A is >15min old (not a candidate) while unrelated B
+# keeps the cache warm, A's newly launched helper -- and A's first helper also
+# creates the subagents/ dir itself -- would stay invisible until the next full
+# rediscovery (<=60s). A live claude_turn_active/<sid> flag naming a session not
+# in the candidates forces one full rediscovery so A + its helper are seen now.
+def test_resumed_stale_parent_helper_seen_via_active_flag(tmp_path):
+    now = 1000.0
+    projects = tmp_path / "projects"
+    enc_a = projects / "-Users-me-projA"
+    enc_b = projects / "-Users-me-projB"
+    _write(enc_b / "sessB.jsonl", now - 5.0)          # B fresh -> keeps cache warm
+    _write(enc_a / "sessA.jsonl", now - 2000.0)       # A stale (> CANDIDATE_MAX_AGE)
+
+    active = {"ids": set()}
+    d = ClaudeCodeDetector(
+        find_processes_fn=lambda: [_FakeProc()],
+        aggregate_cpu_fn=lambda p: 0.0,
+        has_active_shell_children_fn=lambda p: False,
+        projects_dir=projects,
+        stat_fn=os.stat,
+        recent_file_ages_fn=lambda: [],
+        active_sessions_fn=lambda: set(active["ids"]),
+    )
+    # First tick: full discovery. Only B is a candidate (A too old).
+    assert d.is_busy(now=now) is True
+    assert d.streaming is True
+
+    # 30s later (still inside the 60s cache): B has gone quiet, the user resumed
+    # A (turn opens -> active flag names sessA) and A launched its FIRST helper,
+    # creating sessA/subagents/ and a fresh transcript in it.
+    later = now + 30.0
+    _write(enc_b / "sessB.jsonl", later - 500.0)      # B quiet now
+    sub_a = enc_a / "sessA" / "subagents" / "agent-a1.jsonl"
+    _write(sub_a, later - 2.0)
+    active["ids"] = {"sessA"}
+
+    assert d.is_busy(now=later) is True
+    assert d.streaming is True
+    assert d.transcript_path is not None
+    assert d.transcript_path.endswith("sessA/subagents/agent-a1.jsonl")
+
+
+def test_no_active_flag_leaves_stale_parent_helper_until_rediscovery(tmp_path):
+    """Control: with NO active flag naming the stale parent, its helper stays
+    invisible until the next full rediscovery -- the bounded <=60s limitation
+    the trigger above closes only when a live turn flag is present."""
+    now = 1000.0
+    projects = tmp_path / "projects"
+    enc_a = projects / "-Users-me-projA"
+    enc_b = projects / "-Users-me-projB"
+    _write(enc_b / "sessB.jsonl", now - 5.0)
+    _write(enc_a / "sessA.jsonl", now - 2000.0)
+
+    d = ClaudeCodeDetector(
+        find_processes_fn=lambda: [_FakeProc()],
+        aggregate_cpu_fn=lambda p: 0.0,
+        has_active_shell_children_fn=lambda p: False,
+        projects_dir=projects,
+        stat_fn=os.stat,
+        recent_file_ages_fn=lambda: [],
+        active_sessions_fn=lambda: set(),
+    )
+    assert d.is_busy(now=now) is True
+
+    later = now + 30.0
+    _write(enc_b / "sessB.jsonl", later - 500.0)
+    _write(enc_a / "sessA" / "subagents" / "agent-a1.jsonl", later - 2.0)
+
+    # No active flag -> no forced rediscovery -> A's helper not yet seen.
+    assert d.is_busy(now=later) is False
+
+
+def test_stale_active_flag_with_no_transcript_does_not_reglob_every_tick(tmp_path):
+    """A persistently-flagged session with no on-disk transcript (e.g. a stale
+    turn_active flag) must force at most ONE full rediscovery, never a glob
+    storm every tick."""
+    now = 1000.0
+    projects = tmp_path / "projects"
+    _write(projects / "-Users-me-projB" / "sessB.jsonl", now - 5.0)
+
+    globs = {"n": 0}
+
+    def _counting_glob(root):
+        globs["n"] += 1
+        from squid_pet.detectors import _default_claude_transcript_glob
+        return _default_claude_transcript_glob(root)
+
+    d = ClaudeCodeDetector(
+        find_processes_fn=lambda: [_FakeProc()],
+        aggregate_cpu_fn=lambda p: 0.0,
+        has_active_shell_children_fn=lambda p: False,
+        projects_dir=projects,
+        glob_fn=_counting_glob,
+        stat_fn=os.stat,
+        recent_file_ages_fn=lambda: [],
+        active_sessions_fn=lambda: {"ghost-session"},  # never on disk
+    )
+    d.is_busy(now=now)              # 1st full glob
+    assert globs["n"] == 1
+    d.is_busy(now=now + 5.0)        # forces ONE rediscovery for the ghost
+    assert globs["n"] == 2
+    d.is_busy(now=now + 10.0)       # ghost already attempted -> no re-glob
+    d.is_busy(now=now + 15.0)
+    assert globs["n"] == 2
