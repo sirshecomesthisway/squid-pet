@@ -36,7 +36,7 @@ entry points.
 
 ## D2: launchd plist is generated, not committed verbatim
 
-Hardcoding `/Users/pink/Projects/squid-pet/.venv/bin/python` in a checked-in
+Hardcoding `/Users/Pochemuchka/Projects/squid-pet/.venv/bin/python` in a checked-in
 plist worked for Pink alone but breaks immediately when anyone else installs.
 The repo will contain `launchagent/com.pink.squid-pet.plist.template`:
 
