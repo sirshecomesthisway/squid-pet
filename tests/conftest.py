@@ -21,6 +21,10 @@ def isolate_codex_wait_markers(tmp_path, monkeypatch):
                         str(tmp_path / 'claude_failed'))
     monkeypatch.setattr(watcher, 'CLAUDE_SESSION_TTY_DIR',
                         str(tmp_path / 'claude_session_tty'))
+    # claude_sessions_awaiting_input() also drives the (throttled) sweep of
+    # PermissionRequest attribution hints -- never let it reach the real dir.
+    monkeypatch.setattr(watcher, 'CLAUDE_PERMISSION_PENDING_DIR',
+                        str(tmp_path / 'claude_permission_pending'))
     # focus.STATE_SIGNAL_DIRS snapshots the watcher dir constants at import,
     # so keep its concerned entry pointing at the SAME (now isolated) object,
     # preserving the production invariant that take-me-there reads the same
