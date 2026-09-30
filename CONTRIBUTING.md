@@ -8,6 +8,8 @@ If you want to write code, the contribution I most want is **a detector
 for an agent Squid doesn't watch yet**. That's a self-contained change:
 one class, one test file, one line in `build_detectors()`.
 
+Using a coding agent (Claude Code, Codex, ...)? Point it at [`AGENTS.md`](AGENTS.md).
+
 ---
 
 ## Setup

@@ -66,10 +66,10 @@ paths. The installer SHALL substitute the user's actual `$HOME` and project
 directory into the placeholders to produce a per-user plist.
 
 #### Scenario: Plist template substitution
-- **WHEN** `install.sh` renders the plist on a user with `$HOME=/Users/alice`
+- **WHEN** `install.sh` renders the plist on a user with `$HOME=/Users/Pochemuchka`
 - **THEN** every occurrence of `__HOME__` in
   `launchagent/com.pink.squid-pet.plist.template` SHALL be replaced with
-  `/Users/alice` and every `__PROJECT__` with the resolved project path,
+  `/Users/Pochemuchka` and every `__PROJECT__` with the resolved project path,
   AND the result SHALL be written to
   `~/Library/LaunchAgents/com.pink.squid-pet.plist`.
 
