@@ -11,7 +11,7 @@ Nothing new is stored and no transcript is opened -- this reads path
 names only, the same level of access ClaudeCodeDetector already uses when
 it globs those files for mtimes.
 
-Encoding rather than decoding is deliberate: '-Users-alice-squid-pet' cannot
+Encoding rather than decoding is deliberate: '-Users-Pochemuchka-squid-pet' cannot
 be decoded unambiguously (a directory name may itself contain a dash), but
 encoding a known cwd the same way and comparing strings is exact.
 """
@@ -21,18 +21,18 @@ from squid_pet import watcher
 
 
 def test_encodes_a_cwd_the_way_claude_code_does():
-    assert watcher.encode_project_dir("/Users/alice") == "-Users-alice"
-    assert watcher.encode_project_dir("/Users/alice/Projects/squid-pet") == (
-        "-Users-alice-Projects-squid-pet")
+    assert watcher.encode_project_dir("/Users/Pochemuchka") == "-Users-Pochemuchka"
+    assert watcher.encode_project_dir("/Users/Pochemuchka/Projects/squid-pet") == (
+        "-Users-Pochemuchka-Projects-squid-pet")
 
 
 def test_finds_the_project_dir_for_a_session(tmp_path, monkeypatch):
     projects = tmp_path / "projects"
-    (projects / "-Users-alice-Projects-squid-pet").mkdir(parents=True)
-    (projects / "-Users-alice-Projects-squid-pet" / "sess-1.jsonl").write_text("")
+    (projects / "-Users-Pochemuchka-Projects-squid-pet").mkdir(parents=True)
+    (projects / "-Users-Pochemuchka-Projects-squid-pet" / "sess-1.jsonl").write_text("")
     monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(projects))
 
-    assert watcher.claude_session_project_dir("sess-1") == "-Users-alice-Projects-squid-pet"
+    assert watcher.claude_session_project_dir("sess-1") == "-Users-Pochemuchka-Projects-squid-pet"
 
 
 def test_unknown_session_has_no_project_dir(tmp_path, monkeypatch):
@@ -50,14 +50,14 @@ class _FakeProc:
 
 
 def test_label_comes_from_the_live_process_cwd(tmp_path, monkeypatch):
-    """The encoded name alone is ambiguous -- "-Users-alice-Projects-squid-pet"
+    """The encoded name alone is ambiguous -- "-Users-Pochemuchka-Projects-squid-pet"
     split on dashes answers "pet". The process knows its real cwd."""
     projects = tmp_path / "projects"
-    (projects / "-Users-alice-Projects-squid-pet").mkdir(parents=True)
-    (projects / "-Users-alice-Projects-squid-pet" / "sess-2.jsonl").write_text("")
+    (projects / "-Users-Pochemuchka-Projects-squid-pet").mkdir(parents=True)
+    (projects / "-Users-Pochemuchka-Projects-squid-pet" / "sess-2.jsonl").write_text("")
     monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(projects))
     monkeypatch.setattr(watcher, "find_claude_code_processes",
-                        lambda: [_FakeProc("/Users/alice/Projects/squid-pet")])
+                        lambda: [_FakeProc("/Users/Pochemuchka/Projects/squid-pet")])
 
     assert watcher.claude_session_label("sess-2") == "squid-pet"
 
@@ -66,8 +66,8 @@ def test_label_falls_back_approximately_with_no_live_process(tmp_path, monkeypat
     """Documented imprecision: with nothing to ask, a dashed project name
     cannot be recovered. Still better than a uuid."""
     projects = tmp_path / "projects"
-    (projects / "-Users-alice-Projects-squid-pet").mkdir(parents=True)
-    (projects / "-Users-alice-Projects-squid-pet" / "sess-3.jsonl").write_text("")
+    (projects / "-Users-Pochemuchka-Projects-squid-pet").mkdir(parents=True)
+    (projects / "-Users-Pochemuchka-Projects-squid-pet" / "sess-3.jsonl").write_text("")
     monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(projects))
     monkeypatch.setattr(watcher, "find_claude_code_processes", lambda: [])
 
@@ -79,12 +79,12 @@ def test_tty_resolves_through_the_matching_process(tmp_path, monkeypatch):
     running -- the payload has no PID, but the project dir identifies the
     process."""
     projects = tmp_path / "projects"
-    (projects / "-Users-alice-api").mkdir(parents=True)
-    (projects / "-Users-alice-api" / "sess-4.jsonl").write_text("")
+    (projects / "-Users-Pochemuchka-api").mkdir(parents=True)
+    (projects / "-Users-Pochemuchka-api" / "sess-4.jsonl").write_text("")
     monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(projects))
     monkeypatch.setattr(watcher, "find_claude_code_processes", lambda: [
-        _FakeProc("/Users/alice/other", "/dev/ttys001"),
-        _FakeProc("/Users/alice/api", "/dev/ttys002"),
+        _FakeProc("/Users/Pochemuchka/other", "/dev/ttys001"),
+        _FakeProc("/Users/Pochemuchka/api", "/dev/ttys002"),
     ])
 
     assert watcher.claude_session_tty("sess-4") == "/dev/ttys002"
@@ -107,12 +107,12 @@ def test_recorded_tty_picks_the_right_same_cwd_session(tmp_path, monkeypatch):
     session shares its cwd and is listed first. The recorded tty must win,
     so tty and host both resolve to Cursor -- not the Terminal bystander."""
     projects = tmp_path / "projects"
-    (projects / "-Users-alice-Projects-squid-pet").mkdir(parents=True)
-    (projects / "-Users-alice-Projects-squid-pet" / "sess-cursor.jsonl").write_text("")
+    (projects / "-Users-Pochemuchka-Projects-squid-pet").mkdir(parents=True)
+    (projects / "-Users-Pochemuchka-Projects-squid-pet" / "sess-cursor.jsonl").write_text("")
     monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(projects))
     monkeypatch.setattr(watcher, "find_claude_code_processes", lambda: [
-        _FakeProc("/Users/alice/Projects/squid-pet", "/dev/ttys000"),  # Terminal, first
-        _FakeProc("/Users/alice/Projects/squid-pet", "/dev/ttys008"),  # Cursor
+        _FakeProc("/Users/Pochemuchka/Projects/squid-pet", "/dev/ttys000"),  # Terminal, first
+        _FakeProc("/Users/Pochemuchka/Projects/squid-pet", "/dev/ttys008"),  # Cursor
     ])
     _record_tty(monkeypatch, tmp_path, "sess-cursor", "/dev/ttys008")
 
@@ -124,12 +124,12 @@ def test_without_a_recorded_tty_it_falls_back_to_cwd(tmp_path, monkeypatch):
     """Older/detached session with no recorded tty: the cwd match still
     resolves it (correct whenever sessions live in distinct directories)."""
     projects = tmp_path / "projects"
-    (projects / "-Users-alice-api").mkdir(parents=True)
-    (projects / "-Users-alice-api" / "sess-old.jsonl").write_text("")
+    (projects / "-Users-Pochemuchka-api").mkdir(parents=True)
+    (projects / "-Users-Pochemuchka-api" / "sess-old.jsonl").write_text("")
     monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(projects))
     monkeypatch.setattr(watcher, "find_claude_code_processes", lambda: [
-        _FakeProc("/Users/alice/other", "/dev/ttys001"),
-        _FakeProc("/Users/alice/api", "/dev/ttys002"),
+        _FakeProc("/Users/Pochemuchka/other", "/dev/ttys001"),
+        _FakeProc("/Users/Pochemuchka/api", "/dev/ttys002"),
     ])
     monkeypatch.setattr(watcher, "CLAUDE_SESSION_TTY_DIR", str(tmp_path / "empty"))
 
@@ -140,11 +140,11 @@ def test_stale_recorded_tty_with_no_live_match_falls_back_to_cwd(tmp_path, monke
     """A recorded tty whose process is gone must not strand resolution: fall
     through to the cwd match rather than returning nothing."""
     projects = tmp_path / "projects"
-    (projects / "-Users-alice-api").mkdir(parents=True)
-    (projects / "-Users-alice-api" / "sess-z.jsonl").write_text("")
+    (projects / "-Users-Pochemuchka-api").mkdir(parents=True)
+    (projects / "-Users-Pochemuchka-api" / "sess-z.jsonl").write_text("")
     monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(projects))
     monkeypatch.setattr(watcher, "find_claude_code_processes", lambda: [
-        _FakeProc("/Users/alice/api", "/dev/ttys002"),
+        _FakeProc("/Users/Pochemuchka/api", "/dev/ttys002"),
     ])
     _record_tty(monkeypatch, tmp_path, "sess-z", "/dev/ttys999")  # no live proc
 
@@ -158,8 +158,8 @@ def test_label_falls_back_to_none_when_unresolvable(tmp_path, monkeypatch):
 
 def test_describes_a_single_waiting_session(tmp_path, monkeypatch):
     projects = tmp_path / "projects"
-    (projects / "-Users-alice-api").mkdir(parents=True)
-    (projects / "-Users-alice-api" / "s1.jsonl").write_text("")
+    (projects / "-Users-Pochemuchka-api").mkdir(parents=True)
+    (projects / "-Users-Pochemuchka-api" / "s1.jsonl").write_text("")
     monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(projects))
     monkeypatch.setattr(watcher, "find_claude_code_processes", lambda: [])
 
@@ -168,7 +168,7 @@ def test_describes_a_single_waiting_session(tmp_path, monkeypatch):
 
 def test_describes_two_waiting_sessions_by_name(tmp_path, monkeypatch):
     projects = tmp_path / "projects"
-    for enc, sid in (("-Users-alice-api", "s1"), ("-Users-alice-web", "s2")):
+    for enc, sid in (("-Users-Pochemuchka-api", "s1"), ("-Users-Pochemuchka-web", "s2")):
         (projects / enc).mkdir(parents=True)
         (projects / enc / f"{sid}.jsonl").write_text("")
     monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(projects))
@@ -184,8 +184,8 @@ def test_many_waiting_sessions_stay_inside_the_bubble(tmp_path, monkeypatch):
     projects = tmp_path / "projects"
     names = ["alpha-service", "beta-service", "gamma-service", "delta-service"]
     for i, n in enumerate(names):
-        (projects / f"-Users-alice-{n}").mkdir(parents=True)
-        (projects / f"-Users-alice-{n}" / f"s{i}.jsonl").write_text("")
+        (projects / f"-Users-Pochemuchka-{n}").mkdir(parents=True)
+        (projects / f"-Users-Pochemuchka-{n}" / f"s{i}.jsonl").write_text("")
     monkeypatch.setattr(watcher, "CLAUDE_PROJECTS_DIR", str(projects))
 
     out = watcher.describe_waiting_sessions([f"s{i}" for i in range(4)])

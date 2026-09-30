@@ -12,7 +12,7 @@ The first attempt matched the terminal TITLE against the session's
 working directory, which meant recording cwd on the awaiting-input flag
 and widening what docs/PRIVACY.md promises. It was then measured against
 a live window and did not even work: Claude Code sets the title to a
-summary of the current task ("alice -- Squid demo script with status
+summary of the current task ("Pochemuchka -- Squid demo script with status
 mentions"), not the directory. TTY needs no new stored data at all, so
 the flag's contents are unchanged.
 
