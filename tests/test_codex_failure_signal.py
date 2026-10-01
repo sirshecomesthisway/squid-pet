@@ -186,22 +186,38 @@ def test_failure_through_state_machine(db, monkeypatch):
     assert 'codex' in state.state_reason
 
 
-def test_codex_concern_has_no_focus_target(db, monkeypatch):
-    """Pink-2026-09-24: a Codex failed-turn row carries no reliable process
-    owner, so take-me-there has no session to raise -- focus_target must be
-    None, and focus_for_snapshot then returns 'none' (a no-op) rather than
-    guessing or inheriting a Claude window."""
+def _must_not_run(_script):
+    raise AssertionError("a Codex-sourced concern must not raise any window")
+
+
+def test_codex_concern_while_codex_running_has_no_focus_target(db, monkeypatch):
+    """A Codex failed-turn row carries no reliable process owner. While a
+    Codex process is running (e.g. the IDE app-server, which may own a
+    window) there is no target and take-me-there stays a silent 'none'."""
+    from squid_pet import focus
+
+    add(db)
+    sm = machine(monkeypatch)
+    # compute() refreshes the flag via is_busy(); pin it as running.
+    sm._codex_detector.is_busy = lambda now: False
+    sm._codex_detector.codex_running = True
+    state = sm.compute(notify=False)
+    assert state.state == 'concerned'
+    assert state.focus_target is None
+    assert focus.focus_for_snapshot(state, run=_must_not_run) == 'none'
+
+
+def test_codex_concern_with_no_codex_running_reports_no_window(db, monkeypatch):
+    """Headless `codex exec` exits immediately: nothing is running, so the
+    target says there is no window and take-me-there reports 'no-window'
+    (the UI shows a hint) -- still without raising any window."""
     from squid_pet import focus
 
     add(db)
     state = machine(monkeypatch).compute(notify=False)
     assert state.state == 'concerned'
-    assert state.focus_target is None
-    # A no-target concern must resolve to a hard no-op: no window raised. The
-    # run callback would raise if focus_for_snapshot tried to open anything.
-    def _must_not_run(_script):
-        raise AssertionError("a Codex-sourced concern must not raise any window")
-    assert focus.focus_for_snapshot(state, run=_must_not_run) == 'none'
+    assert state.focus_target == {'agent': 'codex', 'no_window': True}
+    assert focus.focus_for_snapshot(state, run=_must_not_run) == 'no-window'
 
 
 def test_disabled_detector_skips_read(db, monkeypatch):
