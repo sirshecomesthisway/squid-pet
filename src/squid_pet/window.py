@@ -745,6 +745,7 @@ class PetApi:
             bubble = self._observer.on_state_change(
                 prev_state, state.state,
                 concern_reason=getattr(state, "concern_reason", "") or "",
+                concern_bubble=getattr(state, "concern_bubble", "") or "",
                 shell_cmdline=shell_cmd,
                 state_reason=getattr(state, "state_reason", "") or "",
                 approval_label=_waiting_label(
@@ -1449,6 +1450,9 @@ class PetApi:
             # poke and heart already happened.
             log.warning(f"take_me_there failed: {e}")
             status = "error"
+        if status == "no-window":
+            self._emit_hint(
+                "no window to open — that Codex run was headless or has exited")
         if status != "resting":
             log.info(f"take_me_there({state}) -> {status}")
         return {"status": status, "state": state}

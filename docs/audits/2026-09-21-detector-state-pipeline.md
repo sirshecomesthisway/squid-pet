@@ -21,7 +21,7 @@ The verification harness is a separate PR (#4), not included in this diff.
 | macOS HID idle | Quartz CGEventSourceSecondsSinceLastEventType, fallback `ioreg` timeout 2s | Every tick; failures ->0 | Exposed diagnostic; sleep uses agent-idle instead |
 | Claude permission/question | claude_pet_hook.py Notification(permission_prompt), PreToolUse(AskUserQuestion/ExitPlanMode) -> session-named flag | 2h disk expiry; 120s observation-based snooze | Approval override; baseline heuristic deletes after >=3s if aggregate working/thinking and <=1 Claude process |
 | Claude wait clear | Same hook: UserPromptSubmit, PostToolUse, Stop, SessionEnd unlink session flag | Next tick | Ends approval; PostToolUse has only session-level correlation |
-| Claude turn open/close | UserPromptSubmit writes claude_turn_active; Stop/SessionEnd remove | 1h stale cleanup; turn fallback requires newest transcript age <=180s | Thinking fallback, Git deferral, celebration/groove latches |
+| Claude turn open/close | UserPromptSubmit writes claude_turn_active; Stop/SessionEnd remove | 1h stale cleanup; turn fallback requires newest transcript age <=600s | Thinking fallback, Git deferral, celebration/groove latches |
 | Claude Stop | Writes claude_finished/session | <=celebrate_hold_sec (20s default), prune >2h | Groove only; no inferred task completion |
 | Claude compaction | PreCompact writes claude_recapping, PostCompact/SessionEnd remove | <=120s, prune >2h | Thinking with recap reason |
 | Explicit completion | squid_task_complete.py writes claude_task_complete/session (or unknown) | <=celebrate_hold_sec; prune >2h | Celebrate regardless of agent presence |
@@ -61,7 +61,7 @@ Any previous state can enter any output state when its guard becomes highest.
 5. **Thinking/recapping**: fresh recap marker when Claude detector enabled.
 6. If either agent process present: **working** for shell/file (arms 25s hold),
    **working** during hold only with continuing streaming, **thinking** for
-   streaming, **thinking** for open Claude turn with transcript age <=180s.
+   streaming, **thinking** for open Claude turn with transcript age <=600s.
 7. **Thinking** if any enabled generic detector busy, else **idle**.
 8. **Approval_needed** overrides any cascade state for eligible direct waits;
    one notification per uninterrupted approval episode. Alert switch is separate

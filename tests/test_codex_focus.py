@@ -78,6 +78,28 @@ def test_dead_or_reused_owner_never_raises_other_session(waiting):
     assert focus.focus_for_state('approval_needed', run=lambda s: pytest.fail('wrong window')) == 'none'
 
 
+def _codex_snapshot(owner):
+    return watcher.PetState(state='concerned',
+                            focus_target={'agent': 'codex', 'owner': owner})
+
+
+def test_snapshot_dead_or_reused_owner_reports_no_window():
+    import psutil
+    never = lambda s: pytest.fail('wrong window')  # noqa: E731
+    reused = {'pid': os.getpid(), 'created': psutil.Process().create_time() - 1}
+    assert focus.focus_for_snapshot(_codex_snapshot(reused), run=never) == 'no-window'
+    dead = {'pid': 2 ** 22 + 12345, 'created': 1.0}
+    assert focus.focus_for_snapshot(_codex_snapshot(dead), run=never) == 'no-window'
+
+
+def test_snapshot_owner_without_tty_reports_no_window(monkeypatch):
+    import psutil
+    owner = {'pid': os.getpid(), 'created': psutil.Process().create_time()}
+    monkeypatch.setattr(psutil.Process, 'terminal', lambda self: None)
+    never = lambda s: pytest.fail('wrong window')  # noqa: E731
+    assert focus.focus_for_snapshot(_codex_snapshot(owner), run=never) == 'no-window'
+
+
 def test_hook_owner_metadata_follows_reference_count_and_cleanup(tmp_path, monkeypatch):
     from tests.test_codex_approval_decisions import hook
     monkeypatch.setattr(hook, 'codex_owner', lambda: {'pid': 123, 'created': 50})

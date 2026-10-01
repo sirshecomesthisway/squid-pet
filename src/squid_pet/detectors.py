@@ -191,7 +191,12 @@ class ClaudeCodeDetector:
 
     STREAMING_STALE_SEC = 20.0
     DISCOVERY_CACHE_SEC = 60.0
-    CANDIDATE_MAX_AGE_SEC = 900.0  # drop transcripts idle >15min from the cache
+    # A subagent transcript whose last conversational record is not a final
+    # result (see _tail_info) counts as busy for this long after its last write:
+    # a long-thinking helper can stay silent for many minutes.
+    SUBAGENT_OPEN_STALE_SEC = 1500.0
+    # Must exceed SUBAGENT_OPEN_STALE_SEC so open helpers stay cached.
+    CANDIDATE_MAX_AGE_SEC = 1800.0
     FILE_ACTIVE_WINDOW_SEC = 10.0  # a bit more generous than IDEDetector's 5s
 
     def __init__(
@@ -260,6 +265,14 @@ class ClaudeCodeDetector:
         self.transcript_path: str | None = None
         self.transcript_age: float = float("inf")
         self.streaming: bool = False
+        # True while some subagent transcript has no final result yet (see
+        # _tail_info); open_subagent_path is the newest such transcript.
+        self.subagent_open: bool = False
+        self.open_subagent_path: str | None = None
+        # Owning session ids of transcripts written recently (file-write window
+        # plus streaming slack) or held open by a subagent. Lets the watcher name
+        # a focus target for a project file write when exactly one session fits.
+        self.recent_session_ids: frozenset[str] = frozenset()
 
     def _lazy_defaults(self) -> None:
         if self._find_processes is None:
@@ -390,12 +403,70 @@ class ClaudeCodeDetector:
         A tail containing only complete ledger records contributes no activity;
         oversized records that cannot be decoded retain the mtime fallback.
         """
+        return self._tail_info(path, stat)[0]
+
+    def _subagent_is_open(self, path, stat) -> bool:
+        """True for a subagent transcript with no final result yet (see
+        _tail_info). Always False for a non-subagent path."""
+        if Path(path).parent.name != "subagents":
+            return False
+        return self._tail_info(path, stat)[1]
+
+    @staticmethod
+    def _tail_is_open(lines) -> bool:
+        """Content-blind: reads only ``type``, ``message.stop_reason`` and the
+        TYPE of the last content block, never any text or values.
+
+        Walk back past ledger/attachment/system/other records to the last
+        user or assistant record. Open = a user record (tool_result), an
+        assistant record with stop_reason tool_use, or one with stop_reason
+        None whose last block is thinking/tool_use. A final text block (often
+        recorded with stop_reason None) is closed. Anything doubtful (empty
+        tail, undecodable record, unknown shape) is not open.
+        """
+        for line in reversed(lines):
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                return False
+            if not isinstance(record, dict):
+                return False
+            rtype = record.get("type")
+            if rtype == "user":
+                return True
+            if rtype == "assistant":
+                message = record.get("message")
+                if not isinstance(message, dict):
+                    return False
+                reason = message.get("stop_reason")
+                if reason == "tool_use":
+                    return True
+                if reason in ("end_turn", "stop_sequence", "max_tokens"):
+                    return False
+                if reason is not None:
+                    return False  # unknown stop reason: doubtful, fail closed
+                # stop_reason None: a finished helper's last text block is
+                # often recorded with None too, so look at the TYPE of the
+                # last content block (never its text/values).
+                content = message.get("content")
+                if not isinstance(content, list) or not content:
+                    return False
+                last = content[-1]
+                if not isinstance(last, dict):
+                    return False
+                return last.get("type") in ("thinking", "tool_use")
+        return False
+
+    def _tail_info(self, path, stat) -> tuple:
+        """(activity_mtime, subagent_open) from one bounded tail read, cached
+        on (mtime, size) so each change to a file is read at most once."""
         key = (getattr(stat, "st_mtime_ns", stat.st_mtime),
                getattr(stat, "st_size", None))
         cached = self._transcript_activity_cache.get(str(path))
         if cached is not None and cached[0] == key:
-            return cached[1]
+            return cached[1], cached[2]
         activity = stat.st_mtime
+        is_open = False
         try:
             with open(path, "rb") as stream:
                 size = stream.seek(0, os.SEEK_END)
@@ -404,6 +475,8 @@ class ClaudeCodeDetector:
                 lines = stream.read(65536).splitlines()
             if offset:
                 lines = lines[1:]  # first record may be partial
+            if Path(path).parent.name == "subagents":
+                is_open = self._tail_is_open(lines)
             saw_ledger = False
             for line in reversed(lines):
                 try:
@@ -429,12 +502,17 @@ class ClaudeCodeDetector:
                 break
         except OSError:
             pass
-        self._transcript_activity_cache[str(path)] = (key, activity)
-        return activity
+        self._transcript_activity_cache[str(path)] = (key, activity, is_open)
+        return activity, is_open
 
     def _newest_transcript_age(self, now: float) -> float:
         newest_mtime = 0.0
+        open_mtime = 0.0
         self.transcript_path = None
+        self.subagent_open = False
+        self.open_subagent_path = None
+        recent_sids: set[str] = set()
+        recent_sec = self.FILE_ACTIVE_WINDOW_SEC + self.STREAMING_STALE_SEC
         candidates = self._discover(now)
         candidate_keys = {str(f) for f in candidates}
         self._transcript_activity_cache = {
@@ -449,9 +527,23 @@ class ClaudeCodeDetector:
             mtime = stat.st_mtime
             if now - mtime < self.STREAMING_STALE_SEC:
                 mtime = self._transcript_activity_mtime(f, stat)
+            # Openness is judged per transcript, independent of glob order, so
+            # every open helper's session lands in recent_session_ids.
+            is_open = (stat.st_mtime <= now
+                       and now - stat.st_mtime < self.SUBAGENT_OPEN_STALE_SEC
+                       and self._subagent_is_open(f, stat))
+            if is_open and stat.st_mtime > open_mtime:
+                open_mtime = stat.st_mtime
+                self.subagent_open = True
+                self.open_subagent_path = str(f)
+            if mtime <= now and (now - mtime < recent_sec or is_open):
+                sid = claude_session_id_from_transcript(str(f))
+                if sid:
+                    recent_sids.add(sid)
             if mtime <= now and mtime > newest_mtime:
                 newest_mtime = mtime
                 self.transcript_path = str(f)
+        self.recent_session_ids = frozenset(recent_sids)
         if newest_mtime == 0.0:
             return float("inf")
         return max(0.0, now - newest_mtime)
@@ -477,7 +569,14 @@ class ClaudeCodeDetector:
         self._scan_now = now
         self.file_active = bool(self._recent_file_ages()) if procs else False
         self.transcript_age = self._newest_transcript_age(now)
-        self.streaming = bool(procs) and self.transcript_age < self.STREAMING_STALE_SEC
+        recent = self.transcript_age < self.STREAMING_STALE_SEC
+        self.subagent_open = bool(procs) and self.subagent_open
+        self.streaming = bool(procs) and (recent or self.subagent_open)
+        if self.streaming and not recent and self.open_subagent_path:
+            # Busy only because a silent helper is still open: point focus at
+            # its parent session. transcript_age stays untouched so the
+            # watcher's stall guard (branch 4c) is unaffected.
+            self.transcript_path = self.open_subagent_path
         self._last_scan_ts = now
 
     def is_busy(self, now: float) -> bool:
@@ -515,6 +614,7 @@ class ClaudeCodeDetector:
             "file_active": self.file_active,
             "transcript_age": self.transcript_age,
             "streaming": self.streaming,
+            "subagent_open": self.subagent_open,
         }
 
 

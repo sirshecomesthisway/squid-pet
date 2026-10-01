@@ -269,20 +269,28 @@ def build_app_activate_script(bundle_id: str) -> str:
     return f'tell application id "{_escape_applescript(bundle_id)}" to activate\n'
 
 
-def _focus_process_owner(owner: dict, run=None, still_current=None) -> str:
-    """Activate only an exact live process's Terminal tab."""
+def _focus_process_owner(owner: dict, run=None, still_current=None,
+                         report_gone: bool = False) -> str:
+    """Activate only an exact live process's Terminal tab.
+
+    report_gone: return "no-window" (instead of "none") when the owner is
+    dead, its pid was reused, or it has no controlling tty (headless), so the
+    caller can tell the user there is nothing to open. Off by default: the
+    approval path keeps its silent "none".
+    """
     import psutil
 
     from . import codex_turns, watcher
     try:
+        gone = "no-window" if report_gone else "none"
         if not isinstance(owner, dict) or not codex_turns.owner_alive(owner):
-            return "none"
+            return gone
         proc = psutil.Process(owner['pid'])
         if proc.create_time() != owner.get('created'):
-            return "none"
+            return gone
         tty = proc.terminal()
         if not tty:
-            return "none"
+            return gone
         cur = proc
         bundle = None
         for _ in range(10):
@@ -338,7 +346,9 @@ def focus_for_snapshot(snapshot, run=None) -> str:
     if target.get('agent') == 'codex' and target.get('request'):
         return _focus_codex_approval([target['request']], run)
     if target.get('agent') == 'codex' and target.get('owner'):
-        return _focus_process_owner(target['owner'], run)
+        return _focus_process_owner(target['owner'], run, report_gone=True)
+    if target.get('agent') == 'codex' and target.get('no_window'):
+        return "no-window"
     if target.get('agent') == 'claude':
         # Resolve only Claude's signal directory. The snapshot may predate a
         # new Codex request, which must not steal a Claude-origin click.

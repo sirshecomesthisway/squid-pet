@@ -148,6 +148,10 @@ class PetState:
     message: str = ""             # short caption shown under the pet
     concern_reason: str = ""      # short headline of why concerned (for tooltip)
     concern_severity: str = ""    # "transient" (network) or "hard" (code crash)
+    # Short bubble text naming the failing agent and category, e.g.
+    # "Claude: usage limit hit". Empty when not concerned. concern_reason
+    # (the longer, agent-neutral tooltip headline) is unchanged.
+    concern_bubble: str = ""
     # Fix C (2026-06-28): short human-readable explanation of WHY this
     # state fired this tick. Surfaced in `squid why` + optionally used
     # as the bubble.
@@ -951,6 +955,29 @@ _CONCERN_BY_ERROR_TYPE: dict[str, tuple[str, str]] = {
 }
 _CONCERN_FALLBACK: tuple[str, str] = ("Something went wrong", "hard")
 
+# error_type -> agent-neutral label (<= 24 chars) for the concerned bubble,
+# which is prefixed "Claude: " / "Codex: " and must fit observer's
+# MAX_BUBBLE_CHARS (32). A test pins that every key above has an entry.
+_CONCERN_SHORT_BY_ERROR_TYPE: dict[str, str] = {
+    "rate_limit": "usage limit hit",
+    "overloaded": "servers overloaded",
+    "server_error": "server error",
+    "authentication_failed": "sign-in expired",
+    "oauth_org_not_allowed": "org not allowed",
+    "account_on_hold": "account on hold",
+    "billing_error": "billing issue",
+    "invalid_request": "request rejected",
+    "model_not_found": "model unavailable",
+    "max_output_tokens": "max response length",
+    "cloud_credential_error": "credentials failed",
+    "unknown": "a request failed",
+    "usage_limited": "usage limit hit",
+    "codex_overloaded": "servers overloaded",
+    "codex_server_error": "server error",
+    "codex_connection_error": "connection failed",
+}
+_CONCERN_SHORT_FALLBACK = "a request failed"
+
 
 def concern_for_error_type(error_type: str) -> tuple[str, str]:
     """Map a Claude or normalized Codex error category to (reason headline, severity).
@@ -1165,9 +1192,11 @@ CLAUDE_TURN_ACTIVE_STALE_SEC = 3600.0
 # stops reading it as "thinking" (branch 4c) and lets her fall through to idle.
 # A usage-limit block (Claude Code halts without firing Stop) keeps the turn
 # bracket open for minutes-to-hours; a genuine silent thinking stretch is much
-# shorter (measured <~60s). 180s sits well clear of both. Hot-reloadable via
+# shorter (typically <~60s, but a 5-minute gap was observed live while Claude
+# kept working -- the 180s default showed idle mid-work). 600s covers that gap
+# and still clears a usage-limit block within ten minutes. Hot-reloadable via
 # config.get("turn_stall_sec").
-TURN_STALL_SEC_DEFAULT = 180.0
+TURN_STALL_SEC_DEFAULT = 600.0
 
 
 # ── WHICH session is waving? (Pink-2026-09-01) ─────────────────────────
@@ -1378,15 +1407,21 @@ def describe_waiting_sessions(session_ids: list[str]) -> str | None:
     return f"{' + '.join(labels)} need you"
 
 
+def claude_turn_active_sessions(fresh_sec: float | None = None) -> list[str]:
+    """Session ids between UserPromptSubmit and Stop whose turn flag is fresher
+    than fresh_sec (default: the crash-safety stale window)."""
+    return _scan_session_flag_dir(
+        CLAUDE_TURN_ACTIVE_DIR,
+        CLAUDE_TURN_ACTIVE_STALE_SEC,
+        fresh_sec if fresh_sec is not None else CLAUDE_TURN_ACTIVE_STALE_SEC,
+    )
+
+
 def claude_turn_in_flight(now: float | None = None, *, fresh_sec: float | None = None) -> bool:
     """True iff any Claude Code session is between UserPromptSubmit and
     Stop -- i.e. actively working on a turn, whether or not it has written
     anything to disk yet."""
-    return bool(_scan_session_flag_dir(
-        CLAUDE_TURN_ACTIVE_DIR,
-        CLAUDE_TURN_ACTIVE_STALE_SEC,
-        fresh_sec if fresh_sec is not None else CLAUDE_TURN_ACTIVE_STALE_SEC,
-    ))
+    return bool(claude_turn_active_sessions(fresh_sec))
 
 
 def claude_task_marked_complete_recently(now: float | None = None) -> bool:
@@ -2384,15 +2419,26 @@ class StateMachine:
             error_type = codex_freshest_failure(now)
             source = "codex failed turn"
             # A Codex failed-turn row carries no reliable process owner, so
-            # there is no session to raise; focus_for_snapshot falls through
-            # to "resting" rather than guessing a window.
-            focus_target = None
+            # there is no session to raise and we never guess a window. When
+            # no Codex process is running the run was headless (`codex exec`)
+            # or has exited: mark it so take-me-there can say no window
+            # exists. While an interactive Codex (`codex`/`codex-tui`) is
+            # running it may own a window, so that stays a silent no-op --
+            # which also means a headless failure next to an open interactive
+            # session is not reported (the row cannot say which process
+            # failed). Reads the detector's existing flag; no new scan.
+            focus_target = (
+                None if getattr(self._codex_detector, "codex_running", False)
+                else {"agent": "codex", "no_window": True})
         if error_type is None:
             return
         reason, severity = concern_for_error_type(error_type)
         st.state = "concerned"
         st.concern_reason = reason
         st.concern_severity = severity
+        short = _CONCERN_SHORT_BY_ERROR_TYPE.get(
+            error_type, _CONCERN_SHORT_FALLBACK)
+        st.concern_bubble = f"{'Claude' if claude_hit else 'Codex'}: {short}"
         st.state_reason = f"{source} ({error_type})"
         st.message = f"⚠️ {reason}"
         st.focus_target = focus_target
@@ -2541,11 +2587,27 @@ class StateMachine:
             owners = {(r['pid'], r['created']) for r in matches}
             return codex_target(matches[0]) if len(owners) == 1 else None
 
+        def file_write_target() -> dict | None:
+            # Project file writes (in-process Edit/Write, often by a subagent)
+            # name no shell owner. Best effort: when only Claude saw the write
+            # and exactly one Claude session is plausible, target it so "take
+            # me there" has something to raise. A hand edit in an editor while
+            # one Claude session is active is attributed to it too. Otherwise
+            # None (never guess between sessions).
+            if not claude_file_active or codex_file_active:
+                return None
+            sids = set(getattr(claude, 'recent_session_ids', None) or ())
+            if not sids:
+                sids = set(claude_turn_active_sessions(_turn_stall))
+            if len(sids) != 1:
+                return None
+            return {"agent": "claude", "session": next(iter(sids))}
+
         def working_target() -> dict | None:
             detector = claude if claude_shell_active else codex if codex_shell_active else None
             owner = getattr(detector, 'shell_owner', None)
             if not owner:
-                return None
+                return file_write_target()
             # finding 2 (2026-09-24): the shell OWNER is authoritative for a
             # working target -- it is the exact process running the tool
             # subprocess. Deliberately NOT stamped with a transcript-derived
@@ -2602,6 +2664,10 @@ class StateMachine:
             """Which agent's streaming signal earns credit. Only called
             once streaming_merged is already known True."""
             if claude_streaming:
+                if (getattr(claude, "subagent_open", False)
+                        and claude_transcript_age >= getattr(
+                            claude, "STREAMING_STALE_SEC", 20.0)):
+                    return "claude helper working"
                 return "claude streaming"
             return "codex streaming"
 

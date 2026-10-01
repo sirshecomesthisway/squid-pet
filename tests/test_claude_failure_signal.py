@@ -125,6 +125,7 @@ def test_fresh_failure_overrides_idle_cascade_to_concerned(tmp_failed_dir, monke
     assert st.concern_severity == "transient"
     assert "limit" in st.concern_reason.lower()
     assert "StopFailure" in st.state_reason
+    assert st.concern_bubble == "Claude: usage limit hit"
 
 
 def test_claude_failure_names_claude_as_the_focus_target(tmp_failed_dir, monkeypatch):
@@ -210,3 +211,15 @@ def test_approval_needed_wins_over_concerned(tmp_failed_dir, tmp_path, monkeypat
     # The approval override runs after the failure override and must overwrite
     # focus_target with its own source, not leave the concern's behind.
     assert st.focus_target == {"agent": "claude"}
+
+
+def test_every_error_type_has_short_label_that_fits_a_bubble():
+    from squid_pet.observer import MAX_BUBBLE_CHARS
+
+    for key in watcher._CONCERN_BY_ERROR_TYPE:
+        short = watcher._CONCERN_SHORT_BY_ERROR_TYPE.get(key)
+        assert short, key
+        assert len(short) <= 24, key
+        for agent in ("Claude", "Codex"):
+            assert len(f"{agent}: {short}") <= MAX_BUBBLE_CHARS, (agent, key)
+    assert len(f"Claude: {watcher._CONCERN_SHORT_FALLBACK}") <= MAX_BUBBLE_CHARS

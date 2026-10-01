@@ -100,7 +100,11 @@ the right app to the front on click instead of a generic/unhelpful target.
 | CPU% of that process | diagnostic only (`squid why`) — not used to decide state |
 | Non-shell descendant processes of `claude` (shared tool-name allowlist, also used by CodexDetector) | detects a live tool call (e.g. a Bash-tool command) → "working" |
 | File mtimes under `project_dirs` (default `~/Projects`), same scan as IDEDetector | detects a very recent write (in-process tools like Edit/Write don't spawn a subprocess, so this catches what shell-child detection misses) → "working" |
-| `~/.claude/projects/*/*.jsonl` and `~/.claude/projects/*/*/subagents/agent-*.jsonl` mtime plus up to 64 KiB of tail record types/timestamps | detects a recent transcript write → "thinking" (proxy for the LLM generating or a tool call resolving). The subagent pattern lets a Task-tool helper's own transcript keep her out of idle while it works; same content-blind tail read, never the `.meta.json` sidecar |
+| `~/.claude/projects/*/*.jsonl` and `~/.claude/projects/*/*/subagents/agent-*.jsonl` mtime plus up to 64 KiB of tail record types/timestamps | detects a recent transcript write → "thinking" (proxy for the LLM generating or a tool call resolving). The subagent pattern lets a Task-tool helper's own transcript keep her out of idle while it works; same content-blind tail read, never the `.meta.json` sidecar. For subagent transcripts the same tail read also reads each record's `type`, `message.stop_reason` and the *type* of its last content block only (never any text): a helper whose last record is a tool result, a tool call or a thinking block (not a final text block) is treated as still working for up to 25 minutes of silence |
+
+Known risk: a helper killed by Esc or a crash leaves a transcript with no final
+record, so the pet can show "thinking" for up to 25 minutes (while any `claude`
+process runs) after it died.
 
 Transcript tails are read only when recently modified, and cached until
 mtime/size changes. Background `artifact-autoreact-ledger` records do not

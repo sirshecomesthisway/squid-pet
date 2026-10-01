@@ -668,15 +668,15 @@ def test_usage_limit_stall_falls_to_idle(monkeypatch, tmp_path):
     """turn_in_flight + transcript silent past turn_stall_sec -> idle, not
     a forever-'thinking'."""
     from squid_pet import config
-    monkeypatch.setattr(config, "_load_raw", lambda: {})  # default 180s stall
+    monkeypatch.setattr(config, "_load_raw", lambda: {})  # default 600s stall
     turn_dir = tmp_path / "claude_turn_active"
-    sm = _claude_machine(monkeypatch, transcript_age_sec=300.0,
+    sm = _claude_machine(monkeypatch, transcript_age_sec=700.0,
                          turn_active_dir=str(turn_dir))
-    _write_flag(turn_dir, "sess-1", 1_000_000.0 - 300.0)
+    _write_flag(turn_dir, "sess-1", 1_000_000.0 - 700.0)
 
     st = sm.compute()
     assert st.state == "idle", (
-        "a turn open but silent for 5 min is blocked (e.g. usage limit), "
+        "a turn open but silent for 10+ min is blocked (e.g. usage limit), "
         "not thinking")
 
 
@@ -684,9 +684,9 @@ def test_turn_in_flight_just_under_stall_still_thinking(monkeypatch, tmp_path):
     """Just below the stall window she is still 'thinking some more' -- the
     original silent-thinking backstop must survive."""
     from squid_pet import config
-    monkeypatch.setattr(config, "_load_raw", lambda: {})  # default 180s stall
+    monkeypatch.setattr(config, "_load_raw", lambda: {})  # default 600s stall
     turn_dir = tmp_path / "claude_turn_active"
-    sm = _claude_machine(monkeypatch, transcript_age_sec=150.0,
+    sm = _claude_machine(monkeypatch, transcript_age_sec=300.0,
                          turn_active_dir=str(turn_dir))
     _write_flag(turn_dir, "sess-1", 1_000_000.0 - 30.0)
 
@@ -779,11 +779,11 @@ def test_b_open_turn_fresh_subagent_past_stall_not_idle(monkeypatch, tmp_path):
     transcript keeps transcript_age young, so streaming (4b) holds her at
     thinking instead of the stall dropping her to idle."""
     from squid_pet import config
-    monkeypatch.setattr(config, "_load_raw", lambda: {})  # default 180s stall
+    monkeypatch.setattr(config, "_load_raw", lambda: {})  # default 600s stall
     now = 1_000_000.0
     turn_dir = tmp_path / "claude_turn_active"
     sm = _machine_with_transcripts(monkeypatch, {
-        _PARENT: now - 300.0,     # parent silent > 180s stall
+        _PARENT: now - 700.0,     # parent silent > 600s stall
         _SUBAGENT: now - 3.0,     # helper still writing
     }, turn_active_dir=str(turn_dir))
     _write_flag(turn_dir, "sess-1", now - 30.0)

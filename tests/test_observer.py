@@ -167,6 +167,23 @@ def test_concerned_with_reason_prefers_reason_verbatim(obs):
     assert "ConnectionRefused" in result
 
 
+def test_concerned_prefers_concern_bubble(obs):
+    result = obs.on_state_change(
+        "idle", "concerned",
+        concern_reason="Usage limit reached",
+        concern_bubble="Claude: usage limit hit",
+    )
+    assert result == "Claude: usage limit hit"
+
+
+def test_concerned_without_bubble_still_uses_reason(obs):
+    result = obs.on_state_change(
+        "idle", "concerned", concern_reason="Usage limit reached",
+        concern_bubble="",
+    )
+    assert result == "Usage limit reached"
+
+
 def test_concern_reason_strips_module_prefixes():
     # Pink-2026-09-24: casing is preserved now (concern_reason is a curated
     # headline whose deliberate casing must not be mangled) -- only the noisy

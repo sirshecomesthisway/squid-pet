@@ -217,10 +217,10 @@ def test_transcript_freshness_boundary(world, kind, age, want):
     assert agent(kind, age=age).is_busy(world[0]) is want
 
 
-@pytest.mark.parametrize("age,want", [(179.999, "thinking"), (180.0, "thinking"),
-                                      (180.001, "idle")])
+@pytest.mark.parametrize("age,want", [(599.999, "thinking"), (600.0, "thinking"),
+                                      (600.001, "idle")])
 def test_open_turn_stall_boundary(world, age, want):
-    flag(watcher.CLAUDE_TURN_ACTIVE_DIR, "s", world[0] - 200)
+    flag(watcher.CLAUDE_TURN_ACTIVE_DIR, "s", world[0] - 700)
     sm = watcher.StateMachine(detectors=[agent("claude", age=age)])
     assert sm.compute(notify=False).state == want
 
@@ -345,10 +345,10 @@ def test_killed_claude_turn_cannot_borrow_live_codex_process(world):
     assert sm.compute(notify=False).state == "idle"
 
 
-@pytest.mark.parametrize("transcript_age", [float("inf"), 600.0])
+@pytest.mark.parametrize("transcript_age", [float("inf"), 1200.0])
 def test_new_prompt_starts_thinking_before_first_transcript_write(world, transcript_age):
     flag(watcher.CLAUDE_TURN_ACTIVE_DIR, "new-turn", world[0])
     sm = watcher.StateMachine(detectors=[agent("claude", age=transcript_age)])
     assert sm.compute(notify=False).state == "thinking"
-    world[0] += 180.001
+    world[0] += 600.001
     assert sm.compute(notify=False).state == "idle"
