@@ -4,7 +4,7 @@ Covers:
   (a) Default 20s baseline on GitDetector
   (b) Config override is read at use site (hot-reloadable: each celebrate
       arm picks up the latest config value, no restart needed)
-  (c) GitDetector fires celebrate on touched HEAD
+  (c) GitDetector fires celebrate on a new commit
 
 Pink-2026-08-22: the legacy agent's detector tests were converted to
 ClaudeCodeDetector (that detector was removed -- the agent was never actually
@@ -20,7 +20,7 @@ Claude Code's official Stop hook: see
 tests/test_watcher_claude_code_cascade.py (state-machine-level
 integration) and tests/test_claude_pet_hook_script.py (the hook script
 itself) for the replacement coverage. GitDetector's celebrate_hold_sec
-tests are untouched -- its signal (an actual .git/HEAD mtime change)
+tests are untouched -- its signal (an actual branch-tip sha change)
 was never part of this problem.
 """
 from __future__ import annotations
@@ -38,45 +38,46 @@ def test_git_default_celebrate_hold_is_20s():
     assert d.CELEBRATE_HOLD_SEC == 20.0
 
 
+def _repo_with_baseline(tmp_path, fake_now):
+    """Repo on main at sha A, detector holding its baseline at fake_now-2."""
+    gitdir = tmp_path / "myrepo" / ".git"
+    (gitdir / "refs" / "heads").mkdir(parents=True)
+    head = gitdir / "HEAD"
+    head.write_text("ref: refs/heads/main\n")
+    os.utime(head, (fake_now - 100, fake_now - 100))
+    _commit(gitdir, "a" * 40, fake_now - 100)
+    d = GitDetector(project_dirs=[str(tmp_path)])
+    d._discovered_at = 0.0  # force first discovery
+    assert not d.is_celebrating(fake_now - 2)  # first sighting: baseline only
+    return gitdir, d
+
+
+def _commit(gitdir, sha, ts):
+    ref = gitdir / "refs" / "heads" / "main"
+    ref.write_text(sha + "\n")
+    os.utime(ref, (ts, ts))
+
+
 # ── (b) Config-override hot-reload ──────────────────────────────────────
 def test_git_celebrate_hold_reads_config_on_arm(tmp_path):
     """GitDetector reads celebrate_hold_sec at the moment celebrate arms."""
-    # Make a fake repo: <tmp>/myrepo/.git/HEAD with a fresh mtime
-    repo = tmp_path / "myrepo"
-    git = repo / ".git"
-    git.mkdir(parents=True)
-    head = git / "HEAD"
-    head.write_text("ref: refs/heads/main\n")
-    # Touch HEAD to now-1 so it's <5s ago
     fake_now = 1000.0
-    os.utime(head, (fake_now - 1, fake_now - 1))
-    (git / "refs" / "heads").mkdir(parents=True)
-
-    d = GitDetector(project_dirs=[str(tmp_path)])
+    gitdir, d = _repo_with_baseline(tmp_path, fake_now)
+    _commit(gitdir, "b" * 40, fake_now - 1)
     with patch("squid_pet.config.get", side_effect=lambda k, default=None:
                12.5 if k == "celebrate_hold_sec" else default):
-        # Force discovery by setting last-discovery to past
-        d._discovered_at = 0.0
         # is_celebrating() -> _refresh() -> arms _celebrate_until
-        assert d.is_celebrating(fake_now), "should fire celebrate on fresh HEAD"
+        assert d.is_celebrating(fake_now), "should fire celebrate on a new commit"
         # Expected: fake_now + 12.5 = 1012.5
         assert abs(d._celebrate_until - 1012.5) < 0.001, \
             f"expected 1012.5, got {d._celebrate_until}"
 
 
-# ── (c) GitDetector fires celebrate on touched HEAD ─────────────────────
-def test_git_celebrate_fires_on_fresh_head(tmp_path):
-    """End-to-end: touch .git/HEAD -> is_celebrating(now) True."""
-    repo = tmp_path / "myrepo"
-    git = repo / ".git"
-    git.mkdir(parents=True)
-    head = git / "HEAD"
-    head.write_text("ref: refs/heads/main\n")
+# ── (c) GitDetector fires celebrate on a new commit ─────────────────────
+def test_git_celebrate_fires_on_new_commit(tmp_path):
+    """End-to-end: branch tip moves between scans -> is_celebrating True."""
     fake_now = 1000.0
-    os.utime(head, (fake_now - 1, fake_now - 1))
-    (git / "refs" / "heads").mkdir(parents=True)
-
-    d = GitDetector(project_dirs=[str(tmp_path)])
-    d._discovered_at = 0.0  # force first discovery
+    gitdir, d = _repo_with_baseline(tmp_path, fake_now)
+    _commit(gitdir, "b" * 40, fake_now - 1)
     assert d.is_celebrating(fake_now), \
-        "GitDetector should report celebrating on fresh HEAD mtime"
+        "GitDetector should report celebrating when the branch tip changes"

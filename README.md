@@ -356,7 +356,7 @@ tick, so list only roots you actively work in. Paths may use `~`.
 |---|---|---|
 | `claude_code` | `claude` process presence, live tool subprocess, recent writes under `project_dirs`, `~/.claude/projects/*/*.jsonl` and subagent `*/*/subagents/agent-*.jsonl` write recency | working / thinking / celebrating |
 | `codex` | `codex`/`codex-tui` process presence, live tool subprocess, recent writes under `project_dirs`, `~/.codex/sessions/**/*.jsonl` write recency | working / thinking |
-| `git` | `.git/{HEAD,index,refs/heads/}` mtimes under `project_dirs` | busy / celebrating |
+| `git` | `.git/{HEAD,index,packed-refs}` and current-branch ref mtimes under `project_dirs`; branch tip sha (in memory only) on change | busy / celebrating |
 | `terminal` | any shell with a long-lived non-shell child | busy (off by default — misfires on any dev machine with a long-running foreground process, e.g. an editor or a REPL) |
 | `ide` | recent file mtimes under `project_dirs` — any editor (VS Code, Cursor, JetBrains, Zed, vim…), no per-IDE support needed. Editor-process CPU% is surfaced by `squid why` but does **not** gate the state | busy / grooving |
 

@@ -40,6 +40,21 @@ def flag(directory, name, timestamp):
     return path
 
 
+def _write_at(path, text, timestamp):
+    path.write_text(text)
+    os.utime(path, (timestamp, timestamp))
+
+
+def _git_baseline_then_commit(gitdir, det, now):
+    """Record a baseline for a repo on main, then move its tip at ``now``."""
+    (gitdir / "refs" / "heads").mkdir(parents=True, exist_ok=True)
+    ref = gitdir / "refs" / "heads" / "main"
+    _write_at(gitdir / "HEAD", "ref: refs/heads/main\n", now - 100)
+    _write_at(ref, "a" * 40, now - 100)
+    assert not det.is_celebrating(now - 1)
+    _write_at(ref, "b" * 40, now - 0.5)
+
+
 def agent(kind, *, running=True, shell=False, age=float("inf"), now=10_000.0):
     cls = ClaudeCodeDetector if kind == "claude" else CodexDetector
     return cls(
@@ -93,8 +108,9 @@ def test_each_fresh_signal_wakes_a_sleeping_machine(world, tmp_path, signal, wan
     elif signal == "git":
         root = tmp_path / "repo"
         (root / ".git").mkdir(parents=True)
-        flag(root / ".git", "HEAD", world[0])
-        inputs.append(GitDetector(project_dirs=[str(root)]))
+        det = GitDetector(project_dirs=[str(root)])
+        _git_baseline_then_commit(root / ".git", det, world[0])
+        inputs.append(det)
     else:
         inputs.append(agent("claude", age=60))
         directory = {"turn": watcher.CLAUDE_TURN_ACTIVE_DIR,
@@ -237,13 +253,29 @@ def test_versioned_python_child_is_active_tool(world):
     assert watcher.shell_child_activity([parent]) == (True, ["python3.13", "job.py"])
 
 
-def test_git_activity_bubble_does_not_claim_a_commit(world, tmp_path):
+def test_git_checkout_does_not_celebrate(world, tmp_path):
+    root = tmp_path / "repo"
+    gitdir = root / ".git"
+    (gitdir / "refs" / "heads").mkdir(parents=True)
+    _write_at(gitdir / "HEAD", "ref: refs/heads/main\n", world[0] - 100)
+    for name, sha in (("main", "a" * 40), ("other", "b" * 40)):
+        _write_at(gitdir / "refs" / "heads" / name, sha, world[0] - 100)
+    det = GitDetector(project_dirs=[str(root)])
+    sm = watcher.StateMachine(detectors=[det])
+    assert sm.compute(notify=False).state != "celebrating"  # baseline
+    world[0] += 1
+    _write_at(gitdir / "HEAD", "ref: refs/heads/other\n", world[0])
+    assert sm.compute(notify=False).state != "celebrating"
+
+
+def test_git_commit_bubble_says_commit(world, tmp_path):
     from squid_pet.observer import Observer
     root = tmp_path / "repo"
-    (root / ".git").mkdir(parents=True)
-    # HEAD mtime changes on checkout too; there is no commit evidence here.
-    flag(root / ".git", "HEAD", world[0])
-    sm = watcher.StateMachine(detectors=[GitDetector(project_dirs=[str(root)])])
+    gitdir = root / ".git"
+    (gitdir / "refs" / "heads").mkdir(parents=True)
+    det = GitDetector(project_dirs=[str(root)])
+    _git_baseline_then_commit(gitdir, det, world[0])
+    sm = watcher.StateMachine(detectors=[det])
     state = sm.compute(notify=False)
     line = Observer(get_muted=lambda: False).on_state_change(
         "idle", state.state, state_reason=state.state_reason)

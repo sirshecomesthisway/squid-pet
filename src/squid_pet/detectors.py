@@ -794,13 +794,18 @@ class CodexDetector:
 # GitDetector -- watches .git/HEAD, .git/index, .git/refs/heads/ mtimes
 # ----------------------------------------------------------------------
 class GitDetector:
-    """Detect git activity by polling .git/HEAD, .git/index, and .git/refs/
-    mtimes -- no shell-out, no file content read.
+    """Detect a new commit on the checked-out branch.
 
-    Per design D1:
-      HEAD modified <5s ago         -> is_celebrating (4s sticky)
-      index modified <5s ago        -> is_busy (staged files)
-      refs/heads/* modified <5s ago -> is_celebrating (4s sticky, just pushed)
+    Each tick stats .git/HEAD, the resolved loose ref and packed-refs (about
+    three stats per repo). Only when one changes does it read HEAD (<=256
+    bytes) and the ref file (65 bytes; packed-refs capped at 1 MiB as the
+    fallback) to get a ref name and sha, held in memory and never logged.
+
+      same symbolic ref, new sha -> is_celebrating (sticky hold): a commit
+      first sighting / ref changed -> baseline only (checkout, checkout -b)
+      detached HEAD / reftable / unreadable -> no signal (an unreadable ref
+      keeps the last sha; the first commit on an unborn branch is a baseline)
+      index modified <5s ago, HEAD state unchanged this tick -> is_busy
 
     Caches the discovered .git directory list for 60s to avoid hammering
     the filesystem. Caps at 50 repos to keep the scan cheap.
@@ -812,6 +817,9 @@ class GitDetector:
     DISCOVERY_CACHE_SEC = 60.0
     MAX_REPOS = 50
     MAX_DEPTH = 4
+    HEAD_READ_CAP = 256
+    REF_READ_CAP = 65  # 64 hex (sha256 repos) + newline
+    PACKED_READ_CAP = 1 << 20
 
     def __init__(
         self,
@@ -831,6 +839,11 @@ class GitDetector:
         self._discovered: list[Path] = []
         self._discovered_at: float = 0.0
         self._celebrate_until: float = 0.0
+        # git_dir -> (mtimes of HEAD / resolved ref / packed-refs,
+        #             symbolic ref, sha). In memory only, never logged.
+        self._head_state: dict[
+            Path, tuple[tuple[float, float, float], str | None, str | None]
+        ] = {}
         # Diagnostic
         self._last_busy_reason: str = ""
         self._last_celebrate_reason: str = ""
@@ -876,30 +889,92 @@ class GitDetector:
         except OSError:
             return 0.0
 
+    @staticmethod
+    def _read_capped(path: Path, cap: int) -> str | None:
+        try:
+            with open(path, "rb") as fh:
+                return fh.read(cap).decode("utf-8", "replace")
+        except OSError:
+            return None
+
+    @staticmethod
+    def _is_sha(text: str) -> bool:
+        return len(text) in (40, 64) and all(c in "0123456789abcdef" for c in text)
+
+    def _resolve_head(self, git_dir: Path) -> tuple[str | None, str | None]:
+        """Return (symbolic ref, sha) for a repo, either of which may be None.
+
+        Detached HEAD, unborn branch, reftable repos and unreadable files all
+        resolve to a None ref and/or sha. The values stay in memory only.
+        """
+        head = self._read_capped(git_dir / "HEAD", self.HEAD_READ_CAP)
+        if head is None:
+            return None, None
+        head = head.strip()
+        if not head.startswith("ref:"):
+            return None, None  # detached (bare sha) or unknown format
+        ref = head[4:].strip()
+        if not ref.startswith("refs/") or ".." in ref:
+            return None, None
+        loose = self._read_capped(git_dir / ref, self.REF_READ_CAP)
+        if loose is not None:
+            sha = loose.strip()
+            return ref, (sha if self._is_sha(sha) else None)
+        packed = self._read_capped(git_dir / "packed-refs", self.PACKED_READ_CAP)
+        if packed is None:
+            return ref, None
+        for line in packed.splitlines():
+            parts = line.split(" ", 1)
+            if len(parts) == 2 and parts[1].strip() == ref and self._is_sha(parts[0]):
+                return ref, parts[0]
+        return ref, None
+
     def _scan_repos(self, now: float) -> tuple[bool, bool, str, str]:
         """Returns (any_busy, any_celebrating, busy_reason, celebrate_reason)."""
         any_busy = False
         any_celeb = False
         busy_reason = ""
         celeb_reason = ""
-        for git_dir in self._discover(now):
-            head = git_dir / "HEAD"
-            index = git_dir / "index"
-            refs_heads = git_dir / "refs" / "heads"
-            head_age = now - self._mtime(head) if self._mtime(head) else float("inf")
-            index_age = now - self._mtime(index) if self._mtime(index) else float("inf")
-            refs_age = now - self._mtime(refs_heads) if self._mtime(refs_heads) else float("inf")
+        repos = self._discover(now)
+        live = set(repos)
+        for stale in [k for k in self._head_state if k not in live]:
+            del self._head_state[stale]
+        for git_dir in repos:
+            prev = self._head_state.get(git_dir)
+            mtimes = (
+                self._mtime(git_dir / "HEAD"),
+                self._mtime(git_dir / prev[1]) if prev and prev[1] else 0.0,
+                self._mtime(git_dir / "packed-refs"),
+            )
+            head_changed = False
+            if prev is None or prev[0] != mtimes:
+                head_changed = prev is not None  # first sighting is not a change
+                ref, sha = self._resolve_head(git_dir)
+                if sha is None and prev is not None and prev[1] == ref:
+                    # A transient unreadable ref must not erase the baseline,
+                    # or the next real sha would be taken for a first sighting.
+                    sha = prev[2]
+                # Re-stat against the freshly resolved ref so the next tick
+                # compares like with like.
+                mtimes = (
+                    mtimes[0],
+                    self._mtime(git_dir / ref) if ref else 0.0,
+                    mtimes[2],
+                )
+                self._head_state[git_dir] = (mtimes, ref, sha)
+                future = any(m > now for m in mtimes)
+                if (
+                    prev is not None and ref is not None and prev[1] == ref
+                    and prev[2] is not None and sha is not None and sha != prev[2]
+                    and not future  # future metadata is clock skew, not activity
+                ):
+                    any_celeb = True
+                    celeb_reason = f"new commit on a branch in {git_dir.parent.name}"
+            index_mtime = self._mtime(git_dir / "index")
+            index_age = now - index_mtime if index_mtime else float("inf")
             # Future metadata is clock skew, not evidence of activity now.
-            head_age = head_age if head_age >= 0 else float("inf")
-            refs_age = refs_age if refs_age >= 0 else float("inf")
             index_age = index_age if index_age >= 0 else float("inf")
-            if head_age < self.BUSY_WINDOW_SEC:
-                any_celeb = True
-                celeb_reason = f"HEAD touched in {git_dir.parent.name} ({head_age:.1f}s ago)"
-            if refs_age < self.BUSY_WINDOW_SEC and head_age >= self.BUSY_WINDOW_SEC:
-                any_celeb = True
-                celeb_reason = f"refs/heads/ touched in {git_dir.parent.name} ({refs_age:.1f}s ago)"
-            if index_age < self.BUSY_WINDOW_SEC and head_age >= self.BUSY_WINDOW_SEC:
+            if index_age < self.BUSY_WINDOW_SEC and not head_changed:
                 any_busy = True
                 busy_reason = f"index staged in {git_dir.parent.name} ({index_age:.1f}s ago)"
         return any_busy, any_celeb, busy_reason, celeb_reason
