@@ -1377,15 +1377,21 @@ def describe_waiting_sessions(session_ids: list[str]) -> str | None:
     return f"{' + '.join(labels)} need you"
 
 
+def claude_turn_active_sessions(fresh_sec: float | None = None) -> list[str]:
+    """Session ids between UserPromptSubmit and Stop whose turn flag is fresher
+    than fresh_sec (default: the crash-safety stale window)."""
+    return _scan_session_flag_dir(
+        CLAUDE_TURN_ACTIVE_DIR,
+        CLAUDE_TURN_ACTIVE_STALE_SEC,
+        fresh_sec if fresh_sec is not None else CLAUDE_TURN_ACTIVE_STALE_SEC,
+    )
+
+
 def claude_turn_in_flight(now: float | None = None, *, fresh_sec: float | None = None) -> bool:
     """True iff any Claude Code session is between UserPromptSubmit and
     Stop -- i.e. actively working on a turn, whether or not it has written
     anything to disk yet."""
-    return bool(_scan_session_flag_dir(
-        CLAUDE_TURN_ACTIVE_DIR,
-        CLAUDE_TURN_ACTIVE_STALE_SEC,
-        fresh_sec if fresh_sec is not None else CLAUDE_TURN_ACTIVE_STALE_SEC,
-    ))
+    return bool(claude_turn_active_sessions(fresh_sec))
 
 
 def claude_task_marked_complete_recently(now: float | None = None) -> bool:
@@ -2540,11 +2546,27 @@ class StateMachine:
             owners = {(r['pid'], r['created']) for r in matches}
             return codex_target(matches[0]) if len(owners) == 1 else None
 
+        def file_write_target() -> dict | None:
+            # Project file writes (in-process Edit/Write, often by a subagent)
+            # name no shell owner. Best effort: when only Claude saw the write
+            # and exactly one Claude session is plausible, target it so "take
+            # me there" has something to raise. A hand edit in an editor while
+            # one Claude session is active is attributed to it too. Otherwise
+            # None (never guess between sessions).
+            if not claude_file_active or codex_file_active:
+                return None
+            sids = set(getattr(claude, 'recent_session_ids', None) or ())
+            if not sids:
+                sids = set(claude_turn_active_sessions(_turn_stall))
+            if len(sids) != 1:
+                return None
+            return {"agent": "claude", "session": next(iter(sids))}
+
         def working_target() -> dict | None:
             detector = claude if claude_shell_active else codex if codex_shell_active else None
             owner = getattr(detector, 'shell_owner', None)
             if not owner:
-                return None
+                return file_write_target()
             # finding 2 (2026-09-24): the shell OWNER is authoritative for a
             # working target -- it is the exact process running the tool
             # subprocess. Deliberately NOT stamped with a transcript-derived

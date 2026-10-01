@@ -269,6 +269,10 @@ class ClaudeCodeDetector:
         # _tail_info); open_subagent_path is the newest such transcript.
         self.subagent_open: bool = False
         self.open_subagent_path: str | None = None
+        # Owning session ids of transcripts written recently (file-write window
+        # plus streaming slack) or held open by a subagent. Lets the watcher name
+        # a focus target for a project file write when exactly one session fits.
+        self.recent_session_ids: frozenset[str] = frozenset()
 
     def _lazy_defaults(self) -> None:
         if self._find_processes is None:
@@ -507,6 +511,8 @@ class ClaudeCodeDetector:
         self.transcript_path = None
         self.subagent_open = False
         self.open_subagent_path = None
+        recent_sids: set[str] = set()
+        recent_sec = self.FILE_ACTIVE_WINDOW_SEC + self.STREAMING_STALE_SEC
         candidates = self._discover(now)
         candidate_keys = {str(f) for f in candidates}
         self._transcript_activity_cache = {
@@ -521,16 +527,23 @@ class ClaudeCodeDetector:
             mtime = stat.st_mtime
             if now - mtime < self.STREAMING_STALE_SEC:
                 mtime = self._transcript_activity_mtime(f, stat)
-            if (stat.st_mtime <= now
-                    and now - stat.st_mtime < self.SUBAGENT_OPEN_STALE_SEC
-                    and stat.st_mtime > open_mtime
-                    and self._subagent_is_open(f, stat)):
+            # Openness is judged per transcript, independent of glob order, so
+            # every open helper's session lands in recent_session_ids.
+            is_open = (stat.st_mtime <= now
+                       and now - stat.st_mtime < self.SUBAGENT_OPEN_STALE_SEC
+                       and self._subagent_is_open(f, stat))
+            if is_open and stat.st_mtime > open_mtime:
                 open_mtime = stat.st_mtime
                 self.subagent_open = True
                 self.open_subagent_path = str(f)
+            if mtime <= now and (now - mtime < recent_sec or is_open):
+                sid = claude_session_id_from_transcript(str(f))
+                if sid:
+                    recent_sids.add(sid)
             if mtime <= now and mtime > newest_mtime:
                 newest_mtime = mtime
                 self.transcript_path = str(f)
+        self.recent_session_ids = frozenset(recent_sids)
         if newest_mtime == 0.0:
             return float("inf")
         return max(0.0, now - newest_mtime)
