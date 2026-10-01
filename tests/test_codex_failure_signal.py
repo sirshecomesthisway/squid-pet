@@ -184,6 +184,7 @@ def test_failure_through_state_machine(db, monkeypatch):
     assert state.concern_severity == 'hard'
     assert 'limit' in state.concern_reason.lower()
     assert 'codex' in state.state_reason
+    assert state.concern_bubble == 'Codex: usage limit hit'
 
 
 def _must_not_run(_script):

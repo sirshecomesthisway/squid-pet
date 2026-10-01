@@ -147,6 +147,10 @@ class PetState:
     message: str = ""             # short caption shown under the pet
     concern_reason: str = ""      # short headline of why concerned (for tooltip)
     concern_severity: str = ""    # "transient" (network) or "hard" (code crash)
+    # Short bubble text naming the failing agent and category, e.g.
+    # "Claude: usage limit hit". Empty when not concerned. concern_reason
+    # (the longer, agent-neutral tooltip headline) is unchanged.
+    concern_bubble: str = ""
     # Fix C (2026-06-28): short human-readable explanation of WHY this
     # state fired this tick. Surfaced in `squid why` + optionally used
     # as the bubble.
@@ -949,6 +953,29 @@ _CONCERN_BY_ERROR_TYPE: dict[str, tuple[str, str]] = {
     "codex_connection_error": ("Codex connection failed", "transient"),
 }
 _CONCERN_FALLBACK: tuple[str, str] = ("Something went wrong", "hard")
+
+# error_type -> agent-neutral label (<= 24 chars) for the concerned bubble,
+# which is prefixed "Claude: " / "Codex: " and must fit observer's
+# MAX_BUBBLE_CHARS (32). A test pins that every key above has an entry.
+_CONCERN_SHORT_BY_ERROR_TYPE: dict[str, str] = {
+    "rate_limit": "usage limit hit",
+    "overloaded": "servers overloaded",
+    "server_error": "server error",
+    "authentication_failed": "sign-in expired",
+    "oauth_org_not_allowed": "org not allowed",
+    "account_on_hold": "account on hold",
+    "billing_error": "billing issue",
+    "invalid_request": "request rejected",
+    "model_not_found": "model unavailable",
+    "max_output_tokens": "max response length",
+    "cloud_credential_error": "credentials failed",
+    "unknown": "a request failed",
+    "usage_limited": "usage limit hit",
+    "codex_overloaded": "servers overloaded",
+    "codex_server_error": "server error",
+    "codex_connection_error": "connection failed",
+}
+_CONCERN_SHORT_FALLBACK = "a request failed"
 
 
 def concern_for_error_type(error_type: str) -> tuple[str, str]:
@@ -2408,6 +2435,9 @@ class StateMachine:
         st.state = "concerned"
         st.concern_reason = reason
         st.concern_severity = severity
+        short = _CONCERN_SHORT_BY_ERROR_TYPE.get(
+            error_type, _CONCERN_SHORT_FALLBACK)
+        st.concern_bubble = f"{'Claude' if claude_hit else 'Codex'}: {short}"
         st.state_reason = f"{source} ({error_type})"
         st.message = f"⚠️ {reason}"
         st.focus_target = focus_target
