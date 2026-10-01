@@ -1164,9 +1164,11 @@ CLAUDE_TURN_ACTIVE_STALE_SEC = 3600.0
 # stops reading it as "thinking" (branch 4c) and lets her fall through to idle.
 # A usage-limit block (Claude Code halts without firing Stop) keeps the turn
 # bracket open for minutes-to-hours; a genuine silent thinking stretch is much
-# shorter (measured <~60s). 180s sits well clear of both. Hot-reloadable via
+# shorter (typically <~60s, but a 5-minute gap was observed live while Claude
+# kept working -- the 180s default showed idle mid-work). 600s covers that gap
+# and still clears a usage-limit block within ten minutes. Hot-reloadable via
 # config.get("turn_stall_sec").
-TURN_STALL_SEC_DEFAULT = 180.0
+TURN_STALL_SEC_DEFAULT = 600.0
 
 
 # ── WHICH session is waving? (Pink-2026-09-01) ─────────────────────────
