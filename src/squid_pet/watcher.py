@@ -2601,6 +2601,10 @@ class StateMachine:
             """Which agent's streaming signal earns credit. Only called
             once streaming_merged is already known True."""
             if claude_streaming:
+                if (getattr(claude, "subagent_open", False)
+                        and claude_transcript_age >= getattr(
+                            claude, "STREAMING_STALE_SEC", 20.0)):
+                    return "claude helper working"
                 return "claude streaming"
             return "codex streaming"
 

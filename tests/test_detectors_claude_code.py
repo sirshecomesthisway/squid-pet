@@ -3,6 +3,8 @@ style. All psutil / filesystem dependencies are injected so no real
 process table or disk is touched."""
 from __future__ import annotations
 
+import builtins
+import json
 import os
 from pathlib import Path
 
@@ -602,3 +604,178 @@ def test_stale_active_flag_with_no_transcript_does_not_reglob_every_tick(tmp_pat
     d.is_busy(now=now + 10.0)       # ghost already attempted -> no re-glob
     d.is_busy(now=now + 15.0)
     assert globs["n"] == 2
+
+
+# ── open (no final result) subagent transcripts stay busy for a long time ──
+def _rec(kind, stop=None, block=None):
+    """Realistic shapes; ``block`` is the last content block type."""
+    if kind == "assistant":
+        block = block or ("tool_use" if stop == "tool_use" else "text")
+        return json.dumps({"type": "assistant", "message": {
+            "stop_reason": stop, "content": [{"type": block, "x": "v"}]}})
+    if kind == "user":
+        return json.dumps({"type": "user", "message": {
+            "content": [{"type": "tool_result"}]}})
+    return json.dumps({"type": kind})
+
+
+def _write_lines(path: Path, lines, mtime: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+    os.utime(path, (mtime, mtime))
+
+
+def _open_detector(projects, procs=True):
+    return ClaudeCodeDetector(
+        find_processes_fn=lambda: [_FakeProc()] if procs else [],
+        aggregate_cpu_fn=lambda p: 0.0,
+        has_active_shell_children_fn=lambda p: False,
+        projects_dir=projects,
+        stat_fn=os.stat,
+        recent_file_ages_fn=lambda: [],
+    )
+
+
+def _sub(projects: Path) -> Path:
+    return projects / "-Users-me-proj" / "PARENT-SID" / "subagents" / "agent-x.jsonl"
+
+
+def test_open_subagent_tool_use_tail_is_streaming_after_long_silence(tmp_path):
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects),
+                 [_rec("user"), _rec("assistant", "tool_use"),
+                  '{"type": "attachment"}', '{"type": "artifact-autoreact-ledger"}'],
+                 now - 300.0)
+    d = _open_detector(projects)
+    assert d.is_busy(now) is True
+    assert d.streaming is True and d.subagent_open is True
+    assert d.transcript_age == 300.0  # stall guard input untouched
+    assert d.transcript_path == str(_sub(projects))
+    assert d.diagnostic()["subagent_open"] is True
+
+
+def test_open_subagent_thinking_block_and_user_tail_are_open(tmp_path):
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects), [_rec("assistant", None, "thinking")], now - 300.0)
+    assert _open_detector(projects).is_busy(now) is True
+    _write_lines(_sub(projects), [_rec("assistant", "end_turn"), _rec("user")], now - 300.0)
+    assert _open_detector(projects).is_busy(now) is True
+
+
+def test_finished_helper_text_block_with_null_stop_reason_is_not_open(tmp_path):
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects),
+                 [_rec("user"), _rec("assistant", "tool_use"), _rec("user"),
+                  _rec("assistant", None, "text")], now - 300.0)
+    d = _open_detector(projects)
+    assert d.is_busy(now) is False
+    assert d.subagent_open is False
+
+
+def test_unknown_block_shapes_fail_closed(tmp_path):
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    for rec in ('{"type": "assistant", "message": {"stop_reason": null}}',
+                '{"type": "assistant", "message": {"stop_reason": null, "content": []}}',
+                '{"type": "assistant", "message": {"stop_reason": null, "content": ["x"]}}',
+                '{"type": "assistant", "message": {"stop_reason": "weird"}}'):
+        _write_lines(_sub(projects), [rec], now - 300.0)
+        assert _open_detector(projects).is_busy(now) is False
+
+
+def test_finished_subagent_end_turn_is_not_streaming(tmp_path):
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects),
+                 [_rec("user"), _rec("assistant", "tool_use"),
+                  _rec("assistant", "end_turn")], now - 300.0)
+    d = _open_detector(projects)
+    assert d.is_busy(now) is False
+    assert d.subagent_open is False
+
+
+def test_open_subagent_silent_past_limit_is_not_streaming(tmp_path):
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects), [_rec("assistant", "tool_use")], now - 2000.0)
+    d = _open_detector(projects)
+    assert d.is_busy(now) is False
+    assert d.subagent_open is False
+
+
+def test_open_parent_transcript_is_not_streaming(tmp_path):
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(projects / "-Users-me-proj" / "PARENT-SID.jsonl",
+                 [_rec("assistant", "tool_use")], now - 300.0)
+    d = _open_detector(projects)
+    assert d.is_busy(now) is False
+    assert d.subagent_open is False
+
+
+def test_malformed_or_oversized_subagent_tail_is_not_open(tmp_path):
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects), [_rec("assistant", "tool_use"), "{not json"], now - 300.0)
+    assert _open_detector(projects).is_busy(now) is False
+    big = json.dumps({"type": "assistant", "message": {"stop_reason": "tool_use",
+                                                       "pad": "x" * 70000}})
+    _write_lines(_sub(projects), [big], now - 300.0)
+    assert _open_detector(projects).is_busy(now) is False
+
+
+def test_open_subagent_without_claude_process_is_not_streaming(tmp_path):
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects), [_rec("assistant", "tool_use")], now - 300.0)
+    d = _open_detector(projects, procs=False)
+    assert d.is_busy(now) is False
+    assert d.subagent_open is False
+
+
+def test_open_subagent_tail_not_reread_when_unchanged(tmp_path, monkeypatch):
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects), [_rec("assistant", "tool_use")], now - 300.0)
+    d = _open_detector(projects)
+    opened = []
+    real_open = builtins.open
+
+    def counting_open(file, *a, **k):
+        if str(file).endswith("agent-x.jsonl"):
+            opened.append(str(file))
+        return real_open(file, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+    assert d.is_busy(now) is True
+    assert d.is_busy(now + 1.0) is True
+    assert d.is_busy(now + 2.0) is True
+    assert len(opened) == 1
+    # a change (new size) is read once more
+    with real_open(_sub(projects), "a") as fh:
+        fh.write(_rec("assistant", "end_turn") + "\n")
+    os.utime(_sub(projects), (now - 100.0, now - 100.0))
+    assert d.is_busy(now + 3.0) is False
+    assert len(opened) == 2
+
+
+def test_open_subagent_cascade_thinking_focuses_parent_session(tmp_path, monkeypatch):
+    from squid_pet import watcher
+    from squid_pet.watcher import StateMachine
+    for name in ("CLAUDE_AWAITING_INPUT_DIR", "CLAUDE_FINISHED_DIR",
+                 "CLAUDE_RECAPPING_DIR", "CLAUDE_TASK_COMPLETE_DIR",
+                 "CLAUDE_TURN_ACTIVE_DIR"):
+        monkeypatch.setattr(watcher, name, "/nonexistent")
+    monkeypatch.setattr(watcher, "macos_idle_seconds", lambda: 0.0)
+    now = 1_000_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects), [_rec("assistant", "tool_use")], now - 300.0)
+    sm = StateMachine(detectors=[_open_detector(projects)])
+    monkeypatch.setattr(watcher.time, "time", lambda: now)
+    st = sm.compute()
+    assert st.state == "thinking"
+    assert st.state_reason == "claude helper working"
+    assert st.focus_target == {"agent": "claude", "session": "PARENT-SID"}

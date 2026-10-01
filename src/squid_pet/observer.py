@@ -338,6 +338,7 @@ _REASON_EXPLAIN = {
     "file write detected (codex)":       "project files changed",
     "claude streaming":       "claude's thinking",
     "codex streaming":        "codex's thinking",
+    "claude helper working":  "claude's helper is busy",
     "claude turn in flight":  "claude's mid-turn",
     "claude recapping":       "claude's recapping",
     "claude grooving":        "claude finished a turn",
