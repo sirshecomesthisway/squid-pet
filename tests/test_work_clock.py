@@ -221,7 +221,8 @@ def test_valid_claude_turn_marker_counts_as_thinking_work(isolated_clock, monkey
     machine, agent = _make_machine("claude_code")
     agent.active = True
     agent.transcript_age = 1.0
-    monkeypatch.setattr(watcher, "claude_turn_in_flight", lambda now=None: True)
+    monkeypatch.setattr(
+        watcher, "claude_turn_in_flight", lambda now=None, **_: True)
 
     clock["now"] = 100.0
     first = machine.compute(notify=False)
@@ -241,7 +242,8 @@ def test_stalled_or_exited_claude_turn_marker_does_not_count_as_work(
     agent.active = active
     agent.enabled = enabled
     agent.transcript_age = 9999.0
-    monkeypatch.setattr(watcher, "claude_turn_in_flight", lambda now=None: True)
+    monkeypatch.setattr(
+        watcher, "claude_turn_in_flight", lambda now=None, **_: False)
 
     clock["now"] = 100.0
     first = machine.compute(notify=False)

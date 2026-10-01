@@ -232,14 +232,8 @@ def test_compute_does_not_fire_without_a_claude_flag(tmp_claude_dir):
     assert st.state != "approval_needed"
 
 
-# ── Regression: 2026-08-27 -- stale flag while genuinely active ────────
-# Real bug caught via live use: Claude Code resumed working (a permission
-# was granted some other way, or an agentic task continued unattended)
-# WITHOUT the user ever submitting a fresh top-level prompt, so
-# UserPromptSubmit never fired to clear the flag -- Squid kept showing
-# "your turn" and re-firing the OS notification while Claude was visibly,
-# actively working. Fix: our own real activity signal (working/thinking)
-# self-heals the stale flag.
+# Aggregate working/thinking used to delete an aged wait. It cannot prove
+# that THIS request resolved, even with just one process (parallel tools).
 def _backdate(path, seconds):
     """Set a flag file's mtime `seconds` into the past, past self-heal's
     minimum-age grace window, so it reads as genuinely stale rather than
@@ -262,7 +256,7 @@ def _new_tool_call_after_flag():
 def test_stale_flag_self_heals_when_genuinely_working(tmp_claude_dir):
     flag = tmp_claude_dir / "sess-stale"
     flag.write_text("permission_prompt")
-    _backdate(flag, watcher.SELF_HEAL_MIN_FLAG_AGE_SEC + 1)
+    _backdate(flag, 4)
 
     sm = watcher.StateMachine()
     sm._compute_inner = lambda: watcher.PetState(state="working", message="x")
@@ -272,10 +266,8 @@ def test_stale_flag_self_heals_when_genuinely_working(tmp_claude_dir):
          _patched_config():
         st = sm.compute()
 
-    assert st.state == "working", (
-        f"genuine current activity must win over a stale flag; got {st.state!r}"
-    )
-    assert not flag.exists(), "the stale flag should be deleted, not just hidden"
+    assert st.state == "working"
+    assert not flag.exists(), "new Bash activity proves the wait was resolved"
     mock_notify.assert_not_called()
 
 
@@ -285,7 +277,7 @@ def test_stale_flag_self_heals_when_thinking(tmp_claude_dir):
     tool call (streaming alone never is: see the 2026-09-30 block)."""
     flag = tmp_claude_dir / "sess-stale-2"
     flag.write_text("permission_prompt")
-    _backdate(flag, watcher.SELF_HEAL_MIN_FLAG_AGE_SEC + 1)
+    _backdate(flag, 4)
 
     sm = watcher.StateMachine()
     sm._compute_inner = lambda: watcher.PetState(state="thinking", message="x")
@@ -299,15 +291,7 @@ def test_stale_flag_self_heals_when_thinking(tmp_claude_dir):
     assert not flag.exists()
 
 
-# ── Regression: 2026-08-31 -- self-heal ate a flag on the SAME tick it
-# was written -- caught live during a demo: Squid never showed
-# approval_needed at all (not even for one tick) for a genuinely-pending
-# AskUserQuestion prompt, because Claude Code was still visibly
-# streaming/active the instant the flag appeared, so self-heal reaped it
-# before the approval-needed block ever got to see it. Self-heal exists
-# to clear a flag stuck behind ongoing work Pink is actively watching --
-# not to reap something raised a moment ago -- so a fresh flag must
-# survive at least SELF_HEAL_MIN_FLAG_AGE_SEC before self-heal may act.
+# Both fresh and aged waits survive unrelated activity.
 def test_fresh_flag_survives_self_heal_and_fires_approval_needed(tmp_claude_dir):
     flag = tmp_claude_dir / "sess-brand-new"
     flag.write_text("permission_prompt")  # mtime == now, well under the grace window
@@ -331,17 +315,7 @@ def test_fresh_flag_survives_self_heal_and_fires_approval_needed(tmp_claude_dir)
     mock_notify.assert_called_once()
 
 
-# ── Regression: 2026-08-30 -- self-heal ate a DIFFERENT session's
-# genuinely-pending approval -- Pink caught live: session A asked for a
-# decision and was waiting, but session B (this very conversation) was
-# actively working, so self-heal's aggregate "any Claude Code activity
-# means every pending wait is resolved" cleared session A's flag before
-# approval_needed ever got a chance to fire. Self-heal's whole premise
-# ("you're actively watching it work") only holds for a single active
-# session -- with 2+ Claude Code processes alive there's no way to tell
-# whose activity is whose (no PID in the hook payload), so it must not
-# fire at all in that case; let the real removal paths (UserPromptSubmit,
-# SessionEnd, stale-timeout, manual "calm Squid") handle it instead.
+# Concurrent sessions must never erase one another's requests.
 def test_stale_flag_does_not_self_heal_with_multiple_sessions_active(tmp_claude_dir):
     flag = tmp_claude_dir / "sess-other-session-waiting"
     flag.write_text("permission_prompt")

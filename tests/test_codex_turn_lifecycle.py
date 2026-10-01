@@ -1,6 +1,7 @@
 """An open Codex turn must survive silent reasoning, but not its owner."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -153,4 +154,6 @@ def test_pending_approval_outranks_active_turn(world, monkeypatch):
     event(root, 'UserPromptSubmit')
     hook.handle(dict(session_id='a', turn_id='one', hook_event_name='PermissionRequest',
                      tool_name='Bash', tool_input={'command': 'sleep 60'}), root)
+    for path in (root / 'codex_awaiting_input').glob('[!.]*'):
+        os.utime(path, (watcher.time.time(), watcher.time.time()))
     assert sm.compute().state == 'approval_needed'
