@@ -186,6 +186,7 @@ from a silent or stalled turn. No new hooks or network calls are involved.
 | `thread_id`, `turn_id`, `started_at` | suppress a failure when another turn has started in the same thread; identifiers are not returned or persisted |
 | `completed_at` | Unix seconds; select the freshest failure within five minutes, excluding future timestamps |
 | `error_json` → `$.codexErrorInfo` | SQL maps a string enum or a known tagged-object key to a fixed, bounded category constant |
+| `error_json` → `$.codexErrorInfo.{httpConnectionFailed,responseStreamConnectionFailed,responseTooManyFailedAttempts}.httpStatusCode` | an integer HTTP status code, compared in SQL only to `401` (maps to `authentication_failed`); the number itself is never selected, returned or persisted |
 
 Only the normalized category leaves SQLite. Squid never selects the raw
 `error_json`, `error.message`, `additionalDetails`, tagged-object payloads,

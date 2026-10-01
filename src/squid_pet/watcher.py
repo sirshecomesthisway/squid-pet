@@ -1056,7 +1056,11 @@ def codex_freshest_failure(now: float | None = None) -> str | None:
     NULL there, so a malformed NEWEST row hid every older fresh failure under
     ORDER BY completed_at DESC LIMIT 1). A newer turn in the same thread
     suppresses its previous failure; ties conservatively suppress it too.
-    Silence never creates a failure.
+    An object variant (httpConnectionFailed, responseStreamConnectionFailed,
+    responseTooManyFailedAttempts) whose integer httpStatusCode is exactly 401
+    maps to 'authentication_failed' (Codex 0.160.0 spike); 403 is deliberately
+    excluded (can be a region/policy block). Only that integer is compared,
+    never projected. Silence never creates a failure.
 
     mode=ro preserves WAL visibility (immutable=1 would miss live WAL rows).
     No writes, migrations, explicit locks, or busy waits; the short SQLite
@@ -1081,6 +1085,20 @@ def codex_freshest_failure(now: float | None = None) -> str | None:
                         WHEN 'serverOverloaded' THEN 'codex_overloaded'
                         WHEN 'internalServerError' THEN 'codex_server_error'
                         ELSE CASE WHEN
+                            (json_type(f.error_json,
+                                '$.codexErrorInfo.httpConnectionFailed.httpStatusCode') = 'integer'
+                                AND json_extract(f.error_json,
+                                '$.codexErrorInfo.httpConnectionFailed.httpStatusCode') = 401)
+                            OR (json_type(f.error_json,
+                                '$.codexErrorInfo.responseStreamConnectionFailed.httpStatusCode') = 'integer'
+                                AND json_extract(f.error_json,
+                                '$.codexErrorInfo.responseStreamConnectionFailed.httpStatusCode') = 401)
+                            OR (json_type(f.error_json,
+                                '$.codexErrorInfo.responseTooManyFailedAttempts.httpStatusCode') = 'integer'
+                                AND json_extract(f.error_json,
+                                '$.codexErrorInfo.responseTooManyFailedAttempts.httpStatusCode') = 401)
+                            THEN 'authentication_failed'
+                            WHEN
                             json_type(f.error_json,
                                 '$.codexErrorInfo.httpConnectionFailed') = 'object'
                             OR json_type(f.error_json,

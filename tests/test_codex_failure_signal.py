@@ -99,6 +99,46 @@ def test_retry_in_other_thread_does_not_clear(db):
     assert watcher.codex_freshest_failure(NOW) == 'usage_limited'
 
 
+_AUTH_VARIANTS = ['httpConnectionFailed', 'responseStreamConnectionFailed',
+                  'responseTooManyFailedAttempts']
+
+
+@pytest.mark.parametrize('variant', _AUTH_VARIANTS)
+def test_http_401_object_variant_is_authentication_failed(db, variant):
+    add(db, {variant: {'httpStatusCode': 401}})
+    assert watcher.codex_freshest_failure(NOW) == 'authentication_failed'
+
+
+@pytest.mark.parametrize('variant', _AUTH_VARIANTS)
+@pytest.mark.parametrize('payload', [
+    {'httpStatusCode': 429}, {'httpStatusCode': 500}, {'httpStatusCode': 403},
+    {'httpStatusCode': '401'}, {'httpStatusCode': None}, {}])
+def test_http_non_401_object_variant_stays_connection_error(db, variant, payload):
+    add(db, {variant: payload})
+    assert watcher.codex_freshest_failure(NOW) == 'codex_connection_error'
+
+
+def test_401_in_disconnected_variant_unchanged(db):
+    add(db, {'responseStreamDisconnected': {'httpStatusCode': 401}})
+    assert watcher.codex_freshest_failure(NOW) == 'codex_connection_error'
+
+
+def test_string_other_unchanged(db):
+    add(db, 'other')
+    assert watcher.codex_freshest_failure(NOW) == 'unknown'
+
+
+def test_401_status_in_message_text_is_never_read(db):
+    add(db, raw=json.dumps({'codexErrorInfo': 'other',
+                            'message': 'httpStatusCode 401'}))
+    assert watcher.codex_freshest_failure(NOW) == 'unknown'
+
+
+def test_truncated_401_json_is_safe(db):
+    add(db, raw='{"codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":401')
+    assert watcher.codex_freshest_failure(NOW) == 'unknown'
+
+
 def test_malformed_json_degrades_safely(db):
     add(db, raw='{broken')
     assert watcher.codex_freshest_failure(NOW) == 'unknown'
