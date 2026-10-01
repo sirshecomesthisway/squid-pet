@@ -2587,27 +2587,16 @@ class StateMachine:
             owners = {(r['pid'], r['created']) for r in matches}
             return codex_target(matches[0]) if len(owners) == 1 else None
 
-        def file_write_target() -> dict | None:
-            # Project file writes (in-process Edit/Write, often by a subagent)
-            # name no shell owner. Best effort: when only Claude saw the write
-            # and exactly one Claude session is plausible, target it so "take
-            # me there" has something to raise. A hand edit in an editor while
-            # one Claude session is active is attributed to it too. Otherwise
-            # None (never guess between sessions).
-            if not claude_file_active or codex_file_active:
-                return None
-            sids = set(getattr(claude, 'recent_session_ids', None) or ())
-            if not sids:
-                sids = set(claude_turn_active_sessions(_turn_stall))
-            if len(sids) != 1:
-                return None
-            return {"agent": "claude", "session": next(iter(sids))}
-
         def working_target() -> dict | None:
             detector = claude if claude_shell_active else codex if codex_shell_active else None
             owner = getattr(detector, 'shell_owner', None)
             if not owner:
-                return file_write_target()
+                # A project file write (in-process Edit/Write, or a human
+                # editor) is an mtime with no writer identity. A recent
+                # transcript write, a sole turn-active session or a sole open
+                # helper does not prove who wrote the file, so no target
+                # rather than a guess (see _working_reason).
+                return None
             # finding 2 (2026-09-24): the shell OWNER is authoritative for a
             # working target -- it is the exact process running the tool
             # subprocess. Deliberately NOT stamped with a transcript-derived
@@ -2915,12 +2904,14 @@ class StateMachine:
             # certainly BLOCKED, not thinking -- the classic case is Claude
             # Code hitting a usage limit, which halts the turn WITHOUT firing
             # the Stop hook, so turn_in_flight stayed True (and she stayed
-            # "thinking") for up to CLAUDE_TURN_ACTIVE_STALE_SEC (1h). Real
-            # silent thinking stretches are short (measured <~60s); a usage
-            # limit blocks for minutes to hours. Past _turn_stall seconds of
-            # transcript silence, stop claiming she is thinking and fall
-            # through to idle. transcript_age needs no transcript CONTENT --
-            # mtime only, same privacy stance as the rest of the detector.
+            # "thinking") for up to CLAUDE_TURN_ACTIVE_STALE_SEC (1h). Silent
+            # thinking stretches are usually short (<~60s) but a 5-minute gap
+            # has been seen mid-work; a usage limit blocks for minutes to
+            # hours. Past _turn_stall seconds (default 600s, see
+            # TURN_STALL_SEC_DEFAULT) of transcript silence, stop claiming she
+            # is thinking and fall through to idle. transcript_age needs no
+            # transcript CONTENT -- mtime only, same privacy stance as the
+            # rest of the detector.
             # UserPromptSubmit is activity even before the first transcript
             # write. Silence expires relative to that new turn as well.
             if claude_running and turn_in_flight and (

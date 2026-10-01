@@ -92,3 +92,5 @@ Do not run it after intermediate turns.
 - Branch off `main`; push a new branch with `git push -u origin <branch>`
   right after its first commit.
 - Do not bypass git hooks.
+- Never add `Co-Authored-By` or "Generated with" attribution lines to commit
+  messages or PR descriptions.
