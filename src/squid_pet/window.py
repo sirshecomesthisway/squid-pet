@@ -1449,6 +1449,9 @@ class PetApi:
             # poke and heart already happened.
             log.warning(f"take_me_there failed: {e}")
             status = "error"
+        if status == "no-window":
+            self._emit_hint(
+                "no window to open — that Codex run was headless or has exited")
         if status != "resting":
             log.info(f"take_me_there({state}) -> {status}")
         return {"status": status, "state": state}

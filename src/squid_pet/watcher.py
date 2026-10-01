@@ -2391,9 +2391,17 @@ class StateMachine:
             error_type = codex_freshest_failure(now)
             source = "codex failed turn"
             # A Codex failed-turn row carries no reliable process owner, so
-            # there is no session to raise; focus_for_snapshot falls through
-            # to "resting" rather than guessing a window.
-            focus_target = None
+            # there is no session to raise and we never guess a window. When
+            # no Codex process is running the run was headless (`codex exec`)
+            # or has exited: mark it so take-me-there can say no window
+            # exists. While an interactive Codex (`codex`/`codex-tui`) is
+            # running it may own a window, so that stays a silent no-op --
+            # which also means a headless failure next to an open interactive
+            # session is not reported (the row cannot say which process
+            # failed). Reads the detector's existing flag; no new scan.
+            focus_target = (
+                None if getattr(self._codex_detector, "codex_running", False)
+                else {"agent": "codex", "no_window": True})
         if error_type is None:
             return
         reason, severity = concern_for_error_type(error_type)

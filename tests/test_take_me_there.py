@@ -22,6 +22,8 @@ def _api(state: str, focus_fn=None):
     api = PetApi.__new__(PetApi)
     api._lock = threading.Lock()
     api._latest = PetState(state=state)
+    api._hint_text = ""
+    api._hint_seq = 0
     if focus_fn is not None:
         api._focus_fn = lambda snapshot: focus_fn(snapshot.state)
     return api
@@ -67,3 +69,17 @@ def test_navigation_receives_the_state_and_its_exact_source_snapshot():
     assert api.take_me_there()['status'] == 'matched'
     assert seen == [api._latest]
     assert seen[0].focus_target['owner']['pid'] == 123
+
+
+def test_no_window_status_emits_a_hint():
+    api = _api("concerned", focus_fn=lambda s: "no-window")
+    result = api.take_me_there()
+    assert result == {"status": "no-window", "state": "concerned"}
+    assert api._hint_seq == 1
+    assert "no window" in api._hint_text
+
+
+def test_silent_none_status_emits_no_hint():
+    api = _api("concerned", focus_fn=lambda s: "none")
+    api.take_me_there()
+    assert api._hint_seq == 0
