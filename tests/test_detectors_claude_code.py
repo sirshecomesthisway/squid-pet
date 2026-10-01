@@ -625,7 +625,11 @@ def _write_lines(path: Path, lines, mtime: float) -> None:
     os.utime(path, (mtime, mtime))
 
 
-def _open_detector(projects, procs=True):
+def _open_detector(projects, procs=True, active=("PARENT-SID",), stopped=None):
+    """``active``: session ids whose turn is in flight (the parent of _sub's
+    helper by default). ``stopped``: {session id: mtime of its last Stop
+    flag}. Both injected so the test never reads the real flag dirs."""
+    stops = dict(stopped or {})
     return ClaudeCodeDetector(
         find_processes_fn=lambda: [_FakeProc()] if procs else [],
         aggregate_cpu_fn=lambda p: 0.0,
@@ -633,6 +637,8 @@ def _open_detector(projects, procs=True):
         projects_dir=projects,
         stat_fn=os.stat,
         recent_file_ages_fn=lambda: [],
+        active_sessions_fn=lambda: set(active),
+        finished_mtime_fn=stops.get,
     )
 
 
@@ -716,15 +722,162 @@ def test_open_parent_transcript_is_not_streaming(tmp_path):
     assert d.subagent_open is False
 
 
-def test_malformed_or_oversized_subagent_tail_is_not_open(tmp_path):
+def test_malformed_subagent_tail_is_not_open(tmp_path):
     now = 10_000.0
     projects = tmp_path / "projects"
     _write_lines(_sub(projects), [_rec("assistant", "tool_use"), "{not json"], now - 300.0)
     assert _open_detector(projects).is_busy(now) is False
-    big = json.dumps({"type": "assistant", "message": {"stop_reason": "tool_use",
-                                                       "pad": "x" * 70000}})
-    _write_lines(_sub(projects), [big], now - 300.0)
+
+
+def _big_tool_result() -> str:
+    """A final record larger than the 64 KiB tail window (e.g. a big file-read
+    result): the bounded read holds only a partial line of it."""
+    return json.dumps({"type": "user", "message": {
+        "content": [{"type": "tool_result", "pad": "x" * 70000}]}})
+
+
+def test_oversized_final_record_keeps_open_helper_busy(tmp_path):
+    # Review finding 1: an oversized last record left no complete line in the
+    # tail, which read as "closed" and dropped a silent helper after 20s.
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects), [_rec("assistant", "tool_use"), _big_tool_result()],
+                 now - 300.0)
+    d = _open_detector(projects)
+    assert d.is_busy(now) is True
+    assert d.subagent_open is True
+
+
+def test_oversized_record_followed_by_small_non_conversational_record_is_open(tmp_path):
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects),
+                 [_rec("assistant", "tool_use"), _big_tool_result(),
+                  '{"type": "attachment"}', '{"type": "artifact-autoreact-ledger"}'],
+                 now - 300.0)
+    d = _open_detector(projects)
+    assert d.is_busy(now) is True
+    assert d.subagent_open is True
+
+
+def test_oversized_record_then_final_text_is_still_closed(tmp_path):
+    # A complete conversational record inside the window still decides.
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects),
+                 [_big_tool_result(), _rec("assistant", "end_turn")], now - 300.0)
     assert _open_detector(projects).is_busy(now) is False
+
+
+def test_tail_window_starting_on_record_boundary_keeps_that_record(tmp_path):
+    # The 64 KiB window can begin exactly at a record boundary; that first
+    # line is complete and must not be dropped as "partial". Here it is the
+    # final end_turn record, so dropping it would read the helper as open.
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    final = json.dumps({"type": "assistant", "message": {
+        "stop_reason": "end_turn", "content": [{"type": "text", "pad": ""}]}})
+    final = final.replace('"pad": ""', '"pad": "%s"' % ("x" * (65535 - len(final))))
+    assert len(final) + 1 == 65536
+    _write_lines(_sub(projects), [_rec("assistant", "tool_use"), final], now - 300.0)
+    d = _open_detector(projects)
+    assert d.is_busy(now) is False
+    assert d.subagent_open is False
+
+
+def test_open_helper_not_held_once_parent_stopped_after_its_last_write(tmp_path):
+    # Review finding 2: a helper that died mid-tool leaves a tool_use /
+    # tool_result tail. Once the parent's turn has closed (Stop after the
+    # helper's last write) it must not be held for the 25-minute open window.
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects), [_rec("assistant", "tool_use")], now - 300.0)
+    d = _open_detector(projects, active=(), stopped={"PARENT-SID": now - 200.0})
+    assert d.is_busy(now) is False
+    assert d.subagent_open is False
+    # No turn flag and no Stop flag (StopFailure / SessionEnd): not held.
+    d = _open_detector(projects, active=())
+    assert d.is_busy(now) is False
+    # Another session's turn or Stop does not hold this helper either.
+    d = _open_detector(projects, active=("OTHER-SID",),
+                       stopped={"OTHER-SID": now - 400.0})
+    assert d.is_busy(now) is False
+    assert d.subagent_open is False
+
+
+def test_background_helper_writing_after_parent_stop_stays_held(tmp_path):
+    # A background helper keeps working after its parent's turn ended (the
+    # parent dispatched it and stopped). Its last write is newer than the
+    # parent's Stop, so a long silent stretch still reads as busy.
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects), [_rec("assistant", "tool_use")], now - 300.0)
+    d = _open_detector(projects, active=(), stopped={"PARENT-SID": now - 900.0})
+    assert d.is_busy(now) is True
+    assert d.subagent_open is True
+    assert d.transcript_path == str(_sub(projects))
+
+
+def test_open_helper_drops_when_parent_turn_closes_without_file_change(tmp_path):
+    # The gate must not be cached with the tail: the helper file is unchanged
+    # when the parent's Stop removes its turn flag and rewrites its Stop flag.
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects), [_rec("assistant", "tool_use")], now - 300.0)
+    active = {"PARENT-SID"}
+    stops: dict = {}
+    d = ClaudeCodeDetector(
+        find_processes_fn=lambda: [_FakeProc()],
+        aggregate_cpu_fn=lambda p: 0.0,
+        has_active_shell_children_fn=lambda p: False,
+        projects_dir=projects,
+        stat_fn=os.stat,
+        recent_file_ages_fn=lambda: [],
+        active_sessions_fn=lambda: set(active),
+        finished_mtime_fn=stops.get,
+    )
+    assert d.is_busy(now) is True
+    active.clear()
+    stops["PARENT-SID"] = now + 0.5
+    assert d.is_busy(now + 1.0) is False
+    assert d.subagent_open is False
+
+
+def test_recent_helper_write_stays_busy_without_parent_turn(tmp_path):
+    # Only the long open-record hold is gated; the 20s recency rule is not
+    # (a background helper keeps writing after the parent's Stop).
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects), [_rec("assistant", "tool_use")], now - 5.0)
+    d = _open_detector(projects, active=())
+    assert d.is_busy(now) is True
+    assert d.streaming is True
+    assert d.subagent_open is False
+
+
+def test_turn_flag_dir_listed_at_most_once_per_tick(tmp_path):
+    now = 10_000.0
+    projects = tmp_path / "projects"
+    _write_lines(_sub(projects), [_rec("assistant", "tool_use")], now - 300.0)
+    calls = {"n": 0}
+
+    def active():
+        calls["n"] += 1
+        return {"PARENT-SID"}
+
+    d = ClaudeCodeDetector(
+        find_processes_fn=lambda: [_FakeProc()],
+        aggregate_cpu_fn=lambda p: 0.0,
+        has_active_shell_children_fn=lambda p: False,
+        projects_dir=projects,
+        stat_fn=os.stat,
+        recent_file_ages_fn=lambda: [],
+        active_sessions_fn=active,
+    )
+    for tick in range(4):  # first tick: full glob; later: cached discovery
+        calls["n"] = 0
+        assert d.is_busy(now + tick) is True
+        assert calls["n"] <= 1
 
 
 def test_open_subagent_without_claude_process_is_not_streaming(tmp_path):

@@ -156,6 +156,17 @@ def _default_active_claude_sessions() -> set:
         return set()
 
 
+def _default_claude_finished_mtime(session_id: str) -> float | None:
+    """mtime of a session's claude_finished Stop flag (rewritten on every Stop,
+    kept ~2h), i.e. when its last turn closed; None if absent. Lazy watcher
+    import, like _default_active_claude_sessions. One stat, no content read."""
+    from . import watcher as _w
+    try:
+        return os.stat(os.path.join(_w.CLAUDE_FINISHED_DIR, session_id)).st_mtime
+    except (OSError, ValueError):
+        return None
+
+
 class ClaudeCodeDetector:
     """Detect Claude Code CLI activity, giving engineers whose daily
     driver is Claude Code a working/thinking/celebrating distinction
@@ -194,6 +205,9 @@ class ClaudeCodeDetector:
     # A subagent transcript whose last conversational record is not a final
     # result (see _tail_info) counts as busy for this long after its last write:
     # a long-thinking helper can stay silent for many minutes.
+    # Held only while the parent session's turn is in flight or the helper
+    # wrote after the parent's last Stop (see _parent_holds_helper), so a
+    # helper that died mid-tool is released once the parent's turn closes.
     SUBAGENT_OPEN_STALE_SEC = 1500.0
     # Must exceed SUBAGENT_OPEN_STALE_SEC so open helpers stay cached.
     CANDIDATE_MAX_AGE_SEC = 1800.0
@@ -213,6 +227,7 @@ class ClaudeCodeDetector:
         project_dirs: Iterable[str] | None = None,
         recent_file_ages_fn: Callable | None = None,
         active_sessions_fn: Callable | None = None,
+        finished_mtime_fn: Callable[[str], float | None] | None = None,
     ) -> None:
         self.enabled = enabled
         self._find_processes = find_processes_fn
@@ -251,10 +266,16 @@ class ClaudeCodeDetector:
         # parent the user just resumed, invisible to the candidate-scoped
         # subagent top-up (finding B). Injectable so tests stay hermetic.
         self._active_sessions_fn = active_sessions_fn
+        # session id -> mtime of its last Stop flag (or None). Injectable so
+        # tests stay hermetic; see _parent_holds_helper.
+        self._finished_mtime_fn = finished_mtime_fn
         # Sessions we have already forced a rediscovery for this cache cycle, so
         # a persistently-flagged session with no on-disk transcript (a stale
         # turn_active flag) can never force a full glob every tick.
         self._rediscovery_triggered_for: set = set()
+        # Per-tick memo of _active_sessions_fn (keyed on _scan_now).
+        self._active_sessions_cache: set | None = None
+        self._active_sessions_at: float | None = None
         self._last_scan_ts: float = 0.0
         self.cpu_percent: float = 0.0
         self.claude_code_running: bool = False
@@ -266,13 +287,10 @@ class ClaudeCodeDetector:
         self.transcript_age: float = float("inf")
         self.streaming: bool = False
         # True while some subagent transcript has no final result yet (see
-        # _tail_info); open_subagent_path is the newest such transcript.
+        # _tail_info) that its parent still holds (_parent_holds_helper);
+        # open_subagent_path is the newest such transcript.
         self.subagent_open: bool = False
         self.open_subagent_path: str | None = None
-        # Owning session ids of transcripts written recently (file-write window
-        # plus streaming slack) or held open by a subagent. Lets the watcher name
-        # a focus target for a project file write when exactly one session fits.
-        self.recent_session_ids: frozenset[str] = frozenset()
 
     def _lazy_defaults(self) -> None:
         if self._find_processes is None:
@@ -332,10 +350,8 @@ class ClaudeCodeDetector:
         transcript can never force a full glob every tick. The scheduled 60s
         rediscovery still covers a turn that outlives the cache window.
         """
-        fn = self._active_sessions_fn or _default_active_claude_sessions
-        try:
-            active = fn()
-        except Exception:
+        active = self._active_sessions()
+        if active is None:
             return False
         # Forget sessions whose turn has since closed -- keeps the guard bounded
         # to live turns and lets a session that resumes later trigger again.
@@ -348,6 +364,42 @@ class ClaudeCodeDetector:
             return False
         self._rediscovery_triggered_for |= unknown
         return True
+
+    def _active_sessions(self) -> set | None:
+        """In-flight turn session ids, listed at most once per tick (shared by
+        rediscovery and the open-helper gate) and only when asked for. None
+        when the source raised."""
+        if self._active_sessions_at == self._scan_now:
+            return self._active_sessions_cache
+        fn = self._active_sessions_fn or _default_active_claude_sessions
+        try:
+            active: set | None = set(fn())
+        except Exception:
+            active = None
+        self._active_sessions_cache = active
+        self._active_sessions_at = self._scan_now
+        return active
+
+    def _parent_holds_helper(self, path, helper_mtime: float) -> bool:
+        """Whether an open helper transcript may be held busy past the 20s
+        recency window: its parent session's turn is in flight, or the helper
+        wrote after the parent's last Stop (a background helper still working
+        after its parent's turn ended). A helper whose parent stopped after
+        its last write, or whose parent has neither flag, is released.
+        StopFailure / SessionEnd write no Stop flag, so they release only a
+        helper that did not write after an earlier Stop. Kept outside the
+        tail cache: the parent's Stop does not touch the helper file."""
+        sid = claude_session_id_from_transcript(str(path))
+        if not sid:
+            return False
+        if sid in (self._active_sessions() or ()):
+            return True
+        fn = self._finished_mtime_fn or _default_claude_finished_mtime
+        try:
+            stopped = fn(sid)
+        except Exception:
+            return False
+        return stopped is not None and helper_mtime > stopped
 
     def _subagent_dirs_for_candidates(self) -> set:
         """The subagents/ dirs to watch, derived from the cached candidates.
@@ -413,7 +465,7 @@ class ClaudeCodeDetector:
         return self._tail_info(path, stat)[1]
 
     @staticmethod
-    def _tail_is_open(lines) -> bool:
+    def _tail_is_open(lines, truncated: bool = False) -> bool:
         """Content-blind: reads only ``type``, ``message.stop_reason`` and the
         TYPE of the last content block, never any text or values.
 
@@ -421,8 +473,14 @@ class ClaudeCodeDetector:
         user or assistant record. Open = a user record (tool_result), an
         assistant record with stop_reason tool_use, or one with stop_reason
         None whose last block is thinking/tool_use. A final text block (often
-        recorded with stop_reason None) is closed. Anything doubtful (empty
-        tail, undecodable record, unknown shape) is not open.
+        recorded with stop_reason None) is closed. An undecodable record or
+        unknown shape is not open, nor is a whole file with no user/assistant
+        record.
+
+        ``truncated``: the tail window started mid-file and its partial first
+        line was dropped. If no user/assistant record is left, the last one is
+        larger than the window (e.g. a big file-read tool_result) -- unknown,
+        so open. The caller's parent-turn gate bounds how long that holds.
         """
         for line in reversed(lines):
             try:
@@ -455,7 +513,7 @@ class ClaudeCodeDetector:
                 if not isinstance(last, dict):
                     return False
                 return last.get("type") in ("thinking", "tool_use")
-        return False
+        return truncated
 
     def _tail_info(self, path, stat) -> tuple:
         """(activity_mtime, subagent_open) from one bounded tail read, cached
@@ -471,12 +529,20 @@ class ClaudeCodeDetector:
             with open(path, "rb") as stream:
                 size = stream.seek(0, os.SEEK_END)
                 offset = max(0, size - 65536)
-                stream.seek(offset)
-                lines = stream.read(65536).splitlines()
+                # Start one byte early (when truncating) so we can tell
+                # whether the window begins exactly on a record boundary.
+                stream.seek(max(0, offset - 1))
+                data = stream.read(65536 + (1 if offset else 0))
             if offset:
-                lines = lines[1:]  # first record may be partial
+                boundary = data[:1] == b"\n"
+                data = data[1:]
+                lines = data.splitlines()
+                if not boundary:
+                    lines = lines[1:]  # first record is partial
+            else:
+                lines = data.splitlines()
             if Path(path).parent.name == "subagents":
-                is_open = self._tail_is_open(lines)
+                is_open = self._tail_is_open(lines, truncated=bool(offset))
             saw_ledger = False
             for line in reversed(lines):
                 try:
@@ -511,8 +577,6 @@ class ClaudeCodeDetector:
         self.transcript_path = None
         self.subagent_open = False
         self.open_subagent_path = None
-        recent_sids: set[str] = set()
-        recent_sec = self.FILE_ACTIVE_WINDOW_SEC + self.STREAMING_STALE_SEC
         candidates = self._discover(now)
         candidate_keys = {str(f) for f in candidates}
         self._transcript_activity_cache = {
@@ -527,23 +591,19 @@ class ClaudeCodeDetector:
             mtime = stat.st_mtime
             if now - mtime < self.STREAMING_STALE_SEC:
                 mtime = self._transcript_activity_mtime(f, stat)
-            # Openness is judged per transcript, independent of glob order, so
-            # every open helper's session lands in recent_session_ids.
-            is_open = (stat.st_mtime <= now
-                       and now - stat.st_mtime < self.SUBAGENT_OPEN_STALE_SEC
-                       and self._subagent_is_open(f, stat))
-            if is_open and stat.st_mtime > open_mtime:
+            # The parent gate is checked last, so its flag lookups happen only
+            # when some helper tail actually reads as open.
+            if (stat.st_mtime <= now
+                    and now - stat.st_mtime < self.SUBAGENT_OPEN_STALE_SEC
+                    and stat.st_mtime > open_mtime
+                    and self._subagent_is_open(f, stat)
+                    and self._parent_holds_helper(f, stat.st_mtime)):
                 open_mtime = stat.st_mtime
                 self.subagent_open = True
                 self.open_subagent_path = str(f)
-            if mtime <= now and (now - mtime < recent_sec or is_open):
-                sid = claude_session_id_from_transcript(str(f))
-                if sid:
-                    recent_sids.add(sid)
             if mtime <= now and mtime > newest_mtime:
                 newest_mtime = mtime
                 self.transcript_path = str(f)
-        self.recent_session_ids = frozenset(recent_sids)
         if newest_mtime == 0.0:
             return float("inf")
         return max(0.0, now - newest_mtime)
@@ -791,15 +851,16 @@ class CodexDetector:
 
 
 # ----------------------------------------------------------------------
-# GitDetector -- watches .git/HEAD, .git/index, .git/refs/heads/ mtimes
+# GitDetector -- watches .git/HEAD, the branch ref, packed-refs, .git/index
 # ----------------------------------------------------------------------
 class GitDetector:
     """Detect a new commit on the checked-out branch.
 
-    Each tick stats .git/HEAD, the resolved loose ref and packed-refs (about
-    three stats per repo). Only when one changes does it read HEAD (<=256
-    bytes) and the ref file (65 bytes; packed-refs capped at 1 MiB as the
-    fallback) to get a ref name and sha, held in memory and never logged.
+    Each tick stats .git/HEAD, the resolved loose ref, packed-refs and
+    .git/index (four stats per repo). Only when one of the first three
+    changes does it read HEAD (<=256 bytes) and the ref file (65 bytes;
+    packed-refs capped at 1 MiB as the fallback) to get a ref name and sha,
+    held in memory and never logged.
 
       same symbolic ref, new sha -> is_celebrating (sticky hold): a commit
       first sighting / ref changed -> baseline only (checkout, checkout -b)

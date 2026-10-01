@@ -1,6 +1,7 @@
-"""A project file write (no shell owner) names the sole plausible Claude session
-so "take me there" has something to raise; with several candidates, or when
-Codex also saw the write, the target stays None."""
+"""A project file write carries no writer identity (an mtime, not an owner), so
+with no shell owner the working state names no focus target: a recent
+transcript write, a sole active turn or a sole open helper does not prove which
+session -- or a human editor -- wrote the file. A shell owner still wins."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -36,6 +37,8 @@ def _machine(monkeypatch, transcripts, *, codex_file=False, shell_owner=None,
         glob_fn=lambda root: iter(list(ages)),
         stat_fn=_stat,
         recent_file_ages_fn=lambda: [1.0],
+        active_sessions_fn=lambda: set(turn_sessions),
+        finished_mtime_fn=lambda sid: None,
     )
     if shell_owner is not None:
         def _signals(procs, active_fn, cmdline_fn, owner_out=None):
@@ -58,11 +61,13 @@ def _machine(monkeypatch, transcripts, *, codex_file=False, shell_owner=None,
     return StateMachine(detectors=dets)
 
 
-def test_file_write_by_one_subagent_targets_the_parent_session(monkeypatch):
+def test_file_write_with_one_recent_session_stays_untargeted(monkeypatch):
+    # A recent transcript write does not prove that session wrote the file:
+    # another session's in-process edit or a human editor bumps the same mtime.
     sm = _machine(monkeypatch, {_ROOT + "PARENT/subagents/agent-x.jsonl": 14.0})
     st = sm.compute(notify=False)
     assert st.state == "working"
-    assert st.focus_target == {"agent": "claude", "session": "PARENT"}
+    assert st.focus_target is None
 
 
 def test_file_write_with_two_recent_sessions_stays_untargeted(monkeypatch):
@@ -80,12 +85,12 @@ def test_file_write_also_seen_by_codex_stays_untargeted(monkeypatch):
     assert sm.compute(notify=False).focus_target is None
 
 
-def test_file_write_falls_back_to_the_sole_active_turn(monkeypatch):
+def test_file_write_with_sole_active_turn_stays_untargeted(monkeypatch):
     sm = _machine(monkeypatch, {_ROOT + "OLD.jsonl": 300.0},
                   turn_sessions=["TURN-SID"])
     st = sm.compute(notify=False)
     assert st.state == "working"
-    assert st.focus_target == {"agent": "claude", "session": "TURN-SID"}
+    assert st.focus_target is None
 
 
 def test_file_write_with_two_active_turns_stays_untargeted(monkeypatch):
@@ -94,32 +99,19 @@ def test_file_write_with_two_active_turns_stays_untargeted(monkeypatch):
     assert sm.compute(notify=False).focus_target is None
 
 
-def test_shell_owner_still_wins_over_file_write_session(monkeypatch):
+def test_file_write_with_single_open_helper_stays_untargeted(monkeypatch):
+    monkeypatch.setattr(ClaudeCodeDetector, "_subagent_is_open",
+                        lambda self, path, stat: True)
+    sm = _machine(monkeypatch, {_ROOT + "A/subagents/agent-A.jsonl": 100.0},
+                  turn_sessions=["A"])
+    st = sm.compute(notify=False)
+    assert sm._claude_detector.subagent_open is True  # the helper IS held open
+    assert st.state == "working"
+    assert st.focus_target is None
+
+
+def test_shell_owner_still_wins_over_file_write(monkeypatch):
     owner = {"pid": 7, "created": 5.0}
     sm = _machine(monkeypatch, {_ROOT + "A.jsonl": 300.0}, shell_owner=owner)
     st = sm.compute(notify=False)
     assert st.focus_target == {"agent": "claude", "owner": owner}
-
-
-def _open_helpers(monkeypatch, order):
-    monkeypatch.setattr(ClaudeCodeDetector, "_subagent_is_open",
-                        lambda self, path, stat: True)
-    return _machine(monkeypatch, {
-        _ROOT + f"{sid}/subagents/agent-{sid}.jsonl": age
-        for sid, age in order})
-
-
-def test_two_sessions_with_open_helpers_are_both_candidates_any_order(monkeypatch):
-    # Helpers quiet past the recent window; A is the newer one.
-    for order in ([("A", 100.0), ("B", 200.0)], [("B", 200.0), ("A", 100.0)]):
-        sm = _open_helpers(monkeypatch, order)
-        st = sm.compute(notify=False)
-        assert sm._claude_detector.recent_session_ids == {"A", "B"}
-        assert st.state == "working"
-        assert st.focus_target is None
-
-
-def test_single_open_helper_still_targets_its_parent(monkeypatch):
-    sm = _open_helpers(monkeypatch, [("A", 100.0)])
-    st = sm.compute(notify=False)
-    assert st.focus_target == {"agent": "claude", "session": "A"}

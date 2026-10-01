@@ -29,7 +29,7 @@ The verification harness is a separate PR (#4), not included in this diff.
 | Codex async question | PostToolUse(request_user_input_async) accepted result -> hashed session/async/call-id marker | UserPromptSubmit or SessionEnd clears; Stop intentionally preserves async markers | Approval independent of synchronous turn |
 | Codex clear | PostToolUse decrements matching count; Stop/Interrupt remove turn-prefix; SessionEnd session-prefix | No approval-granted event; tool-completion can lag approval | Ends approval when correlated lifecycle arrives |
 | Settings | ~/.squid-pet/settings.json mtime hot reload; defaults Claude/Codex/Git/IDE on, terminal off | Rebuilds detector objects and currently resets state-machine latches | Enable/disable detectors, roots/editor names; explicit detector list never reloads |
-| Config | ~/.squid-pet/config.json cached by mtime under lock | working hold 25s, celebrate hold 20s, turn stall 180s; alert enabled/sound/text | Timing and approval behavior; tool_active_window_sec currently unused by this pipeline |
+| Config | ~/.squid-pet/config.json cached by mtime under lock | working hold 25s, celebrate hold 20s, turn stall 600s; alert enabled/sound/text | Timing and approval behavior; tool_active_window_sec currently unused by this pipeline |
 | Wake / force | PetApi hold_awake_until max deadline; ~/.squid-pet/force_state file | Poke/sprint hold; periodic wake 900s cadence/180s duration; force has no expiry/validation | Wake suppresses sleep; force is final override |
 
 All time arithmetic above uses wall-clock epoch seconds. Clock jumps and future
@@ -169,7 +169,7 @@ still overrides the cascade, and debug force still overrides approval.
   packed/nested refs, autosaves and generated files remain heuristic limitations.
   File scanning has depth and 200-match caps; no attribution of a write to an
   agent is claimed. No content/hash/ref-reading redesign is part of this patch.
-- **Timing:** exact <20s transcript, <=20s completion, <=180s silence since the latest transcript or turn start,
+- **Timing:** exact <20s transcript, <=20s completion, <=600s silence since the latest transcript or turn start,
   >120s snooze and >=315s sleep boundaries are pinned. Timers remain wall-clock
   based; backward jumps can extend in-memory holds. Future disk evidence is
   ignored until valid, so clock-skewed real activity can be missed temporarily.
@@ -207,7 +207,7 @@ Mac and record macOS/chip/agent versions plus `python -m squid_pet --why-json` a
 - Approve/deny real commands with short and long runtimes; verify the documented
   grant-to-PostToolUse delay and the 120s snooze tradeoff are acceptable. Exercise
   macOS notification permission disabled/enabled, foreground switching and focus.
-- Run long thinking (>20s), usage-limit silence (>180s), rapid Stop/new prompt,
+- Run long thinking (>20s), usage-limit silence (>600s), rapid Stop/new prompt,
   compaction, killed agent/terminal, a new session after a cached discovery and
   a session resumed in the same process. Compare pet state against agent UI.
 - Leave Squid quiet for 315s, then trigger Git/editor work, compaction and a new
