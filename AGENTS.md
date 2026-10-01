@@ -67,7 +67,7 @@ and use temp dirs.
   log database (read-only, metadata only); if that format is unknown, the
   wave falls back to clearing at command completion. The hook also clears
   stale approvals when a new turn starts.
-- **Privacy.** Detectors read metadata only (mtimes, process names, CPU) —
+- **Privacy.** Detectors read metadata only (mtimes, process names, CPU; GitDetector also a ref name and sha, in memory only) —
   no file contents, no network. See `docs/PRIVACY.md`.
 
 ## Task-complete marker

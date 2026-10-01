@@ -288,8 +288,8 @@ def _format_concern_reason(reason: str) -> Optional[str]:
 # known equivalent hook, so this branch stays unreachable/aspirational
 # for now) -- keep it noncommittal so a future real signal doesn't
 # inherit an overclaiming default. GitDetector's celebrate is tied to an
-# observed HEAD/ref mtime change. Checkout and worktree creation also touch
-# metadata, so do not claim a commit without evidence of one.
+# observed branch-tip sha change on the checked-out branch (checkout and
+# worktree creation do not trigger it); the bubble stays noncommittal.
 _CELEBRATE_REASON_BUBBLES = {
     # Pink-2026-08-30: re-added -- claude celebrating is real again now
     # that watcher.py distinguishes it from routine turn completion via
@@ -344,7 +344,7 @@ _REASON_EXPLAIN = {
     "creative burst":         "something wrapped up",
     "claude celebrating":     "claude finished the task",
     "codex celebrating":      "codex finished",
-    "git celebrating":        "fresh commit landed",
+    "git celebrating":        "new commit on a branch",
     "no signals":             "nothing running",
     "non-agent detector busy": "something's busy",
     # Deliberately NOT mapped: bare "celebrating" (the force_state debug

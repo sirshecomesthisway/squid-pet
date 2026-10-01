@@ -228,12 +228,16 @@ categories without requiring live account failures.
 | Reads | What for |
 |-------|----------|
 | Walks `~/Projects/` (and any custom `project_dirs`) up to depth 4 | finds `.git/` directories |
-| `.git/HEAD` mtime | detects fresh commit (within 5s) → celebrating |
+| `.git/HEAD`, the current branch's ref file and `.git/packed-refs` mtimes | notices that the branch may have moved |
+| `.git/HEAD` content (first 256 bytes), only when an mtime above changed | which branch is checked out |
+| That branch's ref file (65 bytes), or its line in `packed-refs` (capped at 1 MiB) | its tip sha; a new sha on the same branch → celebrating (a new commit). Switching branches or a detached HEAD does not celebrate |
 | `.git/index` mtime | detects active staging → busy |
-| `.git/refs/heads/` mtime | detects fresh push (within 5s) → celebrating |
 
-Does NOT read: commit messages, diffs, branch names, remote URLs,
-`.gitconfig`, anything inside the working tree.
+The ref name and sha are held in memory only, never logged or written to
+`state.json`; the celebrate reason never includes a branch name.
+
+Does NOT read: commit messages, diffs, remote URLs, `.gitconfig`,
+anything inside the working tree.
 
 Caching: the list of `.git/` directories is cached for 60 seconds.
 Hard caps: max 50 repos watched, max depth 4 from each project root,

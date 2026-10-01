@@ -8,7 +8,8 @@ State model:
                    file was just written
   - celebrating  : Claude wrote the explicit task-complete marker
                    (scripts/squid_task_complete.py), Codex's own busy->idle
-                   edge, or GitDetector saw a fresh commit (sticky window)
+                   edge, or GitDetector saw a new commit on the checked-out
+                   branch (sticky window)
   - grooving     : Claude Code's Stop hook fired and nothing resumed since
                    -- the lighter per-turn "still making progress" beat
   - sleeping     : no agent activity for > 5 min (NOT user presence --
@@ -2712,7 +2713,7 @@ class StateMachine:
         # codex's own busy->idle edge, any other detector's (e.g. Git's
         # fresh-commit) celebrate signal, or a manually-armed
         # self.celebrate_until (force_state / test hook).
-        # GitDetector celebrates on a .git/refs mtime change -- the instant
+        # GitDetector celebrates when the branch tip sha changes -- the instant
         # a commit lands, which during an agent turn is well before the
         # turn ends. Pink observed her celebrating a commit 20s before the
         # reply appeared, then grooving the moment the answer arrived.
