@@ -745,6 +745,7 @@ class PetApi:
             bubble = self._observer.on_state_change(
                 prev_state, state.state,
                 concern_reason=getattr(state, "concern_reason", "") or "",
+                concern_bubble=getattr(state, "concern_bubble", "") or "",
                 shell_cmdline=shell_cmd,
                 state_reason=getattr(state, "state_reason", "") or "",
                 approval_label=_waiting_label(

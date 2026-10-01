@@ -629,6 +629,7 @@ class Observer:
         new: str,
         *,
         concern_reason: str = "",
+        concern_bubble: str = "",
         shell_cmdline: Optional[list[str]] = None,
         # Fix C (2026-06-28): state machine's "why" string. When non-empty
         # AND starts with an interesting prefix, 50% chance Squid uses it
@@ -643,7 +644,8 @@ class Observer:
 
         - Returns None if old == new (silent no-op)
         - Returns None if mute is on
-        - For 'concerned', prefers the concern_reason verbatim if non-empty
+        - For 'concerned', prefers concern_bubble (names the agent), then
+          the concern_reason verbatim if non-empty
         - For 'working' shell-state, prefers the shell command name if known
         - Otherwise picks a generic line from BUBBLE_LINES
         """
@@ -679,6 +681,9 @@ class Observer:
 
         # Enriched bubbles -- concrete info beats generic emote
         if trigger_key == "concerned":
+            bubble = concern_bubble.strip()
+            if bubble and len(bubble) <= MAX_BUBBLE_CHARS:
+                return bubble
             specific = _format_concern_reason(concern_reason)
             if specific is not None:
                 return specific
