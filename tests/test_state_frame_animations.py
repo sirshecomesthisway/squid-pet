@@ -37,7 +37,7 @@ def _js_anims():
     assert m, "STATE_ANIMS not found in index.html"
     out = {}
     for state, n, t in re.findall(
-        r"(\w+): \{ frames: (\d+), timeline: \[(.*?)\] \}", m.group(1), re.DOTALL
+        r"(\w+): \{ frames: (\d+), (?:loopFrom: \d+, )?timeline: \[(.*?)\] \}", m.group(1), re.DOTALL
     ):
         out[state] = (int(n), json.loads("[" + t + "]"))
     return out
@@ -113,3 +113,11 @@ def test_every_animated_state_has_a_sprite_cycle_owner():
     """The states the cycler handles are real sprites (backend state or mood sprite)."""
     for state in JS:
         assert (SPRITES / f"{state}.png").is_file()
+
+
+def test_loop_from_points_inside_the_timeline():
+    for state, loop in re.findall(
+        r"(\w+): \{ frames: \d+, loopFrom: (\d+),", HTML
+    ):
+        assert 0 <= int(loop) < len(JS[state][1]), state
+    assert "STATE_ANIMS[key].loopFrom" in HTML

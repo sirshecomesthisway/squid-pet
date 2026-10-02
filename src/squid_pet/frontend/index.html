@@ -961,9 +961,12 @@
       concerned: { frames: 6, timeline: [
         [1, 500], [2, 260], [3, 260], [2, 260], [1, 400], [4, 120], [1, 120],
         [4, 120], [1, 500], [5, 150], [1, 150], [5, 150], [1, 300], [6, 110]] },
-      working: { frames: 5, timeline: [
-        [2, 110], [1, 90], [3, 110], [1, 90], [2, 110], [3, 110], [1, 90], [3, 110],
-        [2, 110], [1, 160], [4, 400], [1, 300], [5, 900], [1, 250]] },
+      // loopFrom: after the first pass, repeat from this timeline index (so
+      // working types its code once, then just keeps the cursor flashing).
+      working: { frames: 7, loopFrom: 4, timeline: [
+        [2, 700], [3, 280], [4, 280], [1, 280],
+        [1, 450], [5, 450], [1, 450], [5, 450], [1, 450], [5, 450],
+        [6, 450], [7, 450], [6, 450], [7, 450], [1, 450], [5, 450]] },
       grooving: { frames: 4, timeline: [[2, 250], [3, 250], [4, 250], [3, 250]] },
       celebrating: { frames: 4, timeline: [[2, 200], [3, 200], [4, 200], [3, 200]] },
       sleeping: { frames: 5, timeline: [
@@ -1009,7 +1012,7 @@
         const tick = () => {
           if (_animKey !== key) return;
           const [n, hold] = timeline[_animStep];
-          _animStep = (_animStep + 1) % timeline.length;
+          _animStep = _animStep + 1 < timeline.length ? _animStep + 1 : (STATE_ANIMS[key].loopFrom || 0);
           if ((!_mood || _mood === key) && !pet.dataset.substate) {
             _animSrc = _animFrame(key, n);
             setSpriteSrcDirect(_animSrc);

@@ -410,18 +410,14 @@ def redraw_limb(
     return op
 
 
-def typing_fingers(left_len: int, right_len: int) -> Op:
-    """Two rounded fingertips poking out of the tentacles onto the keys.
-
-    Each is a short capsule that grows out of the pink mass above it, so it is
-    always attached; `*_len` is how far it reaches below the tentacle's edge.
-    """
+def screen_text(show: int) -> Op:
+    """Show only the first `show` characters of the code on the laptop screen."""
     def op(cv: Canvas) -> None:
-        pink = cv.common(WORK_PINK, "P")
-        for cx, edge, length in ((586, 856, left_len), (644, 836, right_len)):
-            pts = [(float(cx), float(edge - 14)), (float(cx), float(edge + length - 16))]
-            for gx, gy in limb_cells(pts, [19.0, 19.0], 8):
-                cv.rect((gx * 8, gy * 8, gx * 8 + 8, gy * 8 + 8), pink)
+        gone: set[tuple[int, int]] = set()
+        for box in WORK_GLYPHS[show:]:
+            gone |= cv.coords(box, lambda p: p[3] > 0 and p[1] > 120 and p[0] < 140)
+        if gone:
+            hide_ink(lambda _cv: gone)(cv)
     return op
 
 
@@ -586,7 +582,8 @@ def _ring_redraw(phase_deg: float) -> Op:
 # working: the cursor blinks and she glances at the screen.
 WORK_EYES: tuple[Box, Box] = ((410, 575, 530, 712), (625, 590, 750, 712))
 WORK_CURSOR: Box = (330, 836, 380, 864)
-WORK_PINK: Box = (640, 772, 720, 800)
+# the three characters of the code shown on the laptop screen: < / >
+WORK_GLYPHS: list[Box] = [(304, 756, 348, 826), (348, 756, 392, 826), (392, 756, 440, 826)]
 
 # grooving: the three notes bob out of phase.
 NOTE_A: Box = (244, 284, 352, 412)
@@ -689,11 +686,13 @@ FRAMES: dict[str, list[list[Op]]] = {
         [_ring_redraw(20)],                                        # 7
     ],
     "working": [
-        [],                                                        # 1 base
-        [typing_fingers(42, 8)],                                   # 2 left tip taps, right lifts
-        [typing_fingers(8, 42)],                                   # 3 right tip taps, left lifts
-        [screen_cursor_off(WORK_CURSOR)],                          # 4 cursor off
-        [_look_both(WORK_EYES, ((-8, 0), (-16, 0)))],              # 5 glance at screen
+        [],                                                        # 1 base: "</>" and cursor
+        [screen_text(0)],                                          # 2 typewriter: empty
+        [screen_text(1)],                                          # 3 "<"
+        [screen_text(2)],                                          # 4 "</"
+        [screen_cursor_off(WORK_CURSOR)],                          # 5 cursor off
+        [_look_both(WORK_EYES, ((-8, 0), (-16, 0)))],              # 6 glance at screen
+        [_look_both(WORK_EYES, ((-8, 0), (-16, 0))), screen_cursor_off(WORK_CURSOR)],  # 7
     ],
     "grooving": [
         [],                                                        # 1 base (entry only)
@@ -719,7 +718,7 @@ ZONES: dict[str, list[Box]] = {
     "concerned": [CONC_BANG, *[(r[0] - 8, r[1] - 8, r[2] + 8, r[3] + 8) for r in CONC_EYES]],
     "sleeping": [(776, 180, 1010, 470)],
     "drowsy": [DROWSY_EYE_L, DROWSY_EYE_R, DROWSY_RING],
-    "working": [WORK_CURSOR, (540, 740, 700, 900),
+    "working": [WORK_CURSOR, (296, 748, 450, 832),
                 *[(r[0] - 8, r[1] - 8, r[2] + 8, r[3] + 8) for r in WORK_EYES]],
     "grooving": [(a[0] - 80, a[1] - 80, a[2] + 80, a[3] + 80) for a in (ARM_L_BOX, ARM_R_BOX)] + [
                  *[(n[0] - 20, n[1] - 20, n[2] + 20, n[3] + 20) for n in (NOTE_A, NOTE_B, NOTE_C)]],
@@ -777,19 +776,26 @@ def contact_sheet(state: str, frames: list[Image.Image], path: Path) -> None:
 
 
 def js_timelines() -> dict[str, list[tuple[int, int]]]:
-    """STATE_ANIMS timelines parsed from the frontend, as {state: [(frame, ms)]}."""
+    """STATE_ANIMS timelines from the frontend, as {state: [(frame, ms)]}.
+
+    A cycle with `loopFrom` plays its intro once and then loops from there;
+    the preview plays the intro and two laps of the loop.
+    """
     import json
     import re
 
     html = (SPRITES.parent / "index.html").read_text()
     block = re.search(r"const STATE_ANIMS = \{(.*?)\n    \};", html, re.DOTALL)
     assert block, "STATE_ANIMS not found in index.html"
-    return {
-        state: [tuple(step) for step in json.loads("[" + body + "]")]  # type: ignore[misc]
-        for state, body in re.findall(
-            r"(\w+): \{ frames: \d+, timeline: \[(.*?)\] \}", block.group(1), re.DOTALL
-        )
-    }
+    out = {}
+    for state, loop, body in re.findall(
+        r"(\w+): \{ frames: \d+, (?:loopFrom: (\d+), )?timeline: \[(.*?)\] \}",
+        block.group(1), re.DOTALL,
+    ):
+        steps = [tuple(step) for step in json.loads("[" + body + "]")]
+        start = int(loop) if loop else 0
+        out[state] = steps[:start] + steps[start:] * (2 if loop else 1)  # type: ignore[assignment]
+    return out
 
 
 def write_gif(state: str, frames: list[Image.Image], path: Path, size: int = 360) -> None:
