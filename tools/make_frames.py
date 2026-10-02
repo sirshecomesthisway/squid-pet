@@ -556,6 +556,31 @@ STAR_C: Box = (988, 772, 1084, 888)
 STAR_D: Box = (140, 684, 232, 780)
 TWINKLE = 0.55
 
+# celebrating: the two cheering arms are redrawn as tapering limbs and wave up
+# and down together. The mid pose is fitted to the base art.
+CHEER_L_BOX: Box = (230, 520, 432, 762)
+CHEER_R_BOX: Box = (846, 560, 1010, 790)
+CHEER_L_SHOULDER: Point = (440.0, 720.0)
+CHEER_R_SHOULDER: Point = (820.0, 770.0)
+CHEER_L_PTS: list[Point] = [(290, 560), (320, 610), (350, 650), (400, 690), (440, 720)]
+CHEER_L_RAD = [28.0, 29.0, 30.0, 33.0, 42.0]
+CHEER_R_PTS: list[Point] = [(946, 594), (945, 640), (915, 690), (870, 730), (820, 770)]
+CHEER_R_RAD = [22.0, 30.0, 32.0, 36.0, 44.0]
+
+
+def cheer_left(deg: float) -> Op:
+    return redraw_limb(
+        lambda x, y, _p: (x <= 410 and y <= 712) or (x <= 372 and y <= 756), CHEER_L_BOX,
+        rotated(CHEER_L_PTS, CHEER_L_SHOULDER, deg), CHEER_L_RAD, ARM_BODY,
+    )
+
+
+def cheer_right(deg: float) -> Op:
+    return redraw_limb(
+        lambda x, y, _p: (x >= 868 and y <= 716) or (x >= 884 and y <= 780), CHEER_R_BOX,
+        rotated(CHEER_R_PTS, CHEER_R_SHOULDER, deg), CHEER_R_RAD, ARM_BODY,
+    )
+
 
 FRAMES: dict[str, list[list[Op]]] = {
     "thinking": [
@@ -608,10 +633,12 @@ FRAMES: dict[str, list[list[Op]]] = {
          shift_box(NOTE_A, 0, 14), shift_box(NOTE_B, 0, -14), shift_box(NOTE_C, 0, 14)],
     ],
     "celebrating": [
-        [],                                                        # 1 base
-        [scale_box(STAR_A, TWINKLE), scale_box(STAR_C, TWINKLE)],
-        [scale_box(b, TWINKLE) for b in (STAR_A, STAR_B, STAR_C, STAR_D)],
-        [scale_box(STAR_B, TWINKLE), scale_box(STAR_D, TWINKLE)],
+        [],                                                        # 1 base (entry only)
+        [cheer_left(8), cheer_right(-8),                         # 2 arms up, pair A twinkles
+         scale_box(STAR_A, TWINKLE), scale_box(STAR_C, TWINKLE)],
+        [cheer_left(0), cheer_right(0)],                           # 3 arms mid, stars full
+        [cheer_left(-18), cheer_right(18),                         # 4 arms out, pair B twinkles
+         scale_box(STAR_B, TWINKLE), scale_box(STAR_D, TWINKLE)],
     ],
 }
 
@@ -625,7 +652,8 @@ ZONES: dict[str, list[Box]] = {
                 *[(r[0] - 8, r[1] - 8, r[2] + 8, r[3] + 8) for r in WORK_EYES]],
     "grooving": [(a[0] - 80, a[1] - 80, a[2] + 80, a[3] + 80) for a in (ARM_L_BOX, ARM_R_BOX)] + [
                  *[(n[0] - 20, n[1] - 20, n[2] + 20, n[3] + 20) for n in (NOTE_A, NOTE_B, NOTE_C)]],
-    "celebrating": [STAR_A, STAR_B, STAR_C, STAR_D],
+    "celebrating": [STAR_A, STAR_B, STAR_C, STAR_D,
+                    *[(a[0] - 100, a[1] - 100, a[2] + 100, a[3] + 100) for a in (CHEER_L_BOX, CHEER_R_BOX)]],
 }
 
 
