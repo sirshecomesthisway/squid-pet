@@ -317,6 +317,77 @@ def limb_cells(
     return cells
 
 
+def _snap_blocks(cv: Canvas, written: set[tuple[int, int]], size: int) -> None:
+    """Round the moved pixels to `size`-pixel blocks (majority opaque, commonest colour)."""
+    blocks = {(x // size, y // size) for x, y in written}
+    for bx, by in blocks:
+        cells = [(x, y) for y in range(by * size, (by + 1) * size)
+                 for x in range(bx * size, (bx + 1) * size)
+                 if 0 <= x < cv.size[0] and 0 <= y < cv.size[1]]
+        opaque = [c for c in cells if cv.get(*c)[3] > 0]
+        if any(c not in written for c in opaque):
+            continue                       # touches untouched art: leave it alone
+        if len(opaque) * 2 >= len(cells):
+            colour = Counter(cv.get(*c) for c in opaque).most_common(1)[0][0]
+            cv.fill(set(cells), colour)
+        else:
+            cv.fill(set(cells), TRANSPARENT)
+
+
+def bend_part(
+    keep: Callable[[int, int, Pixel], bool],
+    box: Box,
+    shoulder: Point,
+    r_fixed: float,
+    r_full: float,
+    degrees: float,
+    snap: int = 12,
+) -> Op:
+    """Bend the drawn limb selected by `keep` about `shoulder`, keeping its own art.
+
+    The limb's pixels are re-sampled through a twist whose angle grows smoothly
+    from 0 at `r_fixed` from the shoulder (so the root never moves and never
+    tears) to `degrees` at `r_full` (clockwise on screen). Because the original
+    pixels are carried along, the limb keeps its drawn shape, taper and curl.
+    The result is then snapped to `snap`-pixel blocks (only where the block
+    holds nothing but moved limb pixels) so the edges stay blocky pixel art
+    instead of the ragged diagonal a plain rotation leaves.    """
+    import math
+
+    def op(cv: Canvas) -> None:
+        if degrees == 0:
+            return                       # rest pose is the original art
+        x0, y0, x1, y1 = clamp_box(box, cv.size)
+        sx, sy = shoulder
+        mask = {
+            (x, y): cv.get(x, y)
+            for y in range(y0, y1)
+            for x in range(x0, x1)
+            if cv.get(x, y)[3] > 0
+            and math.hypot(x - sx, y - sy) >= r_fixed
+            and keep(x, y, cv.get(x, y))
+        }
+        cv.fill(set(mask), TRANSPARENT)
+        written: set[tuple[int, int]] = set()
+        reach = max(math.hypot(x - sx, y - sy) for x, y in mask) + 4 * abs(degrees) + 20
+        for y in range(max(0, int(sy - reach)), min(cv.size[1], int(sy + reach))):
+            for x in range(max(0, int(sx - reach)), min(cv.size[0], int(sx + reach))):
+                r = math.hypot(x - sx, y - sy)
+                if r < r_fixed:
+                    continue
+                u = min(1.0, (r - r_fixed) / (r_full - r_fixed))
+                phi = math.radians(degrees) * u * u * (3 - 2 * u)
+                c, s_ = math.cos(-phi), math.sin(-phi)
+                px = round(sx + (x - sx) * c - (y - sy) * s_)
+                py = round(sy + (x - sx) * s_ + (y - sy) * c)
+                src = mask.get((px, py))
+                if src is not None:
+                    cv.put(x, y, src)
+                    written.add((x, y))
+        _snap_blocks(cv, written, snap)
+    return op
+
+
 def redraw_limb(
     erase: Callable[[int, int, Pixel], bool],
     erase_box: Box,
@@ -569,16 +640,16 @@ CHEER_R_RAD = [22.0, 30.0, 32.0, 36.0, 44.0]
 
 
 def cheer_left(deg: float) -> Op:
-    return redraw_limb(
-        lambda x, y, _p: (x <= 410 and y <= 712) or (x <= 372 and y <= 756), CHEER_L_BOX,
-        rotated(CHEER_L_PTS, CHEER_L_SHOULDER, deg), CHEER_L_RAD, ARM_BODY,
+    return bend_part(
+        lambda x, y, _p: (x <= 392 and y <= 712) or (x <= 372 and y <= 756), CHEER_L_BOX,
+        CHEER_L_SHOULDER, 80.0, 300.0, deg,
     )
 
 
 def cheer_right(deg: float) -> Op:
-    return redraw_limb(
+    return bend_part(
         lambda x, y, _p: (x >= 868 and y <= 716) or (x >= 884 and y <= 780), CHEER_R_BOX,
-        rotated(CHEER_R_PTS, CHEER_R_SHOULDER, deg), CHEER_R_RAD, ARM_BODY,
+        CHEER_R_SHOULDER, 80.0, 300.0, deg,
     )
 
 

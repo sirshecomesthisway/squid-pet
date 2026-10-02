@@ -75,3 +75,20 @@ sleeping and drowsy are not generated art: they are the base sprite with local
 pixel edits, produced by `tools/make_frames.py` (`--check` verifies they are
 reproducible; `--gif DIR` writes animated previews). Regenerate them with that
 script after changing any of those base sprites.
+
+## Working: typing arms (needs new art)
+
+`working.png` draws the front tentacles as one flat pink lump over the
+keyboard, so they cannot be lifted and lowered by editing pixels. Real
+piano-style typing frames have to be drawn. Generate them one at a time with
+`working.png` attached as the reference (style anchor above):
+
+> [STYLE ANCHOR] — Only change: the two front tentacles. Left tentacle lifted
+> about one tentacle-width above the keyboard, right tentacle pressed down on the
+> keys. Keep the laptop, eyes, body and everything else pixel-identical.
+
+Then the mirror pose (right lifted, left pressed) and a both-resting pose.
+Save them as `working_arm_1.png` … and run them through `tools/remove_bg.py`
+and `tools/align_to_reference.py` (reference `working.png`), as was done for
+the `attention_needed_*` frames; the frontend cycle in `index.html`
+(`STATE_ANIMS`) and `tools/verify_sprites.py` then need the new names added.
