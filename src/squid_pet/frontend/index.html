@@ -962,12 +962,13 @@
         [1, 500], [2, 260], [3, 260], [2, 260], [1, 400], [4, 120], [1, 120],
         [4, 120], [1, 500], [5, 150], [1, 150], [5, 150], [1, 300], [6, 110]] },
       // loopFrom: after the first pass, repeat from this timeline index. working
-      // types "{/}" and then its "_" cursor (the last keystroke) once, after which
-      // only the cursor keeps flashing.
-      working: { frames: 7, loopFrom: 5, timeline: [
-        [2, 700], [3, 280], [4, 280], [5, 280], [1, 280],
-        [1, 450], [5, 450], [1, 450], [5, 450], [1, 450], [5, 450],
-        [6, 450], [7, 450], [6, 450], [7, 450], [1, 450], [5, 450]] },
+      // types "{/}" and then its "_" cursor (the last keystroke) once, her eyes
+      // moving with each keystroke; after that only the cursor keeps flashing
+      // while her eyes keep wandering.
+      working: { frames: 9, loopFrom: 5, timeline: [
+        [2, 700], [3, 280], [4, 280], [9, 280], [6, 280],
+        [1, 450], [5, 450], [6, 450], [7, 450], [8, 450], [9, 450],
+        [8, 450], [9, 450], [6, 450], [7, 450], [1, 450], [5, 450]] },
       grooving: { frames: 4, timeline: [[2, 250], [3, 250], [4, 250], [3, 250]] },
       celebrating: { frames: 4, timeline: [[2, 200], [3, 200], [4, 200], [3, 200]] },
       sleeping: { frames: 5, timeline: [

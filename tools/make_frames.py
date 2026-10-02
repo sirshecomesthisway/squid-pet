@@ -580,7 +580,9 @@ def _ring_redraw(phase_deg: float) -> Op:
 # working: the cursor blinks and she glances at the screen.
 WORK_EYES: tuple[Box, Box] = ((410, 575, 530, 712), (625, 590, 750, 712))
 WORK_CURSOR: Box = (330, 836, 380, 864)
-# the three characters of the code shown on the laptop screen: < / >
+# Eye positions she cycles through while typing and watching the screen.
+# (Defined before FRAMES so the frame table below can use them.)
+# the three characters of the code shown on the laptop screen: { / }
 WORK_GLYPHS: list[Box] = [(304, 756, 348, 826), (348, 756, 392, 826), (392, 756, 440, 826)]
 
 # grooving: the three notes bob out of phase.
@@ -648,6 +650,9 @@ def cheer_right(deg: float) -> Op:
     )
 
 
+WORK_EYE_LEFT = _look_both(WORK_EYES, ((-8, 0), (-16, 0)))
+WORK_EYE_UP = _look_both(WORK_EYES, ((0, -14), (0, -14)))
+
 FRAMES: dict[str, list[list[Op]]] = {
     "thinking": [
         [],                                              # 1 base: one dot
@@ -684,13 +689,15 @@ FRAMES: dict[str, list[list[Op]]] = {
         [_ring_redraw(20)],                                        # 7
     ],
     "working": [
-        [],                                                        # 1 base: "</>" and cursor
-        [screen_text(0), screen_cursor_off(WORK_CURSOR)],          # 2 typewriter: empty
-        [screen_text(1), screen_cursor_off(WORK_CURSOR)],          # 3 "{"
-        [screen_text(2), screen_cursor_off(WORK_CURSOR)],          # 4 "{/"
-        [screen_cursor_off(WORK_CURSOR)],                          # 5 "{/}" / cursor off
-        [_look_both(WORK_EYES, ((-8, 0), (-16, 0)))],              # 6 glance at screen
-        [_look_both(WORK_EYES, ((-8, 0), (-16, 0))), screen_cursor_off(WORK_CURSOR)],  # 7
+        [],                                                        # 1 base: "{/}_", eyes down
+        [screen_text(0), screen_cursor_off(WORK_CURSOR), WORK_EYE_LEFT],   # 2 typing: empty
+        [screen_text(1), screen_cursor_off(WORK_CURSOR), WORK_EYE_UP],     # 3 "{"
+        [screen_text(2), screen_cursor_off(WORK_CURSOR), WORK_EYE_LEFT],   # 4 "{/"
+        [screen_cursor_off(WORK_CURSOR)],                          # 5 "{/}", eyes down
+        [WORK_EYE_LEFT],                                           # 6 "{/}_", eyes left
+        [screen_cursor_off(WORK_CURSOR), WORK_EYE_LEFT],           # 7 "{/}", eyes left
+        [WORK_EYE_UP],                                             # 8 "{/}_", eyes up
+        [screen_cursor_off(WORK_CURSOR), WORK_EYE_UP],             # 9 "{/}", eyes up
     ],
     "grooving": [
         [],                                                        # 1 base (entry only)

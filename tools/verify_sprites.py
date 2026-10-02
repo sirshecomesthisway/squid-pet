@@ -22,7 +22,7 @@ BASE_NAMES = (
 # base sprite itself, so only frames 2..N exist as files.
 STATE_FRAME_COUNTS = {
     "celebrating": 4, "concerned": 6, "drowsy": 7, "grooving": 4, "sleeping": 5,
-    "thinking": 7, "working": 7,
+    "thinking": 7, "working": 9,
 }
 EXPECTED_SIZES = {
     **{f"{name}.png": (1254, 1254) for name in BASE_NAMES},
