@@ -252,7 +252,7 @@ def hide_ink(cells_fn: Callable[[Canvas], set[tuple[int, int]]]) -> Op:
         for x, y in gone:
             for d in range(1, 80):
                 for nx in (x - d, x + d):
-                    if 0 <= nx < w and (nx, y) not in gone:
+                    if 0 <= nx < w and (nx, y) not in gone and cv.get(nx, y)[3] in (0, 255):
                         fills[(x, y)] = cv.get(nx, y)
                         break
                 else:
@@ -265,73 +265,92 @@ def hide_ink(cells_fn: Callable[[Canvas], set[tuple[int, int]]]) -> Op:
     return op
 
 
-def slide_part(
-    keep: Callable[[int, int, Pixel], bool],
-    box: Box,
-    dx: int,
-    dy: int,
-    root: tuple[int, int, int],
+Point = tuple[float, float]
+
+
+def rotated(points: list[Point], pivot: Point, degrees: float) -> list[Point]:
+    """Rotate `points` clockwise on screen by `degrees` about `pivot`."""
+    import math
+
+    t = math.radians(degrees)
+    c, s = math.cos(t), math.sin(t)
+    return [
+        (pivot[0] + (x - pivot[0]) * c - (y - pivot[1]) * s,
+         pivot[1] + (x - pivot[0]) * s + (y - pivot[1]) * c)
+        for x, y in points
+    ]
+
+
+def limb_cells(
+    points: list[Point], radii: list[float], cell: int = 16, origin: tuple[int, int] = (0, 0)
+) -> set[tuple[int, int]]:
+    """Grid cells covered by a tapering limb drawn along a polyline.
+
+    The limb is the union of discs whose radius is interpolated between the
+    `radii` of consecutive `points`. A cell is filled when at least half of it
+    lies inside, which gives the stepped silhouette of hand-drawn pixel art.
+    """
+    import math
+
+    def inside(x: float, y: float) -> bool:
+        for (ax, ay), (bx, by), ra, rb in zip(points, points[1:], radii, radii[1:]):
+            dx, dy = bx - ax, by - ay
+            ln = dx * dx + dy * dy
+            t = 0.0 if ln == 0 else max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / ln))
+            if math.hypot(x - (ax + t * dx), y - (ay + t * dy)) <= ra + (rb - ra) * t:
+                return True
+        return False
+
+    pad = max(radii) + cell
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    ox, oy = origin
+    cells = set()
+    for cy in range(int((min(ys) - pad - oy) // cell), int((max(ys) + pad - oy) // cell) + 1):
+        for cx in range(int((min(xs) - pad - ox) // cell), int((max(xs) + pad - ox) // cell) + 1):
+            hits = sum(
+                inside(ox + cx * cell + (i + 0.5) * cell / 4, oy + cy * cell + (j + 0.5) * cell / 4)
+                for i in range(4) for j in range(4)
+            )
+            if hits >= 8:
+                cells.add((cx, cy))
+    return cells
+
+
+def redraw_limb(
+    erase: Callable[[int, int, Pixel], bool],
+    erase_box: Box,
+    points: list[Point],
+    radii: list[float],
+    colour_box: Box,
+    cell: int = 16,
 ) -> Op:
-    """Move the part selected by `keep` rigidly by (dx, dy), keeping its root attached.
-
-    Sliding (rather than rotating) keeps every pixel edge on the original
-    grid. Whatever the part vacates within `root` = (x, y, radius) of its
-    shoulder is restored from the base sprite, so the join with the body never
-    tears; elsewhere the vacated pixels become clear.
-    """
+    """Erase the drawn limb selected by `erase`, then draw it afresh along `points`."""
     def op(cv: Canvas) -> None:
-        base = cv.img.copy().load()
-        assert base is not None
-        x0, y0, x1, y1 = clamp_box(box, cv.size)
-        cells = {
-            (x, y)
-            for y in range(y0, y1)
-            for x in range(x0, x1)
-            if cv.get(x, y)[3] > 0 and keep(x, y, cv.get(x, y))
-        }
-        cv.move(cells, dx, dy, TRANSPARENT)
-        rx, ry, rr = root
-        for y in range(max(0, ry - rr), min(cv.size[1], ry + rr)):
-            for x in range(max(0, rx - rr), min(cv.size[0], rx + rr)):
-                if (x - rx) ** 2 + (y - ry) ** 2 <= rr * rr and cv.get(x, y)[3] == 0 and base[x, y][3] > 0:
-                    cv.put(x, y, base[x, y])  # type: ignore[arg-type]
+        colour = cv.common(colour_box, "P")
+        x0, y0, x1, y1 = clamp_box(erase_box, cv.size)
+        cv.fill(
+            {(x, y) for y in range(y0, y1) for x in range(x0, x1)
+             if cv.get(x, y)[3] > 0 and erase(x, y, cv.get(x, y))},
+            TRANSPARENT,
+        )
+        for cx, cy in limb_cells(points, radii, cell):
+            cv.rect((cx * cell, cy * cell, (cx + 1) * cell, (cy + 1) * cell), colour)
     return op
 
 
-def press(box: Box, from_box: Box) -> Op:
-    """Extend a fingertip down into the keys: paint `box` with body pink sampled from `from_box`."""
-    def op(cv: Canvas) -> None:
-        cv.rect(box, cv.common(from_box, "P"))
-    return op
+def typing_fingers(left_len: int, right_len: int) -> Op:
+    """Two rounded fingertips poking out of the tentacles onto the keys.
 
-
-def fade_ink(cells_fn: Callable[[Canvas], set[tuple[int, int]]], amount: float) -> Op:
-    """Dim ink toward whatever lies behind it, so the shape stays but looks lighter.
-
-    Over an opaque background (the body) the colour blends toward it; over a
-    clear background the pixel's own alpha drops, so it dims on any wallpaper.
+    Each is a short capsule that grows out of the pink mass above it, so it is
+    always attached; `*_len` is how far it reaches below the tentacle's edge.
     """
     def op(cv: Canvas) -> None:
-        region = cv.dilate(cells_fn(cv), 3)
-        w = cv.size[0]
-        edits = {}
-        for x, y in region:
-            back = None
-            for d in range(1, 80):
-                for nx in (x - d, x + d):
-                    if 0 <= nx < w and (nx, y) not in region:
-                        back = cv.get(nx, y)
-                        break
-                if back is not None:
-                    break
-            assert back is not None, f"no clean pixel beside {(x, y)}"
-            r, g, b, a = cv.get(x, y)
-            if back[3] == 255:
-                edits[(x, y)] = tuple(round(c + (k - c) * amount) for c, k in zip((r, g, b), back[:3])) + (a,)
-            else:
-                edits[(x, y)] = (r, g, b, round(a * (1 - amount)))
-        for c, v in edits.items():
-            cv.put(*c, v)  # type: ignore[arg-type]
+        pink = cv.common(WORK_PINK, "P")
+        for cx, edge, length in ((586, 856, left_len), (644, 836, right_len)):
+            pts = [(float(cx), float(edge - 14)), (float(cx), float(edge + length - 16))]
+            for gx, gy in limb_cells(pts, [19.0, 19.0], 8):
+                cv.rect((gx * 8, gy * 8, gx * 8 + 8, gy * 8 + 8), pink)
     return op
 
 
@@ -464,22 +483,38 @@ def _ring_dots(cv: Canvas) -> list[set[tuple[int, int]]]:
     return sorted(dots, key=ang)
 
 
-def _ring_dim(start: int, width: int) -> Op:
-    """Dim `width` neighbouring ring dots (the ring itself always stays whole)."""
+RING_CENTRE: Point = (843.0, 307.0)
+RING_RADIUS = 100.0
+RING_DOTS = 12
+RING_DOT = 34
+RING_FILL: Pixel = (46, 48, 54, 255)
+RING_EDGE: Pixel = (30, 30, 34, 255)
+
+
+def _ring_redraw(phase_deg: float) -> Op:
+    """Redraw the whole loading ring as an even circle of dots, turned by `phase_deg`.
+
+    The old, uneven ring is erased first, so every frame shows one full circle
+    (including the dots that sit over her head).
+    """
+    import math
+
     def op(cv: Canvas) -> None:
-        dots = _ring_dots(cv)
-        dim = {c for i in range(width) for c in dots[(start + i) % len(dots)]}
-        fade_ink(lambda _cv: dim, RING_DIM)(cv)
+        old = {c for d in _ring_dots(cv) for c in d}
+        hide_ink(lambda _cv: old)(cv)
+        for k in range(RING_DOTS):
+            a = math.radians(phase_deg + k * 360.0 / RING_DOTS)
+            cx = round(RING_CENTRE[0] + RING_RADIUS * math.sin(a))
+            cy = round(RING_CENTRE[1] - RING_RADIUS * math.cos(a))
+            h = RING_DOT // 2
+            cv.rect((cx - h, cy - h, cx + h, cy + h), RING_EDGE)
+            cv.rect((cx - h + 2, cy - h + 2, cx + h - 2, cy + h - 2), RING_FILL)
     return op
 
-
-RING_DIM = 0.7
 
 # working: the cursor blinks and she glances at the screen.
 WORK_EYES: tuple[Box, Box] = ((410, 575, 530, 712), (625, 590, 750, 712))
 WORK_CURSOR: Box = (330, 836, 380, 864)
-WORK_LEFT_FINGER: Box = (556, 862, 606, 886)    # tips that tap down into the keys
-WORK_RIGHT_FINGER: Box = (616, 842, 676, 866)
 WORK_PINK: Box = (640, 772, 720, 800)
 
 # grooving: the three notes bob out of phase.
@@ -487,21 +522,31 @@ NOTE_A: Box = (244, 284, 352, 412)
 NOTE_B: Box = (156, 652, 248, 788)
 NOTE_C: Box = (972, 380, 1068, 520)
 
-# grooving: both raised arms slide up and down about their shoulders. The masks
-# keep the arms apart from the headphones, eyes and body.
-ARM_SWING = 24
+# grooving: both raised arms are redrawn (not shifted) as tapering limbs on the
+# art grid, swinging about their shoulders. The mid pose is fitted to the base art.
 ARM_L_BOX: Box = (270, 596, 432, 742)
 ARM_R_BOX: Box = (856, 682, 1000, 772)
+ARM_L_SHOULDER: Point = (405.0, 745.0)
+ARM_R_SHOULDER: Point = (830.0, 800.0)
+ARM_L_PTS: list[Point] = [(322, 628), (340, 670), (347, 692), (368, 718), (400, 760)]
+ARM_L_RAD = [29.0, 30.0, 31.0, 36.0, 50.0]
+ARM_R_PTS: list[Point] = [(941, 712), (940, 760), (900, 790), (830, 800)]
+ARM_R_RAD = [29.0, 30.0, 34.0, 44.0]
+ARM_BODY: Box = (520, 440, 700, 560)
 
 
-def ARM_L_SWING(dy: int) -> Op:  # noqa: N802
-    return slide_part(
-        lambda x, y, _p: x <= 418 and not (x >= 356 and y < 648), ARM_L_BOX, 0, dy, (385, 735, 56)
+def arm_left(deg: float) -> Op:
+    return redraw_limb(
+        lambda x, y, _p: x <= 418 and not (x >= 356 and y < 648), ARM_L_BOX,
+        rotated(ARM_L_PTS, ARM_L_SHOULDER, deg), ARM_L_RAD, ARM_BODY,
     )
 
 
-def ARM_R_SWING(dy: int) -> Op:  # noqa: N802
-    return slide_part(lambda x, y, _p: x >= 858, ARM_R_BOX, 0, dy, (925, 765, 56))
+def arm_right(deg: float) -> Op:
+    return redraw_limb(
+        lambda x, y, _p: x >= 858, ARM_R_BOX,
+        rotated(ARM_R_PTS, ARM_R_SHOULDER, deg), ARM_R_RAD, ARM_BODY,
+    )
 
 
 # celebrating: the four sparkles twinkle in diagonal pairs.
@@ -543,22 +588,23 @@ FRAMES: dict[str, list[list[Op]]] = {
         [cover_rows(DROWSY_EYE_L, 26, DROWSY_PINK), cover_rows(DROWSY_EYE_R, 26, DROWSY_PINK)],
         [cover_rows(DROWSY_EYE_L, 44, DROWSY_PINK), cover_rows(DROWSY_EYE_R, 44, DROWSY_PINK)],
         [close_box(DROWSY_EYE_L, DROWSY_PINK), close_box(DROWSY_EYE_R, DROWSY_PINK)],
-        [_ring_dim(0, 3)],                                         # 5 ring turns
-        [_ring_dim(3, 3)],                                         # 6
-        [_ring_dim(6, 3)],                                         # 7
+        [_ring_redraw(0)],                                         # 5 full ring, turning
+        [_ring_redraw(10)],                                        # 6
+        [_ring_redraw(20)],                                        # 7
     ],
     "working": [
         [],                                                        # 1 base
-        [press(WORK_LEFT_FINGER, WORK_PINK)],                      # 2 left tip taps
-        [press(WORK_RIGHT_FINGER, WORK_PINK)],                     # 3 right tip taps
+        [typing_fingers(42, 8)],                                   # 2 left tip taps, right lifts
+        [typing_fingers(8, 42)],                                   # 3 right tip taps, left lifts
         [screen_cursor_off(WORK_CURSOR)],                          # 4 cursor off
         [_look_both(WORK_EYES, ((-8, 0), (-16, 0)))],              # 5 glance at screen
     ],
     "grooving": [
-        [],                                                        # 1 base
-        [ARM_L_SWING(-ARM_SWING), ARM_R_SWING(-ARM_SWING),         # 2 left arm up, right down
+        [],                                                        # 1 base (entry only)
+        [arm_left(6), arm_right(22),                              # 2 left arm up, right down
          shift_box(NOTE_A, 0, -14), shift_box(NOTE_B, 0, 14), shift_box(NOTE_C, 0, -14)],
-        [ARM_L_SWING(ARM_SWING), ARM_R_SWING(ARM_SWING),           # 3 left arm down, right up
+        [arm_left(0), arm_right(0)],                               # 3 both mid
+        [arm_left(-22), arm_right(-12),                            # 4 left arm down, right up
          shift_box(NOTE_A, 0, 14), shift_box(NOTE_B, 0, -14), shift_box(NOTE_C, 0, 14)],
     ],
     "celebrating": [
@@ -569,18 +615,15 @@ FRAMES: dict[str, list[list[Op]]] = {
     ],
 }
 
-# States whose frames deliberately dim ink over a clear background (new alpha levels).
-DIMMED = {"drowsy"}
-
 # Regions a state's frames may touch; anything else must match the base.
 ZONES: dict[str, list[Box]] = {
     "thinking": [THINK_BUBBLE, *[(r[0] - 8, r[1] - 8, r[2] + 8, r[3] + 8) for r in THINK_EYES]],
     "concerned": [CONC_BANG, *[(r[0] - 8, r[1] - 8, r[2] + 8, r[3] + 8) for r in CONC_EYES]],
     "sleeping": [(776, 180, 1010, 470)],
     "drowsy": [DROWSY_EYE_L, DROWSY_EYE_R, DROWSY_RING],
-    "working": [WORK_CURSOR, WORK_LEFT_FINGER, WORK_RIGHT_FINGER,
+    "working": [WORK_CURSOR, (540, 740, 700, 900),
                 *[(r[0] - 8, r[1] - 8, r[2] + 8, r[3] + 8) for r in WORK_EYES]],
-    "grooving": [(a[0] - 60, a[1] - 60, a[2] + 60, a[3] + 60) for a in (ARM_L_BOX, ARM_R_BOX)] + [
+    "grooving": [(a[0] - 80, a[1] - 80, a[2] + 80, a[3] + 80) for a in (ARM_L_BOX, ARM_R_BOX)] + [
                  *[(n[0] - 20, n[1] - 20, n[2] + 20, n[3] + 20) for n in (NOTE_A, NOTE_B, NOTE_C)]],
     "celebrating": [STAR_A, STAR_B, STAR_C, STAR_D],
 }
@@ -616,7 +659,7 @@ def verify_state(state: str, base: Image.Image, frames: list[Image.Image]) -> li
         if ImageChops.difference(a, b).getbbox() is not None:
             errors.append(f"{state}_{i}: pixels changed outside the edit zones")
         alphas = {v for _, v in (fr.getchannel("A").getcolors(256) or [])}
-        if alphas - base_alpha and state not in DIMMED:
+        if alphas - base_alpha:
             errors.append(f"{state}_{i}: new alpha values {sorted(alphas - base_alpha)[:5]}")
     return errors
 

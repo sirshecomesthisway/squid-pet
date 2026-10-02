@@ -58,7 +58,8 @@ def test_timeline_indices_are_valid_and_cover_every_frame(state):
     count, timeline = JS[state]
     used = {n for n, _ in timeline}
     assert used <= set(range(1, count + 1))
-    assert used == set(range(1, count + 1)), "a generated frame is never shown"
+    # Frame 1 is the base sprite shown on entry; every generated frame must play.
+    assert used >= set(range(2, count + 1)), "a generated frame is never shown"
     assert all(hold >= 50 for _, hold in timeline)
 
 

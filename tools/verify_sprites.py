@@ -21,7 +21,7 @@ BASE_NAMES = (
 # Derived animation frames (tools/make_frames.py). Frame 1 of each cycle is the
 # base sprite itself, so only frames 2..N exist as files.
 STATE_FRAME_COUNTS = {
-    "celebrating": 4, "concerned": 6, "drowsy": 7, "grooving": 3, "sleeping": 5,
+    "celebrating": 4, "concerned": 6, "drowsy": 7, "grooving": 4, "sleeping": 5,
     "thinking": 7, "working": 5,
 }
 EXPECTED_SIZES = {
