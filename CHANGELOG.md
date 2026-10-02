@@ -8,11 +8,14 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Animated thinking and concerned.** Both states now play derived sprite
-  frames instead of a single image: thinking forms its bubble, adds dots, and
-  drifts and blinks its eyes; concerned darts its eyes, pops and flashes the
-  "!", and blinks. Frames are generated from the base art by
-  `tools/make_frames.py`, and the CSS tilt and tremble are softened to suit.
+- **Animated state sprites.** thinking, concerned, working, grooving,
+  celebrating, drowsy and sleeping now play derived sprite frames instead of a
+  single image: the thought bubble forms and the eyes drift and blink; the "!"
+  pops and flashes; the laptop cursor blinks; the music notes bob; the
+  sparkles twinkle; the Z's drift up; the drowsy lids droop and the loading
+  ring turns. Frames are generated from the base art by `tools/make_frames.py`
+  (frame 1 is always the untouched base sprite), and the CSS tilt and tremble
+  are softened to suit.
 
 ## [0.3.0] - 2026-09-05
 
