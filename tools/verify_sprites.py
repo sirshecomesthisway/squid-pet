@@ -18,10 +18,21 @@ BASE_NAMES = (
     "grooving", "idle", "look-left", "look-right", "sleeping", "stretch",
     "thinking", "working",
 )
+# Derived animation frames (tools/make_frames.py). Frame 1 of each cycle is the
+# base sprite itself, so only frames 2..N exist as files.
+STATE_FRAME_COUNTS = {
+    "celebrating": 4, "concerned": 6, "drowsy": 7, "grooving": 4, "sleeping": 5,
+    "thinking": 7, "working": 9,
+}
 EXPECTED_SIZES = {
     **{f"{name}.png": (1254, 1254) for name in BASE_NAMES},
     **{f"attention_needed_{i}.png": (1254, 1254) for i in range(1, 5)},
     **{f"pancake_flip_{i}.png": (1254, 1254) for i in range(1, 25)},
+    **{
+        f"{state}_{i}.png": (1254, 1254)
+        for state, count in STATE_FRAME_COUNTS.items()
+        for i in range(2, count + 1)
+    },
     "heart.png": (670, 612),
     "idle_menubar.png": (710, 725),
     "sleeping_menubar.png": (753, 756),

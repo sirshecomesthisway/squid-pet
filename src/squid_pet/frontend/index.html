@@ -99,7 +99,7 @@
       animation: idle-squish 900ms ease-in-out !important;
     }
 
-    @keyframes thinking-tilt { 0%,100%{transform:translate(-50%,-50%) rotate(-4deg);} 50%{transform:translate(-50%,-50%) rotate(4deg);} }
+    @keyframes thinking-tilt { 0%,100%{transform:translate(-50%,-50%) rotate(-3deg);} 50%{transform:translate(-50%,-50%) rotate(3deg);} }
     .pet[data-state="thinking"] { animation: thinking-tilt 2.4s ease-in-out infinite; }
 
     @keyframes working-shake { 0%,100%{transform:translate(-50%,-50%) translateX(0);} 25%{transform:translate(-50%,-50%) translateX(-1.5px);} 75%{transform:translate(-50%,-50%) translateX(1.5px);} }
@@ -122,7 +122,7 @@
     @keyframes sleeping-breathe { 0%,100%{transform:translate(-50%,-50%) scale(0.94);} 50%{transform:translate(-50%,-50%) scale(1.02);} }
     .pet[data-state="sleeping"] { animation: sleeping-breathe 4.5s ease-in-out infinite; }
 
-    @keyframes concerned-tremble { 0%,100%{transform:translate(-50%,-50%) translate(0,0);} 10%,30%,50%,70%,90%{transform:translate(-50%,-50%) translate(-1.5px,1.5px);} 20%,40%,60%,80%{transform:translate(-50%,-50%) translate(1.5px,-1.5px);} }
+    @keyframes concerned-tremble { 0%,100%{transform:translate(-50%,-50%) translate(0,0);} 10%,30%,50%,70%,90%{transform:translate(-50%,-50%) translate(-1px,1px);} 20%,40%,60%,80%{transform:translate(-50%,-50%) translate(1px,-1px);} }
     .pet[data-state="concerned"] { animation: concerned-tremble 0.25s linear infinite; }
 
     /* ── APPROVAL-NEEDED ── agent waiting on user input, her loudest cue.
@@ -512,6 +512,8 @@
       // stomps the animation -- she visibly alternates between flipping a
       // pancake and the static working sprite (reported 2026-09-19).
       if (state === "working" && _pancakeSrc) return _pancakeSrc;
+      // Same ownership rule for the generic state frame cycles (STATE_ANIMS).
+      if (_animSrc && _animKey === state) return _animSrc;
       return VALID.has(state) ? `sprites/${state}.png` : `sprites/idle.png`;
     }
 
@@ -531,6 +533,9 @@
       pet.dataset.state = state;       // raw state attribute for CSS animations
       currentState = state;
       dbgState.textContent = state;
+      // Leaving an animated state: drop the cycle WITHOUT restoring -- the
+      // swap below puts the new state's sprite up with its normal fade.
+      if (_animKey && _animKey !== _animVisualKey()) stopStateAnim(false);
       // Attention-needed flag-wave cycler: start on enter, stop on leave.
       // Runs in parallel with normal sprite swap below; the cycler skips
       // its tick when mood/sub-state owns the sprite, so layering is safe.
@@ -938,11 +943,123 @@
       }
     }
 
+    /* ─────── Static-state frame cycles ───────
+       These states used to be one PNG plus a CSS transform. Each now plays a timeline of derived frames (tools/make_frames.py writes
+       <state>_<n>.png; frame 1 is the untouched base sprite, so entering the
+       state never pops). Timeline entries are [frame number, hold ms]. The
+       CSS keyframes keep running underneath for body motion.
+
+       Ownership mirrors the pancake cycle: _animSrc is the frame on screen,
+       spriteUrl() hands it back so "restore the base sprite" paths cannot
+       stomp it, and the mood / sub-state layers pause the swaps (the clock
+       keeps running) instead of fighting them. Frames are preloaded per
+       state; if any is missing she just keeps the static sprite. */
+    const STATE_ANIMS = {
+      thinking: { frames: 7, timeline: [
+        [1, 500], [4, 220], [5, 220], [1, 500], [2, 450], [3, 900],
+        [6, 1000], [3, 500], [7, 110], [3, 700]] },
+      concerned: { frames: 6, timeline: [
+        [1, 500], [2, 260], [3, 260], [2, 260], [1, 400], [4, 120], [1, 120],
+        [4, 120], [1, 500], [5, 150], [1, 150], [5, 150], [1, 300], [6, 110]] },
+      // loopFrom: after the first pass, repeat from this timeline index. working
+      // types "{/}" and then its "_" cursor (the last keystroke) once, her eyes
+      // moving with each keystroke; after that only the cursor keeps flashing
+      // while her eyes keep wandering.
+      working: { frames: 9, loopFrom: 5, timeline: [
+        [2, 700], [3, 280], [4, 280], [9, 280], [6, 280],
+        [1, 450], [5, 450], [6, 450], [7, 450], [8, 450], [9, 450],
+        [8, 450], [9, 450], [6, 450], [7, 450], [1, 450], [5, 450]] },
+      grooving: { frames: 4, timeline: [[2, 250], [3, 250], [4, 250], [3, 250]] },
+      celebrating: { frames: 4, timeline: [[2, 200], [3, 200], [4, 200], [3, 200]] },
+      sleeping: { frames: 5, timeline: [
+        [1, 1200], [2, 500], [3, 600], [4, 600], [1, 900], [5, 700], [1, 500]] },
+      drowsy: { frames: 7, timeline: [
+        [1, 600], [5, 200], [6, 200], [7, 200], [5, 200], [6, 200], [7, 200],
+        [1, 400], [2, 500], [3, 700], [4, 1100], [1, 160],
+        [5, 200], [6, 200], [7, 200]] },
+    };
+    let _animKey   = null;     // state whose cycle is running
+    let _animSrc   = null;     // frame currently shown by the cycle
+    let _animTimer = null;
+    let _animStep  = 0;
+    const _animReady = {};     // state -> Promise<bool>, loaded lazily
+
+    // Frame 1 IS the base sprite; only frames 2.. exist as <state>_<n>.png.
+    function _animFrame(key, n) { return n === 1 ? `sprites/${key}.png` : `sprites/${key}_${n}.png`; }
+
+    function _animPreload(key) {
+      if (_animReady[key]) return _animReady[key];
+      const srcs = Array.from({ length: STATE_ANIMS[key].frames },
+                              (_, i) => _animFrame(key, i + 1));
+      _animReady[key] = Promise.all(srcs.map(src => new Promise(res => {
+        const im = new Image();
+        im.onload  = () => res(true);
+        im.onerror = () => res(false);
+        im.src = src;
+      }))).then(oks => {
+        const ok = oks.every(Boolean);
+        if (!ok) console.warn(`[squid] ${key} frames missing -- keeping static sprite`);
+        return ok;
+      });
+      return _animReady[key];
+    }
+
+    function startStateAnim(key) {
+      _animKey = key;
+      _animStep = 0;
+      _animPreload(key).then(ok => {
+        if (_animKey !== key) return;          // left the state while loading
+        if (!ok) { _animKey = null; return; }
+        const timeline = STATE_ANIMS[key].timeline;
+        const tick = () => {
+          if (_animKey !== key) return;
+          const [n, hold] = timeline[_animStep];
+          _animStep = _animStep + 1 < timeline.length ? _animStep + 1 : (STATE_ANIMS[key].loopFrom || 0);
+          if ((!_mood || _mood === key) && !pet.dataset.substate) {
+            _animSrc = _animFrame(key, n);
+            setSpriteSrcDirect(_animSrc);
+          }
+          _animTimer = setTimeout(tick, hold);
+        };
+        tick();
+      });
+    }
+
+    function stopStateAnim(restore) {
+      if (!_animKey) return;
+      _animKey = null;
+      _animSrc = null;            // release ownership BEFORE the restore
+      if (_animTimer) { clearTimeout(_animTimer); _animTimer = null; }
+      if (restore && !_mood && !pet.dataset.substate) {
+        setSpriteSrcDirect(spriteUrl(currentState));
+      }
+    }
+
+    // Which cycle (if any) should be on screen right now. The mood layer
+    // owns drowsy/sleeping (frontend-only sprites); everything else follows
+    // the backend state. The pancake cycle keeps long-running `working`, and
+    // stretch / approval_needed have their own sprite choreography.
+    function _animVisualKey() {
+      if (_mood === "drowsy" || _mood === "sleeping") return _mood;
+      if (_mood === "stretch" || currentState === "approval_needed") return null;
+      if (currentState === "working" && _longWorking) return null;
+      return STATE_ANIMS.hasOwnProperty(currentState) ? currentState : null;
+    }
+
+    // Called every poll tick and on every mood change.
+    function syncStateAnim() {
+      const want = _animVisualKey();
+      if (want === _animKey) return;
+      stopStateAnim(true);
+      if (want) startStateAnim(want);
+    }
+
     function enterDrowsy() {
       if (_mood === "drowsy") return;
       _mood = "drowsy";
       notifyMoodToBackend("drowsy");
       setSpriteSrcDirect("sprites/drowsy.png");
+      syncStateAnim();
       console.log("[squid] -> drowsy mood");
     }
 
@@ -951,6 +1068,7 @@
       _mood = "sleeping";
       notifyMoodToBackend("sleeping");
       setSpriteSrcDirect("sprites/sleeping.png");
+      syncStateAnim();
       console.log("[squid] -> sleeping mood (3 min agent-idle)");
     }
 
@@ -964,6 +1082,7 @@
       _mood = "stretch";
       notifyMoodToBackend("stretch");
       setSpriteSrcDirect("sprites/stretch.png");
+      syncStateAnim();                       // drop the drowsy/sleeping cycle
       console.log(`[squid] -> stretch (waking from ${from})`);
       setTimeout(() => {
         _mood = "";
@@ -986,6 +1105,7 @@
         // a fresh state -- longer than the 1.5s stretch.
         const base = currentState === "sleeping" ? "idle" : currentState;
         setSpriteSrcDirect(spriteUrl(base));
+        syncStateAnim();
         console.log(`[squid] stretch complete -> awake (base=${base})`);
       }, STRETCH_DURATION_MS);
     }
@@ -1278,6 +1398,7 @@
           _longWorking = result?.long_working === true;
           setState(result?.state || "idle");
           syncPancakeFlip();
+          syncStateAnim();
           applySubState(result?.sub_state || "");
           // PetState.message (backend's short per-state caption, e.g.
           // "🛠️ running shell") was computed every tick but never
