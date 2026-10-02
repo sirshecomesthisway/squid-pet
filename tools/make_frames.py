@@ -422,12 +422,10 @@ def screen_text(show: int) -> Op:
 
 
 def screen_cursor_off(box: Box) -> Op:
-    """Blank the blinking cursor on the laptop screen with the screen colour."""
+    """Blank the blinking cursor on the laptop screen (inpainted from the screen beside it)."""
     def op(cv: Canvas) -> None:
-        cur = cv.coords(box, lambda p: role(p) in ("C", "?") and p[1] > p[0] + 30)
-        ring = cv.dilate(cur, 3) - cur
-        c = Counter(cv.get(x, y) for x, y in ring if cv.get(x, y)[1] <= cv.get(x, y)[0] + 30)
-        cv.fill(cur, c.most_common(1)[0][0])
+        gone = cv.coords(box, lambda p: p[3] > 0 and p[1] > 120 and p[0] < 140)
+        hide_ink(lambda _cv: gone)(cv)
     return op
 
 
@@ -687,10 +685,10 @@ FRAMES: dict[str, list[list[Op]]] = {
     ],
     "working": [
         [],                                                        # 1 base: "</>" and cursor
-        [screen_text(0)],                                          # 2 typewriter: empty
-        [screen_text(1)],                                          # 3 "<"
-        [screen_text(2)],                                          # 4 "</"
-        [screen_cursor_off(WORK_CURSOR)],                          # 5 cursor off
+        [screen_text(0), screen_cursor_off(WORK_CURSOR)],          # 2 typewriter: empty
+        [screen_text(1), screen_cursor_off(WORK_CURSOR)],          # 3 "{"
+        [screen_text(2), screen_cursor_off(WORK_CURSOR)],          # 4 "{/"
+        [screen_cursor_off(WORK_CURSOR)],                          # 5 "{/}" / cursor off
         [_look_both(WORK_EYES, ((-8, 0), (-16, 0)))],              # 6 glance at screen
         [_look_both(WORK_EYES, ((-8, 0), (-16, 0))), screen_cursor_off(WORK_CURSOR)],  # 7
     ],
