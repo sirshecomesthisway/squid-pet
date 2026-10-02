@@ -265,6 +265,76 @@ def hide_ink(cells_fn: Callable[[Canvas], set[tuple[int, int]]]) -> Op:
     return op
 
 
+def slide_part(
+    keep: Callable[[int, int, Pixel], bool],
+    box: Box,
+    dx: int,
+    dy: int,
+    root: tuple[int, int, int],
+) -> Op:
+    """Move the part selected by `keep` rigidly by (dx, dy), keeping its root attached.
+
+    Sliding (rather than rotating) keeps every pixel edge on the original
+    grid. Whatever the part vacates within `root` = (x, y, radius) of its
+    shoulder is restored from the base sprite, so the join with the body never
+    tears; elsewhere the vacated pixels become clear.
+    """
+    def op(cv: Canvas) -> None:
+        base = cv.img.copy().load()
+        assert base is not None
+        x0, y0, x1, y1 = clamp_box(box, cv.size)
+        cells = {
+            (x, y)
+            for y in range(y0, y1)
+            for x in range(x0, x1)
+            if cv.get(x, y)[3] > 0 and keep(x, y, cv.get(x, y))
+        }
+        cv.move(cells, dx, dy, TRANSPARENT)
+        rx, ry, rr = root
+        for y in range(max(0, ry - rr), min(cv.size[1], ry + rr)):
+            for x in range(max(0, rx - rr), min(cv.size[0], rx + rr)):
+                if (x - rx) ** 2 + (y - ry) ** 2 <= rr * rr and cv.get(x, y)[3] == 0 and base[x, y][3] > 0:
+                    cv.put(x, y, base[x, y])  # type: ignore[arg-type]
+    return op
+
+
+def press(box: Box, from_box: Box) -> Op:
+    """Extend a fingertip down into the keys: paint `box` with body pink sampled from `from_box`."""
+    def op(cv: Canvas) -> None:
+        cv.rect(box, cv.common(from_box, "P"))
+    return op
+
+
+def fade_ink(cells_fn: Callable[[Canvas], set[tuple[int, int]]], amount: float) -> Op:
+    """Dim ink toward whatever lies behind it, so the shape stays but looks lighter.
+
+    Over an opaque background (the body) the colour blends toward it; over a
+    clear background the pixel's own alpha drops, so it dims on any wallpaper.
+    """
+    def op(cv: Canvas) -> None:
+        region = cv.dilate(cells_fn(cv), 3)
+        w = cv.size[0]
+        edits = {}
+        for x, y in region:
+            back = None
+            for d in range(1, 80):
+                for nx in (x - d, x + d):
+                    if 0 <= nx < w and (nx, y) not in region:
+                        back = cv.get(nx, y)
+                        break
+                if back is not None:
+                    break
+            assert back is not None, f"no clean pixel beside {(x, y)}"
+            r, g, b, a = cv.get(x, y)
+            if back[3] == 255:
+                edits[(x, y)] = tuple(round(c + (k - c) * amount) for c, k in zip((r, g, b), back[:3])) + (a,)
+            else:
+                edits[(x, y)] = (r, g, b, round(a * (1 - amount)))
+        for c, v in edits.items():
+            cv.put(*c, v)  # type: ignore[arg-type]
+    return op
+
+
 def screen_cursor_off(box: Box) -> Op:
     """Blank the blinking cursor on the laptop screen with the screen colour."""
     def op(cv: Canvas) -> None:
@@ -394,22 +464,45 @@ def _ring_dots(cv: Canvas) -> list[set[tuple[int, int]]]:
     return sorted(dots, key=ang)
 
 
-def _ring_gap(start: int, width: int) -> Op:
+def _ring_dim(start: int, width: int) -> Op:
+    """Dim `width` neighbouring ring dots (the ring itself always stays whole)."""
     def op(cv: Canvas) -> None:
         dots = _ring_dots(cv)
-        gone = {c for i in range(width) for c in dots[(start + i) % len(dots)]}
-        hide_ink(lambda _cv: gone)(cv)
+        dim = {c for i in range(width) for c in dots[(start + i) % len(dots)]}
+        fade_ink(lambda _cv: dim, RING_DIM)(cv)
     return op
 
+
+RING_DIM = 0.7
 
 # working: the cursor blinks and she glances at the screen.
 WORK_EYES: tuple[Box, Box] = ((410, 575, 530, 712), (625, 590, 750, 712))
 WORK_CURSOR: Box = (330, 836, 380, 864)
+WORK_LEFT_FINGER: Box = (556, 862, 606, 886)    # tips that tap down into the keys
+WORK_RIGHT_FINGER: Box = (616, 842, 676, 866)
+WORK_PINK: Box = (640, 772, 720, 800)
 
 # grooving: the three notes bob out of phase.
 NOTE_A: Box = (244, 284, 352, 412)
 NOTE_B: Box = (156, 652, 248, 788)
 NOTE_C: Box = (972, 380, 1068, 520)
+
+# grooving: both raised arms slide up and down about their shoulders. The masks
+# keep the arms apart from the headphones, eyes and body.
+ARM_SWING = 24
+ARM_L_BOX: Box = (270, 596, 432, 742)
+ARM_R_BOX: Box = (856, 682, 1000, 772)
+
+
+def ARM_L_SWING(dy: int) -> Op:  # noqa: N802
+    return slide_part(
+        lambda x, y, _p: x <= 418 and not (x >= 356 and y < 648), ARM_L_BOX, 0, dy, (385, 735, 56)
+    )
+
+
+def ARM_R_SWING(dy: int) -> Op:  # noqa: N802
+    return slide_part(lambda x, y, _p: x >= 858, ARM_R_BOX, 0, dy, (925, 765, 56))
+
 
 # celebrating: the four sparkles twinkle in diagonal pairs.
 STAR_A: Box = (260, 224, 372, 348)
@@ -450,19 +543,23 @@ FRAMES: dict[str, list[list[Op]]] = {
         [cover_rows(DROWSY_EYE_L, 26, DROWSY_PINK), cover_rows(DROWSY_EYE_R, 26, DROWSY_PINK)],
         [cover_rows(DROWSY_EYE_L, 44, DROWSY_PINK), cover_rows(DROWSY_EYE_R, 44, DROWSY_PINK)],
         [close_box(DROWSY_EYE_L, DROWSY_PINK), close_box(DROWSY_EYE_R, DROWSY_PINK)],
-        [_ring_gap(0, 3)],                                         # 5 ring turns
-        [_ring_gap(6, 3)],                                         # 6 ring turns on
+        [_ring_dim(0, 3)],                                         # 5 ring turns
+        [_ring_dim(3, 3)],                                         # 6
+        [_ring_dim(6, 3)],                                         # 7
     ],
     "working": [
         [],                                                        # 1 base
-        [screen_cursor_off(WORK_CURSOR)],                          # 2 cursor off
-        [_look_both(WORK_EYES, ((-8, 0), (-16, 0)))],             # 3 glance at screen
-        [_look_both(WORK_EYES, ((-8, 0), (-16, 0))), screen_cursor_off(WORK_CURSOR)],
+        [press(WORK_LEFT_FINGER, WORK_PINK)],                      # 2 left tip taps
+        [press(WORK_RIGHT_FINGER, WORK_PINK)],                     # 3 right tip taps
+        [screen_cursor_off(WORK_CURSOR)],                          # 4 cursor off
+        [_look_both(WORK_EYES, ((-8, 0), (-16, 0)))],              # 5 glance at screen
     ],
     "grooving": [
         [],                                                        # 1 base
-        [shift_box(NOTE_A, 0, -14), shift_box(NOTE_B, 0, 14), shift_box(NOTE_C, 0, -14)],
-        [shift_box(NOTE_A, 0, 14), shift_box(NOTE_B, 0, -14), shift_box(NOTE_C, 0, 14)],
+        [ARM_L_SWING(-ARM_SWING), ARM_R_SWING(-ARM_SWING),         # 2 left arm up, right down
+         shift_box(NOTE_A, 0, -14), shift_box(NOTE_B, 0, 14), shift_box(NOTE_C, 0, -14)],
+        [ARM_L_SWING(ARM_SWING), ARM_R_SWING(ARM_SWING),           # 3 left arm down, right up
+         shift_box(NOTE_A, 0, 14), shift_box(NOTE_B, 0, -14), shift_box(NOTE_C, 0, 14)],
     ],
     "celebrating": [
         [],                                                        # 1 base
@@ -472,14 +569,19 @@ FRAMES: dict[str, list[list[Op]]] = {
     ],
 }
 
+# States whose frames deliberately dim ink over a clear background (new alpha levels).
+DIMMED = {"drowsy"}
+
 # Regions a state's frames may touch; anything else must match the base.
 ZONES: dict[str, list[Box]] = {
     "thinking": [THINK_BUBBLE, *[(r[0] - 8, r[1] - 8, r[2] + 8, r[3] + 8) for r in THINK_EYES]],
     "concerned": [CONC_BANG, *[(r[0] - 8, r[1] - 8, r[2] + 8, r[3] + 8) for r in CONC_EYES]],
     "sleeping": [(776, 180, 1010, 470)],
     "drowsy": [DROWSY_EYE_L, DROWSY_EYE_R, DROWSY_RING],
-    "working": [WORK_CURSOR, *[(r[0] - 8, r[1] - 8, r[2] + 8, r[3] + 8) for r in WORK_EYES]],
-    "grooving": [(n[0] - 20, n[1] - 20, n[2] + 20, n[3] + 20) for n in (NOTE_A, NOTE_B, NOTE_C)],
+    "working": [WORK_CURSOR, WORK_LEFT_FINGER, WORK_RIGHT_FINGER,
+                *[(r[0] - 8, r[1] - 8, r[2] + 8, r[3] + 8) for r in WORK_EYES]],
+    "grooving": [(a[0] - 60, a[1] - 60, a[2] + 60, a[3] + 60) for a in (ARM_L_BOX, ARM_R_BOX)] + [
+                 *[(n[0] - 20, n[1] - 20, n[2] + 20, n[3] + 20) for n in (NOTE_A, NOTE_B, NOTE_C)]],
     "celebrating": [STAR_A, STAR_B, STAR_C, STAR_D],
 }
 
@@ -514,7 +616,7 @@ def verify_state(state: str, base: Image.Image, frames: list[Image.Image]) -> li
         if ImageChops.difference(a, b).getbbox() is not None:
             errors.append(f"{state}_{i}: pixels changed outside the edit zones")
         alphas = {v for _, v in (fr.getchannel("A").getcolors(256) or [])}
-        if alphas - base_alpha:
+        if alphas - base_alpha and state not in DIMMED:
             errors.append(f"{state}_{i}: new alpha values {sorted(alphas - base_alpha)[:5]}")
     return errors
 
