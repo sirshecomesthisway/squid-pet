@@ -67,3 +67,10 @@ concerned.png
 ```
 
 Once all 7 are present, the pet auto-discovers them on next launch.
+
+## Derived animation frames
+
+`thinking_2..7.png` and `concerned_2..6.png` are not generated art: they are
+the base sprite with local pixel edits, produced by `tools/make_frames.py`
+(`--check` verifies they are reproducible). Regenerate them with that script
+after changing `thinking.png` or `concerned.png`.

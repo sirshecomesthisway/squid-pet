@@ -4,6 +4,16 @@ All notable changes to Squid are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims
 to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Animated thinking and concerned.** Both states now play derived sprite
+  frames instead of a single image: thinking forms its bubble, adds dots, and
+  drifts and blinks its eyes; concerned darts its eyes, pops and flashes the
+  "!", and blinks. Frames are generated from the base art by
+  `tools/make_frames.py`, and the CSS tilt and tremble are softened to suit.
+
 ## [0.3.0] - 2026-09-05
 
 First public release. Squid is a tiny macOS desktop companion that shows what
