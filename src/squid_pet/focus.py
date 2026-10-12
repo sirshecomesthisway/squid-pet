@@ -29,6 +29,16 @@ Two levels, because only one is universally available:
 Best-effort by nature: the hook payload carries no PID, so with several
 sessions waiting there is no way to know which one fired -- the same
 limitation find_terminal_app_bundle_for_claude_code documents.
+
+2026-10-12 -- DESKTOP SESSIONS. A session in the Claude desktop app's Code tab
+runs the app's own bundled CLI with no terminal at all, so the tty chain can
+only fail -- and its last resort, "any live claude process's tty", then raised
+whatever unrelated Terminal tab was open. The hook records each session's
+surface (watcher.claude_session_surface); a session recorded as the desktop
+surface raises the desktop app by bundle id instead and stops there. There is
+no public way to select one Code tab inside the app, so none is guessed.
+Terminal sessions -- and any session whose surface is unknown or unrecorded --
+take exactly the tty path above, unchanged.
 """
 
 from __future__ import annotations
@@ -40,6 +50,10 @@ from typing import Callable, Optional
 log = logging.getLogger(__name__)
 
 TERMINAL_APP_BUNDLE_ID = "com.apple.Terminal"
+# The Claude desktop app (its Code tab hosts "local-agent" sessions). Same
+# value as watcher.CLAUDE_DESKTOP_BUNDLE_ID; repeated here so this module
+# keeps its lazy watcher import.
+CLAUDE_DESKTOP_BUNDLE_ID = "com.anthropic.claudefordesktop"
 
 
 def _signal_dirs() -> dict:
@@ -190,6 +204,39 @@ def _freshest_in(dir_path: str, fresh_sec: Optional[float] = None) -> Optional[s
     return best[1] if best else None
 
 
+def _is_desktop_session(session_id: Optional[str]) -> bool:
+    """True only when the hook RECORDED this session as the desktop surface.
+    Unknown, unrecorded, unreadable -> False, i.e. today's tty path."""
+    if not session_id:
+        return False
+    try:
+        from . import watcher
+        return watcher.claude_session_surface(session_id) == watcher.CLAUDE_SURFACE_DESKTOP
+    except Exception:
+        return False
+
+
+def _is_desktop_cli_proc(proc) -> bool:
+    """True when `proc`'s own executable is the desktop app's bundled Claude
+    Code CLI (its claude.app carries watcher.CLAUDE_DESKTOP_CLI_BUNDLE_ID).
+    Intrinsic to the process, so it holds even if its parent app is gone.
+    Any failure -> False, i.e. today's path. Called on a click only."""
+    try:
+        from . import watcher
+        return (watcher._bundle_id_from_exe_path(proc.exe())
+                == watcher.CLAUDE_DESKTOP_CLI_BUNDLE_ID)
+    except Exception:
+        return False
+
+
+def _raise_desktop_app(run: Optional[Callable[[str], Optional[str]]] = None) -> str:
+    """Bring the Claude desktop app forward -- and stop. Which Code tab inside
+    it holds the session is not exposed, so the honest answer is "app-only"."""
+    runner = run if run is not None else _run_osascript
+    runner(build_app_activate_script(CLAUDE_DESKTOP_BUNDLE_ID))
+    return "app-only"
+
+
 def freshest_waiting_session() -> Optional[str]:
     """Session id of the most recently raised wave."""
     from .watcher import CLAUDE_AWAITING_INPUT_DIR
@@ -207,13 +254,17 @@ def waiting_session_tty() -> Optional[str]:
     limitation find_terminal_app_bundle_for_claude_code documents.
 
     Falls back to any live process's tty, which is exactly right in the
-    single-session case and no worse than the old behaviour otherwise.
+    single-session case and no worse than the old behaviour otherwise --
+    EXCEPT for a desktop-app session (2026-10-12): it has no tty, so that
+    fallback could only hand back an unrelated Terminal tab. None instead.
     """
     try:
         from .watcher import claude_session_tty, find_claude_code_processes
     except Exception:
         return None
     sid = freshest_waiting_session()
+    if _is_desktop_session(sid):
+        return None
     if sid:
         try:
             tty = claude_session_tty(sid)
@@ -439,6 +490,19 @@ def _focus_claude_state(state: str,
     # non-Terminal hosts are still raised) rather than _focus_process_owner's
     # Terminal-only exact-tab path. Only when the owner cannot be resolved
     # (process gone) do we fall through to the session/freshest/blind chain.
+    #
+    # 2026-10-12 (review fix 1): the desktop-surface check must cover the owner
+    # path too. A named working/thinking session recorded as the desktop
+    # surface decides before the owner is even consulted; and an owner process
+    # that IS the desktop app's bundled CLI with no terminal decides right
+    # after it resolves -- that test needs no session id (working targets
+    # deliberately carry none) and no host walk, which can return None (e.g.
+    # the app is gone and the CLI was reparented to launchd). Without it that
+    # case fell to _any_claude_tty() below and raised a stranger's Terminal
+    # tab. Every other owner keeps the exact pre-existing flow.
+    if (session is not None and state in ("working", "thinking")
+            and _is_desktop_session(session)):
+        return _raise_desktop_app(run)
     if owner and state in ("working", "thinking"):
         from .watcher import _terminal_app_bundle_for_proc
         proc = _claude_owner_proc(owner)
@@ -448,6 +512,8 @@ def _focus_claude_state(state: str,
                 tty = proc.terminal()
             except Exception:
                 tty = None
+            if not tty and _is_desktop_cli_proc(proc):
+                return _raise_desktop_app(run)
             try:
                 bundle = _terminal_app_bundle_for_proc(proc)
             except Exception:
@@ -460,6 +526,11 @@ def _focus_claude_state(state: str,
             sid = _named_if_fresh(signal_dir, session, fresh_sec) if session else None
             if sid is None:
                 sid = _freshest_in(signal_dir, fresh_sec)
+        if _is_desktop_session(sid):
+            # A desktop Code-tab session: no tty exists, and the blind
+            # fallback below would raise an unrelated Terminal tab. Raise the
+            # desktop app and stop (see the module docstring).
+            return _raise_desktop_app(run)
         if sid:
             try:
                 from .watcher import _terminal_app_bundle_for_proc, claude_session_proc
@@ -587,6 +658,8 @@ def focus_waiting_session(run: Optional[Callable[[str], Optional[str]]] = None) 
     requests = watcher.codex_requests_awaiting_input()
     if requests:
         return _focus_codex_approval(requests, run)
+    if _is_desktop_session(freshest_waiting_session()):
+        return _raise_desktop_app(run)
     runner = run if run is not None else _run_osascript
     try:
         from .watcher import find_terminal_app_bundle_for_claude_code

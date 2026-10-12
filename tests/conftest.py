@@ -21,6 +21,11 @@ def isolate_codex_wait_markers(tmp_path, monkeypatch):
                         str(tmp_path / 'claude_failed'))
     monkeypatch.setattr(watcher, 'CLAUDE_SESSION_TTY_DIR',
                         str(tmp_path / 'claude_session_tty'))
+    # compute() also lists (and stale-sweeps) claude_session_surface/ every
+    # tick, and focus.py reads it on a click.
+    monkeypatch.setattr(watcher, 'CLAUDE_SESSION_SURFACE_DIR',
+                        str(tmp_path / 'claude_session_surface'))
+    monkeypatch.setattr(watcher, '_CLAUDE_SURFACE_CACHE', {})
     # claude_sessions_awaiting_input() also drives the (throttled) sweep of
     # PermissionRequest attribution hints -- never let it reach the real dir.
     monkeypatch.setattr(watcher, 'CLAUDE_PERMISSION_PENDING_DIR',
