@@ -47,6 +47,7 @@ config, outside this repo).
 | `tool_use_id` (PermissionRequest events only, if present) | an opaque tool-call id, stored with that request's attribution hint (below) only if it is a plain id; not user content |
 | `notification_type` (Notification events only) | only `permission_prompt` creates a flag; every other value, `idle_prompt` included, is ignored |
 | `error_type` (StopFailure events only) | the error CATEGORY (e.g. `rate_limit`, `billing_error`) that ended the turn -- drives the concerned/warning sprite. A bounded enum, never message text |
+| `transcript_path` (any event, main session only) | names the session's own transcript, from which the hook reads ONE metadata field, `entrypoint` (below). Never stored |
 | `agent_id` (any event) | an opaque subagent (Task-tool helper) identifier -- not user content. Tells a helper's events apart from the parent session's (main-thread events never carry one); written into the awaiting-input flag as that helper's owner line (below) so that its own later clearing event resolves only its own prompt. Used only if it is a plain id (letters, digits, `-`, `_`); anything else -- including an empty one -- is ignored and logged as `BAD_AGENT_ID` without the value |
 
 `PermissionRequest` payloads also carry `tool_name`, `tool_input` and
@@ -59,13 +60,23 @@ the table above.
 | `~/.squid-pet/claude_permission_pending/<session_id>` (one JSON line per recent `PermissionRequest`: the `agent_id` or null, the call's `tool_use_id` if the payload carries a plain one, and the time) | attribution hints, never a wave -- kept in their own folder so the watcher can never mistake one for a pending prompt. A real `Notification` carries no `agent_id`, so it uses the hints younger than 10s to decide whose prompt is up: every such hint is used up and adds its own owner line (the subagent's, or the main session's), so when several could be the one on screen, each keeps the prompt up until its own tool runs or its own turn ends -- nothing is guessed; with none, the prompt counts as the main session's. Accepted limitation: a prompt that fires no `PermissionRequest` of its own (e.g. a sandbox network prompt) while exactly one unrelated hint is live is attributed to that hint's owner. Closing it would mean never trusting a single hint, which would stop a subagent's own prompt from clearing on the subagent's own resolution; reviewers disagreed on its severity (one rated it an accepted, non-regressing edge case, another a serious bug), and it is kept deliberately. At most 8 per session; a hint is removed when used, when its caller's tool runs or fails or its request is auto-denied, when its caller's turn ends, on `SessionEnd`, and by the watcher's sweep of anything untouched for 5 minutes (a session that ended without `SessionEnd`). Opaque ids and times only -- never the tool name, its input, or any prompt text |
 | `~/.squid-pet/claude_failed/<session_id>` (content: the error_type category) | direct signal: this session's turn ended on an API error (usage limit, overload, auth, billing, ...) -- shows "concerned". Never contains message text |
 | `~/.squid-pet/claude_session_tty/<session_id>` (content: a `/dev/ttysNNN` string) | lets "take me there" raise the exact terminal/tab a signal came from, rather than guessing by working directory (which cannot tell apart two sessions in the same folder). A terminal device number only -- not the working directory, project name, or any content. Removed on `SessionEnd`, and swept after 2h as crash-safety (like the other flag dirs) so a session that died without firing `SessionEnd` cannot leak a stale entry |
+| `~/.squid-pet/claude_session_surface/<session_id>` (content: `cli`, `local-agent`, `sdk-cli` or `unknown`) | which surface the session runs on -- the terminal CLI, the desktop app's Code tab, or headless `claude -p` -- so "take me there" can raise the desktop app for a desktop session instead of guessing a terminal tab, and `squid why` / `state.json` (`claude_surfaces`) can say where a session is. Removed on `SessionEnd`, refreshed by every later event, and swept after 2h like the other flag dirs |
 | `~/.squid-pet/claude_hook.log` (one line per hook invocation, auto-truncated past 200KB) | lets you verify the hook is actually firing -- `tail -f` it while using Claude Code |
 
-Does NOT read: the `message` field's human-readable text, `transcript_path`,
+Does NOT read: the `message` field's human-readable text,
 `cwd`, `prompt_id`, `last_assistant_message`, or any other field Claude
 Code's hook payload includes beyond the fields above; does not read
-transcript file contents,
-prompt/response text, or tool call arguments/results. Never imports the
+prompt/response text, or tool call arguments/results.
+
+Surface (2026-10-12): to fill `claude_session_surface/` the hook reads at
+most 64 KiB from the end of the session's transcript (and, only if no record
+there carries the field, at most 64 KiB from its start) and takes ONE value
+from it: the top-level `entrypoint` metadata field of the newest record that
+has one. That buffer can contain message text; nothing in it is used,
+retained or logged except that field, and an `entrypoint` key nested inside
+message content or a tool input is ignored. Any value other than `cli`,
+`local-agent` or `sdk-cli` is recorded as `unknown`. Subagent events never
+trigger the read. Never imports the
 `squid_pet` package and has
 zero dependencies beyond the Python stdlib, so a bug in squid-pet proper
 can't affect it (or vice versa) -- it's wired up and torn down entirely
@@ -284,7 +295,8 @@ per scan to stay cheap.
 Squid writes ONLY to `~/.squid-pet/`:
 
 * `state.json` — current PetState snapshot (state, message, idle_seconds,
-  timestamps). Overwritten ~1×/second. **Never contains file paths,
+  timestamps, and `claude_surfaces`: each recorded Claude Code session id with
+  its surface name). Overwritten ~1×/second. **Never contains file paths,
   commit hashes, or process arguments.**
 * `settings.json` — your own preferences (stroll_mode, triggers.*).
 * `logs/squid.log` — startup + lifecycle log.
@@ -297,7 +309,12 @@ directory or the read-only directories listed above per-detector.
 
 ## What's sent over the network
 
-**Nothing.** Squid has zero network code. She does not phone home.
+**Nothing.** Squid has zero network code.
+
+Claude Code sessions that run in the cloud (Claude Code on the web) or inside
+the desktop app's VM sandbox leave nothing on this Mac, so Squid cannot see
+them -- they are out of scope. Squid makes no network calls to observe them,
+and never will: she watches only what Claude Code writes locally. She does not phone home.
 She does not check for updates. She does not load images from URLs.
 The window/wanderer load static SVGs bundled inside the package.
 

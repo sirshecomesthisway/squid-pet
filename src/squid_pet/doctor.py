@@ -423,6 +423,124 @@ def check_startup_log_complete(log_path: Path = STDOUT_LOG,
     )
 
 # ----------------------------------------------------------------------
+# Claude Code surfaces (informational -- never a check, never an exit code)
+# ----------------------------------------------------------------------
+# 2026-10-12: Claude Code reaches this machine on several surfaces. The
+# terminal CLI and the desktop app's Code tab are both watched (the desktop app
+# spawns its OWN bundled copy of the CLI, which fires the same hooks); the
+# desktop VM sandbox and cloud sessions leave nothing local to watch. The
+# bundled copy updates on the app's schedule, not the terminal CLI's, so the
+# two can run far-apart versions -- report both and warn on a wide skew.
+CLAUDE_DESKTOP_BUNDLE_ID = "com.anthropic.claudefordesktop"
+CLAUDE_DESKTOP_APP_PATHS = (
+    Path("/Applications/Claude.app"),
+    Path.home() / "Applications" / "Claude.app",
+)
+CLAUDE_DESKTOP_BUNDLED_CLI_ROOT = (
+    Path.home() / "Library" / "Application Support" / "Claude" / "claude-code")
+# Warn when major.minor differ, or the patch numbers are at least this far
+# apart. Claude Code ships patch releases often; a gap this wide means hook
+# payloads and transcript fields may differ between the two surfaces.
+CLI_VERSION_SKEW_WARN_PATCHES = 50
+
+
+@dataclass
+class SurfaceReport:
+    desktop_app_version: Optional[str]
+    desktop_cli_version: Optional[str]
+    terminal_cli_version: Optional[str]
+    warnings: list
+
+    def lines(self) -> list:
+        term = self.terminal_cli_version or "not found on PATH"
+        if self.desktop_app_version is None:
+            desktop = "not installed (normal -- only needed for its Code tab)"
+        else:
+            bundled = self.desktop_cli_version or "not downloaded yet"
+            desktop = (f"{self.desktop_app_version}, bundled Claude Code CLI "
+                       f"{bundled}")
+        out = [f"terminal CLI      {term}",
+               f"desktop app       {desktop}"]
+        out += [f"WARN: {w}" for w in self.warnings]
+        return out
+
+
+def _version_tuple(text: Optional[str]) -> Optional[tuple]:
+    import re
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def _desktop_app_version(app_paths) -> Optional[str]:
+    import plistlib
+    for app in app_paths:
+        try:
+            with open(Path(app) / "Contents" / "Info.plist", "rb") as f:
+                info = plistlib.load(f)
+        except Exception:
+            continue
+        if info.get("CFBundleIdentifier") == CLAUDE_DESKTOP_BUNDLE_ID:
+            version = info.get("CFBundleShortVersionString")
+            return str(version) if version else "unknown version"
+    return None
+
+
+def _desktop_bundled_cli_version(root: Path) -> Optional[str]:
+    """Newest <root>/<x.y.z>/ that actually holds the bundled CLI binary."""
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    best: Optional[tuple] = None
+    for name in names:
+        vt = _version_tuple(name)
+        exe = Path(root) / name / "claude.app" / "Contents" / "MacOS" / "claude"
+        if vt is not None and exe.is_file() and (best is None or vt > best[0]):
+            best = (vt, name)
+    return best[1] if best else None
+
+
+def terminal_claude_version(which=None, run=None) -> Optional[str]:
+    """`claude --version` of the CLI on PATH (one fork -- fine on demand,
+    never on the 1 Hz path). None if absent, failing, or unparseable."""
+    import re
+    import shutil
+    which = which or shutil.which
+    run = run or subprocess.run
+    try:
+        exe = which("claude")
+        if not exe:
+            return None
+        r = run([exe, "--version"], capture_output=True, text=True, timeout=5.0)
+        m = re.search(r"\b(\d+\.\d+\.\d+)\b", r.stdout or "")
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def claude_surface_report(app_paths=None, bundled_cli_root=None,
+                          terminal_version_fn=None) -> SurfaceReport:
+    """Which Claude Code surfaces this machine has, and their CLI versions."""
+    app_version = _desktop_app_version(
+        CLAUDE_DESKTOP_APP_PATHS if app_paths is None else app_paths)
+    cli_version = None
+    if app_version is not None:
+        cli_version = _desktop_bundled_cli_version(
+            CLAUDE_DESKTOP_BUNDLED_CLI_ROOT if bundled_cli_root is None
+            else bundled_cli_root)
+    term_version = (terminal_version_fn or terminal_claude_version)()
+    warnings = []
+    d, t = _version_tuple(cli_version), _version_tuple(term_version)
+    if d is not None and t is not None and (
+            d[:2] != t[:2] or abs(d[2] - t[2]) >= CLI_VERSION_SKEW_WARN_PATCHES):
+        warnings.append(
+            f"the desktop app's bundled Claude Code CLI ({cli_version}) and the "
+            f"terminal CLI ({term_version}) are far apart -- hook payloads and "
+            "transcript fields can differ between the two surfaces")
+    return SurfaceReport(app_version, cli_version, term_version, warnings)
+
+
+# ----------------------------------------------------------------------
 # Orchestrator
 # ----------------------------------------------------------------------
 CHECK_ORDER = (
@@ -439,13 +557,26 @@ def run_all_checks() -> list[CheckResult]:
     return [fn() for _name, fn in CHECK_ORDER]
 
 
+def _safe_surface_report() -> Optional[SurfaceReport]:
+    """The surface report must never break doctor."""
+    try:
+        return claude_surface_report()
+    except Exception:
+        return None
+
+
 def run_doctor(json_output: bool = False) -> int:
-    """Run all 6 checks. Print results. Return exit code (0 = healthy)."""
+    """Run all 6 checks. Print results. Return exit code (0 = healthy).
+
+    The Claude Code surface report is informational: printed after the
+    checks, never counted, never part of the exit code."""
     results = run_all_checks()
+    surfaces = _safe_surface_report()
     if json_output:
         payload = {
             "healthy": all(r.passed for r in results),
             "checks": [asdict(r) for r in results],
+            "claude_surfaces": asdict(surfaces) if surfaces else None,
         }
         print(json.dumps(payload, indent=2))
     else:
@@ -456,6 +587,11 @@ def run_doctor(json_output: bool = False) -> int:
         print("-" * 70)
         passed = sum(1 for r in results if r.passed)
         print(f"{passed}/{len(results)} checks passed")
+        if surfaces is not None:
+            print()
+            print("Claude Code surfaces (info only -- never fails doctor):")
+            for line in surfaces.lines():
+                print(f"  {line}")
     # Exit code: 0 if all pass, otherwise the 1-based index of first failure.
     for i, r in enumerate(results, start=1):
         if not r.passed:

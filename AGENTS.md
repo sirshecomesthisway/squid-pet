@@ -67,10 +67,28 @@ and use temp dirs.
   log database (read-only, metadata only); if that format is unknown, the
   wave falls back to clearing at command completion. The hook also clears
   stale approvals when a new turn starts.
+- **Four Claude Code surfaces.** The hook records each session's surface in
+  `~/.squid-pet/claude_session_surface/<session_id>` from the transcript's
+  top-level `entrypoint`; `state.json` (`claude_surfaces`) and `squid why`
+  show it, and `squid doctor` reports the CLI version on each.
+  - Terminal CLI (`entrypoint: "cli"`): fully watched; take-me-there raises
+    the exact tab via the session's tty.
+  - Desktop app Code tab (`"local-agent"`): the app runs its own bundled CLI
+    (`~/Library/Application Support/Claude/claude-code/<ver>/`) with
+    `CLAUDE_CONFIG_DIR` stripped, so it uses the real `~/.claude`, fires
+    these hooks and writes a normal transcript — detection works as for the
+    CLI. It has no tty: take-me-there activates the app
+    (`com.anthropic.claudefordesktop`) and cannot pick a Code tab. Its
+    bundled CLI lags the terminal CLI by many versions.
+  - Desktop VM sandbox (`claude-code-vm`) and cloud / Code on the web:
+    nothing local to see; out of scope, and squid makes no network calls.
+  - `claude -p` writes `"sdk-cli"`. It and any unknown value take the
+    terminal path.
 - **Privacy.** Detectors read metadata only (mtimes, process names, CPU,
-  transcript record `type` / `stop_reason` / content-block `type`; GitDetector
-  also a ref name and sha, in memory only) — no message text or file contents,
-  no network. See `docs/PRIVACY.md`.
+  transcript record `type` / `stop_reason` / content-block `type`, and the
+  hook reads the top-level `entrypoint`; GitDetector also a ref name and sha,
+  in memory only) — no message text or file contents, no network. See
+  `docs/PRIVACY.md`.
 
 ## Task-complete marker
 
