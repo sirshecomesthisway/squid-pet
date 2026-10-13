@@ -56,7 +56,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -157,6 +157,12 @@ class PetState:
     # as the bubble.
     state_reason: str = ""
     focus_target: dict | None = None  # provenance of this snapshot, never a guessed workspace
+    # 2026-10-12: session_id -> the surface that Claude Code session runs on
+    # ("cli", "local-agent" = desktop app Code tab, "sdk-cli" = `claude -p`,
+    # or "unknown"), from the hook-written claude_session_surface/ dir. Lets
+    # state.json and `squid why` say WHERE a session is, and focus.py raise the
+    # desktop app for a desktop session. Diagnostic for the frontend (unread).
+    claude_surfaces: dict[str, str] = field(default_factory=dict)
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -510,7 +516,10 @@ def _terminal_app_bundle_for_proc(proc: "psutil.Process | None") -> str | None:
             except Exception:
                 exe = None
             bid = _bundle_id_from_exe_path(exe)
-            if bid:
+            # 2026-10-12: the desktop app's Code tab runs its own bundled CLI,
+            # itself packaged as a claude.app. That is the claude process, not
+            # a window host -- keep walking to the desktop app that spawned it.
+            if bid and bid != CLAUDE_DESKTOP_CLI_BUNDLE_ID:
                 return bid
             cur = cur.parent()
             depth += 1
@@ -1333,6 +1342,109 @@ def claude_session_recorded_tty(session_id: str) -> str | None:
         return None
 
 
+# 2026-10-12: which SURFACE each Claude Code session runs on, written by
+# scripts/claude_pet_hook.py (_record_session_surface) from the top-level
+# `entrypoint` metadata field of the session's own transcript. One small file
+# per session holding the surface string; removed on SessionEnd, touched by
+# every later event, and swept after the same 2h crash-safety window as the
+# sibling flag dirs so a session that died without SessionEnd cannot leak one.
+CLAUDE_SESSION_SURFACE_DIR = os.path.join(
+    os.path.expanduser("~"), ".squid-pet", "claude_session_surface"
+)
+CLAUDE_SESSION_SURFACE_STALE_SEC = 7200.0  # 2h -- crashed-session disk cleanup only
+CLAUDE_SURFACE_CLI = "cli"
+CLAUDE_SURFACE_DESKTOP = "local-agent"  # the desktop app's Code tab
+CLAUDE_SURFACE_SDK = "sdk-cli"          # headless `claude -p`
+CLAUDE_SURFACE_UNKNOWN = "unknown"
+_CLAUDE_KNOWN_SURFACES = frozenset({
+    CLAUDE_SURFACE_CLI, CLAUDE_SURFACE_DESKTOP, CLAUDE_SURFACE_SDK,
+    CLAUDE_SURFACE_UNKNOWN,
+})
+# The Claude desktop app, and the CLI it bundles and spawns for its Code tab
+# (~/Library/Application Support/Claude/claude-code/<ver>/claude.app). The
+# bundled CLI's own .app is never a window host -- see
+# _terminal_app_bundle_for_proc.
+CLAUDE_DESKTOP_BUNDLE_ID = "com.anthropic.claudefordesktop"
+CLAUDE_DESKTOP_CLI_BUNDLE_ID = "com.anthropic.claude-code"
+# session_id -> (mtime_ns, surface): a file is re-read only when its mtime
+# moves, so the 1 Hz tick costs one listdir + one stat per live session.
+_CLAUDE_SURFACE_CACHE: dict[str, tuple[int, str]] = {}
+
+
+def _normalize_surface(raw: str) -> str:
+    """The hook writes only known values, but the file is outside our control:
+    anything else reads as unknown (which every consumer treats as the CLI)."""
+    value = raw.strip()
+    return value if value in _CLAUDE_KNOWN_SURFACES else CLAUDE_SURFACE_UNKNOWN
+
+
+def _read_surface_file(path: str) -> str | None:
+    try:
+        with open(path, errors="replace") as f:
+            return _normalize_surface(f.read(64))
+    except OSError:
+        return None
+
+
+def claude_session_surfaces(now: float | None = None, *,
+                            sweep: bool = True) -> dict[str, str]:
+    """{session_id: surface} for every session the hook has recorded.
+
+    Per tick: one listdir of a small dir plus one stat per entry -- the same
+    cost shape as _scan_session_flag_dir -- and a file read only when an
+    entry's mtime changed (cached). Entries older than
+    CLAUDE_SESSION_SURFACE_STALE_SEC are deleted when `sweep` (re-stat first,
+    as sweep_stale_session_ttys does, so a just-touched entry survives);
+    sweep=False is the read-only form for diagnostics. Dotfiles (the hook's
+    atomic-write tmps) are never sessions. Any OS error -> best-effort {}."""
+    if now is None:
+        now = time.time()
+    try:
+        names = os.listdir(CLAUDE_SESSION_SURFACE_DIR)
+    except OSError:
+        _CLAUDE_SURFACE_CACHE.clear()
+        return {}
+    out: dict[str, str] = {}
+    for name in names:
+        if name.startswith("."):
+            continue
+        path = os.path.join(CLAUDE_SESSION_SURFACE_DIR, name)
+        try:
+            meta = os.stat(path)
+            if not stat_module.S_ISREG(meta.st_mode):
+                continue
+            if now - meta.st_mtime > CLAUDE_SESSION_SURFACE_STALE_SEC:
+                if not sweep:
+                    continue
+                meta = os.stat(path)
+                if now - meta.st_mtime > CLAUDE_SESSION_SURFACE_STALE_SEC:
+                    os.unlink(path)
+                    continue
+        except OSError:
+            continue
+        cached = _CLAUDE_SURFACE_CACHE.get(name)
+        if cached is not None and cached[0] == meta.st_mtime_ns:
+            out[name] = cached[1]
+            continue
+        surface = _read_surface_file(path)
+        if surface is None:
+            continue
+        _CLAUDE_SURFACE_CACHE[name] = (meta.st_mtime_ns, surface)
+        out[name] = surface
+    for gone in set(_CLAUDE_SURFACE_CACHE) - set(out):
+        del _CLAUDE_SURFACE_CACHE[gone]
+    return out
+
+
+def claude_session_surface(session_id: str) -> str | None:
+    """The recorded surface of ONE session (exact key, one small read), or
+    None when nothing is recorded. Read-only -- used by focus.py on a click."""
+    if (not session_id or session_id.startswith(".")
+            or os.sep in session_id or session_id in (".", "..")):
+        return None
+    return _read_surface_file(os.path.join(CLAUDE_SESSION_SURFACE_DIR, session_id))
+
+
 def claude_session_proc(session_id: str) -> "psutil.Process | None":
     """The live claude process running this session.
 
@@ -2044,7 +2156,8 @@ class StateMachine:
         """
         self.awake_hold_until = max(self.awake_hold_until, timestamp)
 
-    def compute(self, *, notify: bool = True) -> PetState:
+    def compute(self, *, notify: bool = True,
+                sweep_surfaces: bool = True) -> PetState:
         """Run the cascade, then layer in agent_idle_seconds tracking.
 
         Hot-reloads detectors from settings.json if the file changed
@@ -2054,6 +2167,11 @@ class StateMachine:
         notify=False skips firing the real OS approval notification --
         for read-only diagnostic callers (squid why) that need to call
         compute() to prime detector caches without causing side effects.
+
+        sweep_surfaces=False is the same structural opt-out for the
+        claude_session_surface/ stale sweep: the snapshot still reports only
+        live entries, but nothing is unlinked. The daemon's own tick keeps the
+        default and does the sweeping.
         """
         self._maybe_reload_settings()
         st = self._compute_inner()
@@ -2062,6 +2180,10 @@ class StateMachine:
         # Prune tty entries crashed sessions leaked -- this dir is read only by
         # exact key, never listed, so it has no read-time prune of its own.
         sweep_stale_session_ttys(now)
+        # Which surface each Claude session is on (one listdir; reads only on
+        # change), for state.json and `squid why`. Sweeps its own stale entries
+        # unless a read-only caller opted out.
+        st.claude_surfaces = claude_session_surfaces(now, sweep=sweep_surfaces)
 
         # Approval-needed is layered on AFTER the cascade, from Claude Code's
         # and Codex's own hook-written flag files. It OVERRIDES whatever the

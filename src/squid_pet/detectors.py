@@ -228,8 +228,14 @@ class ClaudeCodeDetector:
         recent_file_ages_fn: Callable | None = None,
         active_sessions_fn: Callable | None = None,
         finished_mtime_fn: Callable[[str], float | None] | None = None,
+        surfaces_fn: Callable[[], dict] | None = None,
     ) -> None:
         self.enabled = enabled
+        # session id -> surface ("cli" / "local-agent" / "sdk-cli" / "unknown"),
+        # default: the hook-written claude_session_surface/ dir, read-only.
+        # Consulted by diagnostic() only (`squid why`), never on the tick path.
+        # Injectable so tests stay hermetic.
+        self._surfaces_fn = surfaces_fn
         self._find_processes = find_processes_fn
         self._aggregate_cpu = aggregate_cpu_fn
         self._has_active_shell_children = has_active_shell_children_fn
@@ -664,6 +670,7 @@ class ClaudeCodeDetector:
         return False  # no reliable signal yet -- documented non-goal
 
     def diagnostic(self) -> dict:
+        surfaces = self._surfaces()
         return {
             "name": self.name,
             "enabled": self.enabled,
@@ -675,7 +682,23 @@ class ClaudeCodeDetector:
             "transcript_age": self.transcript_age,
             "streaming": self.streaming,
             "subagent_open": self.subagent_open,
+            # Which surface the newest-transcript session is on (None when
+            # nothing is recorded for it), and every recorded session's.
+            "surface": surfaces.get(
+                claude_session_id_from_transcript(self.transcript_path) or ""),
+            "surfaces": surfaces,
         }
+
+    def _surfaces(self) -> dict:
+        """Recorded surfaces, best-effort ({} on any failure). Read-only: the
+        default never stale-sweeps from a diagnostic call."""
+        try:
+            if self._surfaces_fn is not None:
+                return dict(self._surfaces_fn())
+            from . import watcher as _w
+            return _w.claude_session_surfaces(sweep=False)
+        except Exception:
+            return {}
 
 
 # ----------------------------------------------------------------------

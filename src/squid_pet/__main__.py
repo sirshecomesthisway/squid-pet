@@ -151,10 +151,12 @@ def _run_why(json_output: bool = False) -> None:
     # afterward, untouched, outside this block.
     import contextlib
     import io
+    # sweep_surfaces=False: the same read-only rule for disk -- `squid why`
+    # must not unlink the claude_session_surface/ entries it is reporting on.
     with contextlib.redirect_stdout(io.StringIO()):
-        sm.compute(notify=False)        # prime CPU sampling
+        sm.compute(notify=False, sweep_surfaces=False)  # prime CPU sampling
         _t.sleep(0.3)
-        st = sm.compute(notify=False)
+        st = sm.compute(notify=False, sweep_surfaces=False)
 
     per_detector = []
     now = _t.time()

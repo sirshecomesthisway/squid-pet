@@ -16,7 +16,18 @@ import json
 import os
 import time
 
+import pytest
+
 from squid_pet import doctor
+
+
+@pytest.fixture(autouse=True)
+def _no_real_surface_probe(monkeypatch):
+    """run_doctor() also prints the Claude Code surface report, which reads
+    /Applications and runs `claude --version`. Keep these tests hermetic; the
+    report itself is covered by tests/test_doctor_surfaces.py."""
+    monkeypatch.setattr(doctor, "claude_surface_report",
+                        lambda: doctor.SurfaceReport(None, None, None, []))
 
 
 # ----------------------------------------------------------------------

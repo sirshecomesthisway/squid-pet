@@ -90,10 +90,16 @@ Protocol:
     UserPromptSubmit (retry) or SessionEnd.
   - PreCompact -> write <recap_dir>/<session_id>  (compaction starting)
   - PostCompact -> remove <recap_dir>/<session_id>  (compaction done)
+  - Every main-thread event except SessionEnd -> <surface_dir>/<session_id>
+    = the session's surface ("cli", "local-agent", "sdk-cli" or "unknown"),
+    from the top-level `entrypoint` field of the transcript named by
+    transcript_path (bounded read; see _record_session_surface). SessionEnd
+    removes it.
 
 No message/transcript content is ever read or written for any of these
-signals -- session_id and mtime only, matching this project's stated
-privacy stance (see ClaudeCodeDetector's docstring on why transcript
+signals -- session_id and mtime only, plus the transcript records' top-level
+`entrypoint` metadata field for the surface entry, matching this project's
+stated privacy stance (see ClaudeCodeDetector's docstring on why transcript
 content is never read). Stop's payload includes a last_assistant_message
 field; PreCompact's includes custom_instructions; both are deliberately
 ignored. PreCompact's trigger field ("manual" vs "auto") is also
@@ -185,6 +191,12 @@ FAILED_DIR = os.path.join(_SQUID_PET_HOME, "claude_failed")
 # key, not a guess. A tty is a device number, not user content -- consistent
 # with this script's content-blindness (see docs/PRIVACY.md).
 TTY_DIR = os.path.join(_SQUID_PET_HOME, "claude_session_tty")
+# 2026-10-12: session_id -> which SURFACE the session runs on, so "take me
+# there" can raise the Claude desktop app for a desktop Code-tab session
+# instead of guessing a terminal tab (see _record_session_surface). Content:
+# one of _KNOWN_SURFACES or "unknown" -- the transcript's top-level
+# `entrypoint` metadata field, never message text.
+SURFACE_DIR = os.path.join(_SQUID_PET_HOME, "claude_session_surface")
 # Pink-2026-09-01: "a turn is in flight". UserPromptSubmit opens it, Stop
 # closes it. Exists because ClaudeCodeDetector infers thinking from
 # transcript mtime, and Claude Code only writes a transcript entry when a
@@ -540,6 +552,148 @@ def _record_session_tty(session_id: str, event: str) -> None:
         _atomic_write(path, tty)
     except Exception as e:
         _log(f"TTY {session_id} WRITE_FAILED {e!r}")
+
+
+# 2026-10-12: Claude Code reaches this machine on several SURFACES, and every
+# transcript record Claude Code writes for a conversation carries a top-level
+# `entrypoint` naming the one it came from (verified live):
+#   "cli"          the terminal CLI (`claude`)
+#   "local-agent"  the desktop app's Code tab. The app runs its OWN bundled CLI
+#                  with CLAUDE_CONFIG_DIR stripped, so it fires these same hooks
+#                  and writes a normal ~/.claude transcript -- but the process
+#                  has no terminal, so a tty-based "take me there" can only
+#                  guess (and raised an unrelated Terminal tab).
+#   "sdk-cli"      headless `claude -p`
+# Anything else (a missing, non-string or newer value) is recorded as
+# "unknown", which every reader treats exactly like the terminal CLI.
+_KNOWN_SURFACES = frozenset({"cli", "local-agent", "sdk-cli"})
+_SURFACE_UNKNOWN = "unknown"
+# Bound on each transcript read. The newest records live in the tail, so one
+# window normally decides; the head is read only as a fallback (see
+# _transcript_surface). Hooks block the turn: never slurp a transcript.
+_SURFACE_READ_BYTES = 65536
+_ENTRYPOINT_KEY = b'"entrypoint"'
+
+
+def _surface_of_record(line: bytes) -> str | None:
+    """The surface one transcript line names, or None if it names none.
+
+    Metadata only: the line is decoded, but nothing is read from it except the
+    record's TOP-LEVEL `entrypoint` -- never `message`, content blocks, tool
+    inputs or text (an `entrypoint` key nested inside any of those is ignored,
+    as is the literal string inside message text). Malformed or partial lines
+    name nothing."""
+    if _ENTRYPOINT_KEY not in line:
+        return None  # cheap pre-filter: most bookkeeping records carry none
+    try:
+        record = json.loads(line)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    if not isinstance(record, dict) or "entrypoint" not in record:
+        return None
+    value = record["entrypoint"]
+    return value if isinstance(value, str) and value in _KNOWN_SURFACES \
+        else _SURFACE_UNKNOWN
+
+
+def _transcript_surface(path: object, *, use_head: bool) -> str | None:
+    """Surface of the session whose transcript is at `path`, or None when it
+    cannot be determined (no usable path, not a regular file, unreadable, or no
+    record in the bounded windows carries an entrypoint).
+
+    The NEWEST record carrying an entrypoint wins (tail window, read
+    backwards), so a session resumed on another surface reports the surface it
+    is on now. A single record larger than the window can hide every
+    entrypoint from the tail; with `use_head` the first window of the file
+    (the session's opening records) is the fallback. At most two bounded
+    reads, via pread on one descriptor.
+
+    Opened O_NONBLOCK and checked S_ISREG before reading, so a FIFO or device
+    at that path can never block the hook (and with it the user's turn)."""
+    if not isinstance(path, str) or not path.endswith(".jsonl") \
+            or not os.path.isabs(path):
+        return None
+    import stat as _stat
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except (OSError, ValueError):
+        return None
+    try:
+        info = os.fstat(fd)
+        if not _stat.S_ISREG(info.st_mode):
+            return None
+        size = info.st_size
+        offset = max(0, size - _SURFACE_READ_BYTES)
+        lines = os.pread(fd, _SURFACE_READ_BYTES, offset).split(b"\n")
+        if offset:
+            lines = lines[1:]  # the window may start mid-record
+        for line in reversed(lines):
+            surface = _surface_of_record(line)
+            if surface is not None:
+                return surface
+        if not use_head or not offset:
+            return None  # no head fallback asked for, or the tail WAS the file
+        # Only reached when the file is larger than one window, so the head
+        # window may end mid-record: drop its last piece.
+        lines = os.pread(fd, _SURFACE_READ_BYTES, 0).split(b"\n")[:-1]
+        for line in lines:
+            surface = _surface_of_record(line)
+            if surface is not None:
+                return surface
+        return None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _record_session_surface(session_id: str, event: str,
+                            transcript_path: object, *, is_helper: bool) -> None:
+    """Best-effort: record which surface this session runs on in
+    SURFACE_DIR/<session_id>. Never raises -- hooks must never break a session.
+
+      - SessionEnd: nothing here; the SessionEnd cleanup removes the entry.
+      - A helper (agent_id) event: never resolves (its transcript_path may be
+        its own, and it shares the parent's session id), only bumps an
+        existing entry's mtime, like _touch_session_tty.
+      - Otherwise: resolve from the transcript the payload names -- a bounded
+        read with no subprocess, cheap enough for every event (unlike the tty
+        lookup's `ps` fork, which is why that one is turn-open only). Every
+        event re-resolves, so a cross-surface resume corrects itself on the
+        next event. A changed value is published atomically; an unchanged one
+        is only touched (keeping it clear of the watcher's 2h stale sweep);
+        an undeterminable one leaves any existing entry alone."""
+    try:
+        if event == "SessionEnd":
+            return
+        path = os.path.join(SURFACE_DIR, session_id)
+        if is_helper:
+            _touch(path)
+            return
+        try:
+            with open(path, errors="replace") as f:
+                current: str | None = f.read(64).strip()
+        except OSError:
+            current = None
+        surface = _transcript_surface(transcript_path, use_head=current is None)
+        if surface is None or surface == current:
+            if current is not None:
+                _touch(path)
+            return
+        if not _ensure_dir(SURFACE_DIR, "surface"):
+            return
+        _atomic_write(path, surface)
+        _log(f"SURFACE {session_id} {surface}")
+    except Exception as e:
+        _log(f"SURFACE {session_id} FAILED {e!r}")
+
+
+def _touch(path: str) -> None:
+    """Bump an EXISTING entry's mtime; creates nothing, never raises."""
+    try:
+        os.utime(path)
+    except OSError:
+        pass
 
 
 def _ensure_dir(path: str, event: str) -> bool:
@@ -1150,6 +1304,11 @@ def main() -> int:
     # event (helpers don't fire turn-open), only bumps an existing one's mtime
     # so the parent session doesn't age out of the tty registry mid-helper-run.
     _record_session_tty(session_id, event)
+    # Which surface (terminal CLI / desktop Code tab / headless) the session is
+    # on, so "take me there" can raise the right app. Same placement and the
+    # same helper rule as the tty registry; see _record_session_surface.
+    _record_session_surface(session_id, event, payload.get("transcript_path"),
+                            is_helper=is_helper)
 
     if event == "PermissionRequest":
         # Round 4: ATTRIBUTION ONLY -- never a wave. PermissionRequest also
@@ -1352,6 +1511,11 @@ def main() -> int:
             try:
                 os.unlink(os.path.join(TTY_DIR, session_id))
                 _log(f"{event} {session_id} TTY_REMOVED")
+            except (FileNotFoundError, OSError):
+                pass
+            try:
+                os.unlink(os.path.join(SURFACE_DIR, session_id))
+                _log(f"{event} {session_id} SURFACE_REMOVED")
             except (FileNotFoundError, OSError):
                 pass
     if event == "Stop":
