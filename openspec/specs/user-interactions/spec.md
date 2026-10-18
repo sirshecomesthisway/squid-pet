@@ -44,16 +44,31 @@ The poke SHALL NOT show a "boop!" hint pill.
 A double-click on Squid SHALL be treated as a LIKE gesture distinct from a
 single-click poke. The dblclick handler SHALL, in order:
 - Cancel any pending single-click poke timer.
-- Invoke `api.poke()` (which sets the 60 s wake override).
+- Spawn a single blinking heart above Squid's sprite (see `pet-reactions`),
+  before any RPC.
+- Invoke and await `api.poke()` (which sets the 60 s wake override).
 - If the current state is `approval_needed`, invoke
-  `api.acknowledge_approval()` and display the bubble returned on that RPC
+  `api.acknowledge_approval()`; if it is `concerned`, invoke
+  `api.acknowledge_concern()`. Display the bubble returned on that RPC
   response directly, rather than waiting for the next poll to pick it up.
-- Invoke `api.take_me_there()` unconditionally; the backend decides whether
-  there is anywhere to go.
-- Spawn a single blinking heart above Squid's sprite (see `pet-reactions`).
+- Invoke `api.take_me_there()` unconditionally and without awaiting it; the
+  backend decides whether there is anywhere to go.
 
-Any failure in the acknowledge or take-me-there steps SHALL be swallowed so
-the poke and heart still happen.
+Each RPC step (poke, each acknowledge, take-me-there) SHALL be isolated: its
+failure SHALL be swallowed so the remaining steps still run, and SHALL be
+logged -- naming the call -- to the console and to `squid.log` via
+`api.debug_log()`. Logging a failure SHALL itself never throw.
+- **Why**: Pink-2026-10-14. The heart is a local animation and must never
+  wait on an RPC: at the end of the handler it waited on a take-me-there
+  osascript stuck on its 5 s timeout, landed ~5 s late, and was reported as
+  "no heart". In one shared try, a failed poke or acknowledge skipped
+  take-me-there -- "it didn't take me there". Failures are logged rather
+  than discarded because this bug was diagnosed from `squid.log`.
+- **Why poke is awaited**: poke and the acknowledges both publish an
+  observer bubble at the same priority, and an equal priority overwrites.
+  Awaiting poke makes its bubble land first, so the acknowledge's like-line
+  is the one the next poll sees. A poke that never settles therefore holds
+  back the rest of the gesture; the heart is already shown by then.
 
 The previous foundational behavior of dblclick (cycling forced state through
 the sprite states for debug) is REMOVED. State cycling lives in the
@@ -177,6 +192,106 @@ When the session's flag has aged out of its freshness window but the sprite
 still shows the state, the resolver SHALL fall back to any live Claude Code
 process's tty rather than giving up.
 
+At most one raise SHALL run at a time per destination. A destination is the
+RESOLVED window -- exactly what the resolver reads to pick it, compared by
+value: for a Claude `focus_target`, the signal directory its state resolves
+to (`focus.STATE_SIGNAL_DIRS`, the resolver's own mapping) together with the
+target; for a Codex `focus_target`, the target alone, since the resolver
+never reads the state for it. A target naming any other agent SHALL also be
+keyed on the target alone. A `take_me_there()` call arriving while a raise
+for the SAME destination is still in flight SHALL be dropped -- not queued,
+not debounced -- returning status `busy`, and SHALL show a hint saying a
+raise is already running, without promising arrival. A call for a DIFFERENT
+destination SHALL NOT be dropped: it raises its own window even while
+another raise is in flight. A call with nothing to open SHALL bypass this
+guard entirely and SHALL never report `busy` or show a `busy` hint, even
+while a raise is in flight: a resting state (`focus.RESTING_STATES`: `idle`,
+`drowsy`, `sleeping`, `stretch`) returns `resting`; an active state with no
+`focus_target` returns the resolver's silent `none`; a no-window Codex
+target returns `no-window` with its own "no window to open" hint; and a
+Claude target in a state with no signal directory returns `resting`.
+- **Why**: Pink-2026-10-12/10-14. The cost is the AppleEvent, not the
+  gesture: each raise is a fresh osascript, AppleEvents to one app
+  serialize, and a burst of double-clicks queued raises until they hit the
+  5 s timeout. The hint exists because a silent drop looked like "did
+  nothing" and invited another double-click; it does not promise arrival
+  because a hung osascript ends in status `none`, which stays silent.
+- **Why per destination**: Pink-2026-10-17. The drop used to cover any
+  call while any raise ran, on the premise that the running raise was
+  taking you there -- true only for the same window. A raise can hold for
+  0.6-5 s while the state recomputes every second: working on project A
+  could still be raising when she flipped to `approval_needed` for project
+  B, and the double-click on the wave calmed it, then dropped B's raise --
+  no navigation, and no wave left to prompt a retry. A different
+  destination is worth its AppleEvent, and that overlap is rare. A call with
+  nothing to open spawns no osascript, so a busy hint there would describe
+  a window it was never going to open.
+- **Why the resolved destination, not the state**: Pink-2026-10-17. A
+  Claude `focus_target` is often just the agent name and the resolver picks
+  the session by the state's signal directory, so `approval_needed` and
+  `celebrating` with equal targets are two windows. But an earlier revision
+  keyed on the state itself, and `working` and `thinking` share one
+  directory and are given the same target by the watcher: a routine
+  working-to-thinking tick then let a second osascript queue behind the
+  first at the same tab -- the 5 s timeout pile-up this guard exists to
+  stop. Every Codex state change did the same. Over-splitting is what
+  re-breaks the guard, so a target the resolver does not recognise errs
+  towards fewer keys. A no-window Codex target used to take the guard too,
+  so a microsecond overlap could replace its true "no window to open" hint
+  with a busy one.
+
+#### Scenario: Double-click while a raise is in flight
+- **WHEN** a `take_me_there()` raise is still running for an active state
+- **AND** the user double-clicks again with the same state and
+  `focus_target`
+- **THEN** the second call returns `busy` and spawns no osascript
+- **AND** a hint says a raise is already running
+
+#### Scenario: Working turns to thinking while a raise is in flight
+- **WHEN** a `take_me_there()` raise for `working` is still running
+- **AND** the state becomes `thinking` with the same `focus_target` and the
+  user double-clicks
+- **THEN** the second call returns `busy` and spawns no osascript, because
+  both states resolve through the same signal directory to the same tab
+
+#### Scenario: A Codex target across a state change while a raise is in flight
+- **WHEN** a `take_me_there()` raise for a Codex `focus_target` is still
+  running
+- **AND** the state changes but the Codex `focus_target` does not, and the
+  user double-clicks
+- **THEN** the second call returns `busy` and spawns no osascript
+
+#### Scenario: Same Claude target, different signal directory
+- **WHEN** a `take_me_there()` raise for `celebrating` with `focus_target`
+  `{"agent": "claude"}` is still running
+- **AND** the state becomes `approval_needed` with an equal target and the
+  user double-clicks
+- **THEN** the `approval_needed` window is raised, with no `busy` status
+
+#### Scenario: Double-click a new destination while a raise is in flight
+- **WHEN** a `take_me_there()` raise for `working` on project A is still
+  running
+- **AND** the state becomes `approval_needed` for project B and the user
+  double-clicks
+- **THEN** project B's window is raised
+- **AND** no `busy` status and no hint
+
+#### Scenario: Double-click with nothing to open while a raise is in flight
+- **WHEN** a `take_me_there()` raise is still running
+- **AND** the state is active but has no `focus_target` (e.g. `grooving`
+  with no Claude source)
+- **AND** the user double-clicks
+- **THEN** `take_me_there()` returns `none`, spawns no osascript, and shows
+  no hint
+
+#### Scenario: Double-click a headless Codex failure while a raise is in flight
+- **WHEN** a `take_me_there()` raise is still running
+- **AND** the state is `concerned` with `focus_target`
+  `{"agent": "codex", "no_window": true}` and the user double-clicks
+- **THEN** `take_me_there()` returns `no-window` and spawns no osascript
+- **AND** the hint says there is no window to open, never that a raise is
+  already running
+
 #### Scenario: Double-click a waving Squid
 - **WHEN** state is `approval_needed` and a session flag names session `S`
 - **THEN** the terminal tab running `S` is raised to the front
@@ -185,6 +300,8 @@ process's tty rather than giving up.
 - **WHEN** state is `sleeping`
 - **THEN** `take_me_there()` returns `resting`
 - **AND** the gesture is just a poke and a heart
+- **AND** this holds even while an earlier raise is still in flight: no
+  `busy`, no hint
 
 ### Requirement: Swing-to-wake gesture during drag
 

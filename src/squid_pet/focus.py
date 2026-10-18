@@ -336,9 +336,16 @@ def _focus_codex_approval(requests: list[str], run=None) -> str:
         return "none"
 
 
+# Pink-2026-10-14: the states with nowhere to go -- focus_for_snapshot
+# answers "resting" for them without spawning anything. Shared so
+# PetApi.take_me_there's in-flight guard skips exactly these states and the
+# two lists can never drift apart.
+RESTING_STATES = frozenset({'idle', 'sleeping', 'drowsy', 'stretch'})
+
+
 def focus_for_snapshot(snapshot, run=None) -> str:
     """Navigate using the source that won this state, never a new global guess."""
-    if snapshot.state in {'idle', 'sleeping', 'drowsy', 'stretch'}:
+    if snapshot.state in RESTING_STATES:
         return "resting"
     target = snapshot.focus_target
     if not target:

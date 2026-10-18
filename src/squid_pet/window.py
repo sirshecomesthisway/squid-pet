@@ -20,7 +20,8 @@ from typing import Any
 
 import webview
 
-from . import config, observer, watcher
+from . import config, focus, observer, watcher
+from .focus import RESTING_STATES
 from .passthrough import PassthroughController
 
 log = logging.getLogger(__name__)
@@ -594,6 +595,56 @@ def _waiting_label(state_reason: str) -> str | None:
         return None
 
 
+def _focus_destination_key(state: str, target: Any) -> str | None:
+    """A stable key for the window take_me_there would raise, or None.
+
+    Pink-2026-10-17: the key is the RESOLVED destination -- exactly what
+    focus.focus_for_snapshot reads to pick a window, and nothing more:
+      * Codex target: the target alone. The resolver raises the request's or
+        owner's window straight from it and never reads the state, so one
+        Codex target is one window whatever she is showing.
+      * Claude target: (signal directory, target). The resolver picks the
+        directory by state through focus.STATE_SIGNAL_DIRS, read here
+        directly (not copied) so the two can never drift. working and
+        thinking share claude_turn_active/, and the watcher builds both their
+        targets from the same streaming_target(), so a working -> thinking
+        tick is the same tab and must drop. approval_needed and celebrating
+        use different directories, so an equal {"agent": "claude"} there is
+        two windows and must not.
+      * Any other agent (the watcher builds none today): the target alone.
+        Over-splitting is what re-opens the osascript pile-up, so a resolver
+        branch that does not exist yet errs towards fewer keys -- and stays
+        guarded if it ever learns to spawn.
+    An earlier revision keyed on (state, target), claiming equal targets in
+    two states are two windows. That is false for working/thinking and for
+    every Codex state change: each let a second osascript at the same tab
+    queue behind the first AppleEvent, the 5s timeout pile-up again.
+
+    None means "no guard". Either there is nothing to open -- a no-window
+    Codex run, or a Claude state with no signal directory, both of which
+    focus answers at once without spawning -- or the target cannot be JSON
+    encoded: an exception here would escape before take_me_there's try, the
+    frontend's .catch would swallow it, and the raise would never happen.
+    JSON with sorted keys, so equal targets built separately or in another
+    key order collide and nothing relies on the dict being hashable.
+    """
+    agent = target.get("agent") if isinstance(target, dict) else None
+    signal_dir = None
+    if agent == "claude":
+        signal_dir = focus.STATE_SIGNAL_DIRS.get(state)
+        if signal_dir is None:
+            return None
+    elif (agent == "codex" and target.get("no_window")
+          and not target.get("request") and not target.get("owner")):
+        # The same precedence focus_for_snapshot uses: request, then owner,
+        # and only then no_window.
+        return None
+    try:
+        return json.dumps([signal_dir, target], sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return None
+
+
 def is_drag_active() -> bool:
     """True iff a Python drag thread is currently running."""
     return _drag_thread is not None and _drag_thread.is_alive()
@@ -662,6 +713,11 @@ class PetApi:
         # PetApi via __new__ simply never have it.
         from .focus import focus_for_snapshot as _focus
         self._focus_fn = _focus
+        # Pink-2026-10-17: the destinations whose take_me_there raise is still
+        # running, keyed per destination so a different one is never dropped;
+        # the small lock guards only the set. See take_me_there.
+        self._focus_inflight_lock = threading.Lock()
+        self._focus_inflight_targets: set[str] = set()
         self._sprint_fast_transition: bool = False  # frontend uses 0.2s CSS transition when True
         # Stroll mode: "edges" (hug border) or "anywhere" (free roam).
         # Removed by unify-idle-rhythm 2026-06-13 (regression), restored
@@ -1436,6 +1492,37 @@ class PetApi:
 
         The callable is read off self so tests building PetApi via __new__
         never raise a real window.
+
+        Pink-2026-10-12: a call arriving while a raise for the same
+        destination is in flight returns "busy" without touching osascript.
+        Each raise is a fresh osascript (~0.6-0.8s of spawn + AppleEvent
+        overhead, capped at 5s by focus._run_osascript), pywebview runs every
+        JS call on its own thread, and AppleEvents to one app serialize -- so
+        a burst of gestures used to queue raises until they hit the timeout.
+        Dropping (not queueing, not debouncing on a timer) is right because
+        the cost is the AppleEvent, not the gesture.
+
+        Pink-2026-10-17: the drop is per destination, and only for a call
+        that would really spawn osascript. It used to be "any raise running",
+        on the premise that the running raise was taking you there -- true
+        only for the same window. A raise holds for 0.6-5s while the watcher
+        ticks at 1 Hz, so working-on-A could still be raising when she
+        flipped to approval_needed-for-B; the frontend's ack calmed B's wave,
+        then B's raise was dropped: no navigation, no wave left to prompt a
+        retry. A different destination now raises (it is worth the
+        AppleEvent, and rare); "destination" is what focus resolves -- see
+        _focus_destination_key. A call with nothing to open -- a resting
+        state, no focus_target, a no-window Codex run, or a Claude state with
+        no signal directory, where focus answers at once without spawning --
+        never touches the guard, so it never reports busy.
+
+        Pink-2026-10-12: a drop is not silent -- it emits a hint. Silent,
+        "dropped as busy" looked exactly like "did nothing", and the natural
+        reaction to that is to double-click again: the very gesture that gets
+        dropped. The guard is read off self like the callable, and a PetApi
+        without it (built via __new__) just raises unguarded; an
+        AttributeError here would escape before the try below and be
+        swallowed by the frontend's .catch, so the raise would never happen.
         """
         with self._lock:
             snapshot = self._latest
@@ -1443,6 +1530,36 @@ class PetApi:
         focus_fn = getattr(self, "_focus_fn", None)
         if focus_fn is None:
             return {"status": "skipped", "state": state}
+        guard_lock = getattr(self, "_focus_inflight_lock", None)
+        inflight = getattr(self, "_focus_inflight_targets", None)
+        # Pink-2026-10-14: resting states never spawn osascript (focus answers
+        # "resting" for them straight away), so they bypass the guard: a
+        # dblclick on a drowsy Squid while a raise runs stays a plain poke and
+        # heart, with no "busy" and no hint about navigation she won't do.
+        # Pink-2026-10-17: the same holds for a falsy focus_target -- focus
+        # answers a silent "none" without spawning anything, so a busy hint
+        # there spoke about a window this call was never going to open. The
+        # other two instant answers (no-window Codex, a Claude state with no
+        # signal dir) come back from _focus_destination_key as None.
+        key = None
+        if (guard_lock is not None and inflight is not None
+                and state not in RESTING_STATES and snapshot.focus_target):
+            key = _focus_destination_key(state, snapshot.focus_target)
+        if key is not None:
+            with guard_lock:
+                busy = key in inflight
+                if not busy:
+                    inflight.add(key)
+            if busy:
+                log.info(f"take_me_there({state}) -> busy "
+                         "(a raise for this window is already running)")
+                # Pink-2026-10-14: says only what is true -- a raise is
+                # running. It must not promise arrival: a hung osascript times
+                # out to "none", which is deliberately silent, so a promise
+                # would then quietly fail. Emitted outside guard_lock:
+                # _emit_hint takes self._lock.
+                self._emit_hint("still trying to open that window…")
+                return {"status": "busy", "state": state}
         try:
             status = focus_fn(snapshot)
         except Exception as e:
@@ -1450,6 +1567,10 @@ class PetApi:
             # poke and heart already happened.
             log.warning(f"take_me_there failed: {e}")
             status = "error"
+        finally:
+            if key is not None:
+                with guard_lock:
+                    inflight.discard(key)
         if status == "no-window":
             self._emit_hint(
                 "no window to open — that Codex run was headless or has exited")
