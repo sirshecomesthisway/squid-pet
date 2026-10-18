@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import time
 from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
@@ -231,10 +232,28 @@ def _is_desktop_cli_proc(proc) -> bool:
 
 def _raise_desktop_app(run: Optional[Callable[[str], Optional[str]]] = None) -> str:
     """Bring the Claude desktop app forward -- and stop. Which Code tab inside
-    it holds the session is not exposed, so the honest answer is "app-only"."""
+    it holds the session is not exposed, so the honest answer is "app-only".
+
+    Pink-2026-10-18: one script and nothing after it, so a timeout (both
+    attempts) is "timeout" and a raise that did not run is "error" -- it
+    used to claim "app-only" whatever the runner said."""
     runner = run if run is not None else _run_osascript
-    runner(build_app_activate_script(CLAUDE_DESKTOP_BUNDLE_ID))
-    return "app-only"
+    return _activate(runner, CLAUDE_DESKTOP_BUNDLE_ID)
+
+
+def _activate(runner: Callable[[str], Optional[str]], bundle: str) -> str:
+    """Run the app-activate script for `bundle` and report what happened.
+
+    Pink-2026-10-18: the activate's result used to be thrown away and
+    "app-only" claimed regardless. None means the script did not run (the
+    real runner returns None only on a non-timeout failure), so "error";
+    every attempt timing out is "timeout". The exit status is NOT checked: an
+    AppleScript error in a script that ran still reads as "app-only"."""
+    try:
+        out = runner(build_app_activate_script(bundle))
+    except FocusTimeout:
+        return "timeout"
+    return "app-only" if out is not None else "error"
 
 
 def freshest_waiting_session() -> Optional[str]:
@@ -360,7 +379,12 @@ def _focus_process_owner(owner: dict, run=None, still_current=None,
             return "none"
         script = build_terminal_focus_script(tty, require_match=True)
         runner = run if run is not None else _run_osascript
-        result = runner(script)
+        try:
+            result = runner(script)
+        except FocusTimeout:
+            # Pink-2026-10-18: caught here, before the OSError handler below
+            # could ever see it (FocusTimeout is deliberately not one).
+            return "timeout"
         return "matched" if result and result.strip() == "matched" else "none"
     except (OSError, ValueError, TypeError, KeyError, psutil.Error):
         return "none"
@@ -387,9 +411,14 @@ def _focus_codex_approval(requests: list[str], run=None) -> str:
         return "none"
 
 
+# Pink-2026-10-14: the states with nowhere to go -- focus_for_snapshot
+# answers "resting" for them without spawning anything.
+RESTING_STATES = frozenset({'idle', 'sleeping', 'drowsy', 'stretch'})
+
+
 def focus_for_snapshot(snapshot, run=None) -> str:
     """Navigate using the source that won this state, never a new global guess."""
-    if snapshot.state in {'idle', 'sleeping', 'drowsy', 'stretch'}:
+    if snapshot.state in RESTING_STATES:
         return "resting"
     target = snapshot.focus_target
     if not target:
@@ -593,6 +622,8 @@ def focus_for_state(state: str,
     Returns "matched" (that tab is now front), "app-only" (right app,
     unknown tab), "none" (no terminal identified) or "resting" (nothing to
     open -- idle, drowsy, sleeping, or any state we have no signal for).
+    Pink-2026-10-18: also "timeout" (every osascript attempt timed out, see
+    _run_osascript) and "error" (the app-activate script did not run).
     """
     if state == "approval_needed":
         from . import watcher
@@ -637,13 +668,31 @@ def _raise(tty: Optional[str],
             bundle = find_terminal_app_bundle_for_claude_code()
         except Exception:
             bundle = None
+    return _tab_then_app(runner, tty, bundle)
+
+
+def _tab_then_app(runner: Callable[[str], Optional[str]],
+                  tty: Optional[str], bundle: Optional[str]) -> str:
+    """Terminal.app with a tty: the exact-tab script. Otherwise, or when that
+    script did not run (None), the app-activate fallback.
+
+    Pink-2026-10-18: a TIMED-OUT tab script stops here with "timeout" and
+    runs nothing else. Falling through to the activate script was a second
+    full-timeout osascript after the first had already failed -- ~10s of
+    waiting in the 2026-10-12 incident, to land in the wrong tab. A tab
+    script that ran but matched no tab never needed the fallback: it
+    activates Terminal itself and answers "app-only". The fallback stays for
+    None, which an injected runner may return and the real one returns for a
+    non-timeout failure."""
     if bundle == TERMINAL_APP_BUNDLE_ID and tty:
-        out = runner(build_terminal_focus_script(tty))
+        try:
+            out = runner(build_terminal_focus_script(tty))
+        except FocusTimeout:
+            return "timeout"
         if out is not None:
             return out.strip() or "app-only"
     if bundle:
-        runner(build_app_activate_script(bundle))
-        return "app-only"
+        return _activate(runner, bundle)
     return "none"
 
 
@@ -651,7 +700,8 @@ def focus_waiting_session(run: Optional[Callable[[str], Optional[str]]] = None) 
     """Bring the waiting session to the front.
 
     Returns what it achieved: "matched" (that tab is now front), "app-only"
-    (right app, unknown tab), or "none". `run` is injectable so tests never
+    (right app, unknown tab), or "none" -- or, Pink-2026-10-18, "timeout" /
+    "error" as focus_for_state documents. `run` is injectable so tests never
     raise a real window.
     """
     from . import watcher
@@ -668,21 +718,98 @@ def focus_waiting_session(run: Optional[Callable[[str], Optional[str]]] = None) 
         bundle = None
 
     tty = waiting_session_tty()
-    if bundle == TERMINAL_APP_BUNDLE_ID and tty:
-        out = runner(build_terminal_focus_script(tty))
-        if out is not None:
-            return out.strip() or "app-only"
-    if bundle:
-        runner(build_app_activate_script(bundle))
-        return "app-only"
-    return "none"
+    return _tab_then_app(runner, tty, bundle)
+
+
+class FocusTimeout(Exception):
+    """Every attempt of one osascript call timed out (see _run_osascript).
+
+    Raised only by the real runner, never by an injected `run=`, so the
+    runner contract -- a str, or None for "it did not run" -- is unchanged
+    for every existing caller and test. Deliberately NOT a TimeoutError:
+    that is an OSError, which _focus_process_owner and _focus_codex_approval
+    catch and turn into a silent "none".
+    """
+
+
+# Pink-2026-10-18: was timeout=5 (2026-09-01, never explained). Live-daemon
+# logs: 116 raises, 113 healthy at 0.6-0.8s, 3 timed out (~2.6%) -- each the
+# FIRST call, with nothing else in flight, so it was not a pile-up. 2s is
+# ~2.5x a healthy call; 5s only made the user wait longer for a result that
+# had already gone wrong. Why the 3 stalled is unknown (the macOS log for
+# those times has rotated away), and "first use after a long idle" is ruled
+# out: 43 of the 113 successes followed gaps over an hour too.
+_OSASCRIPT_TIMEOUT_SEC = 2
+# One retry, on a timeout only. Not expected to rescue most stalls: after
+# one incident no second attempt was made for 2.6 hours, and in the other
+# two the attempt that worked came only after the full 5s had passed, so a
+# retry 2s in may well land in the same slow spell. What it
+# buys is a bounded (~4s), honest answer. Note also that killing osascript
+# does not recall an AppleEvent the app already received, so the window may
+# still come forward late -- unverified either way.
+_OSASCRIPT_ATTEMPTS = 2
+
+
+def _script_kind(script: str) -> str:
+    """Which of our scripts this is, for the log line -- never the body,
+    which carries a tty."""
+    if "tty of tb" in script:
+        return "tab-match"
+    if script == build_app_activate_script(CLAUDE_DESKTOP_BUNDLE_ID):
+        return "desktop-raise"
+    if script.rstrip().endswith("to activate"):
+        return "app-activate"
+    return "other"
 
 
 def _run_osascript(script: str) -> Optional[str]:
-    try:
-        r = subprocess.run(["osascript", "-e", script],
-                           capture_output=True, text=True, timeout=5)
+    """Run one AppleScript; return its stdout, or None if it did not run.
+
+    Pink-2026-10-18: each attempt is capped at _OSASCRIPT_TIMEOUT_SEC and
+    retried once, ONLY on subprocess.TimeoutExpired -- a missing binary or a
+    malformed call will not fix itself, so it returns None at once, as it
+    always did. When every attempt times out this raises FocusTimeout and
+    the caller reports "timeout" WITHOUT chaining another script: the old
+    fall-through to the app-activate fallback was a second 5s call, and in
+    the 2026-10-12 incident it turned one 5s wait into ~10s that ended in
+    the right app but the wrong tab.
+
+    Logs one line per attempt (script kind, attempt, elapsed ms, outcome):
+    INFO when it ran, WARNING otherwise. Never the script body or an
+    exception's message -- TimeoutExpired's embeds the whole command, tty
+    included. One call per double-click, so this is outside the 1 Hz budget.
+    """
+    kind = _script_kind(script)
+    for attempt in range(1, _OSASCRIPT_ATTEMPTS + 1):
+        t0 = time.monotonic()
+        try:
+            r = subprocess.run(["osascript", "-e", script], capture_output=True,
+                               text=True, timeout=_OSASCRIPT_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            log.warning("focus osascript kind=%s attempt=%d/%d elapsed_ms=%d "
+                        "outcome=timeout", kind, attempt, _OSASCRIPT_ATTEMPTS,
+                        _elapsed_ms(t0))
+            continue
+        except Exception as e:
+            log.warning("focus osascript kind=%s attempt=%d/%d elapsed_ms=%d "
+                        "outcome=failed (%s)", kind, attempt, _OSASCRIPT_ATTEMPTS,
+                        _elapsed_ms(t0), type(e).__name__)
+            return None
+        log.info("focus osascript kind=%s attempt=%d/%d elapsed_ms=%d "
+                 "outcome=ok rc=%s result=%s", kind, attempt, _OSASCRIPT_ATTEMPTS,
+                 _elapsed_ms(t0), r.returncode, _result_token(r.stdout))
         return r.stdout
-    except Exception as e:
-        log.warning("focus (osascript) failed: %s", e)
-        return None
+    raise FocusTimeout(kind)
+
+
+def _elapsed_ms(t0: float) -> int:
+    return int((time.monotonic() - t0) * 1000)
+
+
+def _result_token(stdout: Optional[str]) -> str:
+    """Our scripts answer with one of a few fixed words; anything else is
+    not echoed into the log."""
+    out = (stdout or "").strip()
+    if not out:
+        return "-"
+    return out if out in ("matched", "app-only", "none") else "other"

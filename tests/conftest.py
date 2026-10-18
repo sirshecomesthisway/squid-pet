@@ -30,6 +30,14 @@ def isolate_codex_wait_markers(tmp_path, monkeypatch):
     # PermissionRequest attribution hints -- never let it reach the real dir.
     monkeypatch.setattr(watcher, 'CLAUDE_PERMISSION_PENDING_DIR',
                         str(tmp_path / 'claude_permission_pending'))
+    # Pink-2026-10-17: compute()'s branch 3b reads claude_recapping/ and
+    # returns "thinking" before branch 4, so a live compaction in the
+    # developer's own session flipped any bare-compute() test with an enabled
+    # Claude detector. Nothing holds this path by identity (no state maps to
+    # it in focus.STATE_SIGNAL_DIRS -- recapping reports as "thinking", which
+    # resolves through claude_turn_active/), so a plain re-point is enough.
+    monkeypatch.setattr(watcher, 'CLAUDE_RECAPPING_DIR',
+                        str(tmp_path / 'claude_recapping'))
     # focus.STATE_SIGNAL_DIRS snapshots the watcher dir constants at import,
     # so keep its concerned entry pointing at the SAME (now isolated) object,
     # preserving the production invariant that take-me-there reads the same

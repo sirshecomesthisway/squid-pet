@@ -29,10 +29,28 @@ def install_world(monkeypatch, idle=0.0):
     the suite the moment the turn-in-flight signal went live: a real flag
     from the developer's own in-flight turn made
     test_codex_only_stale_transcript_no_shell_falls_to_idle report
-    thinking. Every new session-flag dir has to be added here."""
+    thinking. Every new session-flag dir has to be added here.
+
+    Pink-2026-10-12: a fourth time, via CLAUDE_RECAPPING_DIR -- isolated by
+    test_watcher_claude_code_cascade.py and seven other files, never here. A
+    real recap flag from the developer's own live session (it bit when a
+    conversation was compacted mid-test-run) turned
+    test_claude_and_codex_both_running_shell_evidence_merges and
+    test_shared_project_write_does_not_credit_claude into "thinking".
+    Reproduced by planting a claude_recapping/ flag under a fake HOME.
+    Pink-2026-10-17: the real isolation for CLAUDE_RECAPPING_DIR now lives
+    in conftest.py's autouse fixture (every test, not just this file); the
+    re-point below is kept only as belt-and-braces and is redundant.
+    The other dirs compute() reads -- CLAUDE_FAILED_DIR,
+    CLAUDE_PERMISSION_PENDING_DIR, CODEX_AWAITING_INPUT_DIR,
+    CLAUDE_SESSION_TTY_DIR -- are already pointed at tmp dirs for every test
+    by conftest.py's autouse fixture, so they are deliberately NOT re-pointed
+    here (that would also break the focus.STATE_SIGNAL_DIRS identity the
+    fixture preserves for claude_failed/)."""
     monkeypatch.setattr(watcher, "macos_idle_seconds", lambda: idle)
     monkeypatch.setattr(watcher, "CLAUDE_AWAITING_INPUT_DIR", "/nonexistent")
     monkeypatch.setattr(watcher, "CLAUDE_FINISHED_DIR", "/nonexistent")
+    monkeypatch.setattr(watcher, "CLAUDE_RECAPPING_DIR", "/nonexistent")
     monkeypatch.setattr(watcher, "CLAUDE_TASK_COMPLETE_DIR", "/nonexistent")
     monkeypatch.setattr(watcher, "CLAUDE_TURN_ACTIVE_DIR", "/nonexistent")
 
@@ -176,3 +194,18 @@ def test_shared_project_write_does_not_credit_claude(monkeypatch):
     line = Observer(get_muted=lambda: False).on_state_change(
         'idle', st.state, state_reason=st.state_reason)
     assert line == 'project files changed'
+
+
+def test_conftest_isolates_the_recapping_dir_for_every_test(tmp_path):
+    """Pink-2026-10-17: the recapping isolation now lives in conftest.py's
+    autouse fixture, not only in install_world -- eleven other files call
+    compute() with no recap patch, and a live compaction writing
+    ~/.squid-pet/claude_recapping/<sid> mid-run sends any of them with an
+    enabled Claude detector to branch 3b, "thinking". This test never calls
+    install_world, so it sees exactly what every other test sees. Comparing
+    path strings only: nothing here reads or writes the real ~/.squid-pet/."""
+    import os
+    real = os.path.join(os.path.expanduser("~"), ".squid-pet", "claude_recapping")
+    assert watcher.CLAUDE_RECAPPING_DIR != real
+    assert Path(watcher.CLAUDE_RECAPPING_DIR).parent == tmp_path
+    assert watcher.claude_sessions_recapping() == []
