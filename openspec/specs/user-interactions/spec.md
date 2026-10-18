@@ -44,16 +44,31 @@ The poke SHALL NOT show a "boop!" hint pill.
 A double-click on Squid SHALL be treated as a LIKE gesture distinct from a
 single-click poke. The dblclick handler SHALL, in order:
 - Cancel any pending single-click poke timer.
-- Invoke `api.poke()` (which sets the 60 s wake override).
+- Spawn a single blinking heart above Squid's sprite (see `pet-reactions`),
+  before any RPC.
+- Invoke and await `api.poke()` (which sets the 60 s wake override).
 - If the current state is `approval_needed`, invoke
-  `api.acknowledge_approval()` and display the bubble returned on that RPC
+  `api.acknowledge_approval()`; if it is `concerned`, invoke
+  `api.acknowledge_concern()`. Display the bubble returned on that RPC
   response directly, rather than waiting for the next poll to pick it up.
-- Invoke `api.take_me_there()` unconditionally; the backend decides whether
-  there is anywhere to go.
-- Spawn a single blinking heart above Squid's sprite (see `pet-reactions`).
+- Invoke `api.take_me_there()` unconditionally and without awaiting it; the
+  backend decides whether there is anywhere to go.
 
-Any failure in the acknowledge or take-me-there steps SHALL be swallowed so
-the poke and heart still happen.
+Each RPC step (poke, each acknowledge, take-me-there) SHALL be isolated: its
+failure SHALL be swallowed so the remaining steps still run, and SHALL be
+logged -- naming the call -- to the console and to `squid.log` via
+`api.debug_log()`. Logging a failure SHALL itself never throw.
+- **Why**: Pink-2026-10-14. The heart is a local animation and must never
+  wait on an RPC: at the end of the handler it waited on a take-me-there
+  osascript stuck on its 5 s timeout, landed ~5 s late, and was reported as
+  "no heart". In one shared try, a failed poke or acknowledge skipped
+  take-me-there -- "it didn't take me there". Failures are logged rather
+  than discarded because this bug was diagnosed from `squid.log`.
+- **Why poke is awaited**: poke and the acknowledges both publish an
+  observer bubble at the same priority, and an equal priority overwrites.
+  Awaiting poke makes its bubble land first, so the acknowledge's like-line
+  is the one the next poll sees. A poke that never settles therefore holds
+  back the rest of the gesture; the heart is already shown by then.
 
 The previous foundational behavior of dblclick (cycling forced state through
 the sprite states for debug) is REMOVED. State cycling lives in the
@@ -176,6 +191,68 @@ by design and SHALL return status `resting`.
 When the session's flag has aged out of its freshness window but the sprite
 still shows the state, the resolver SHALL fall back to any live Claude Code
 process's tty rather than giving up.
+
+Each window-raise script (an `osascript` call) SHALL be capped at 2 s per
+attempt. An attempt that times out SHALL be retried exactly once; any other
+failure (for example a missing `osascript` binary) SHALL NOT be retried. When
+both attempts time out, `take_me_there()` SHALL return status `timeout` and
+SHALL show a hint saying the window could not be reached in time -- naming
+no cause and not promising arrival -- and SHALL NOT run any further script:
+in particular, a timed-out exact-tab script SHALL NOT fall through to the
+app-activate fallback. That fallback SHALL remain only for a tab script that
+did not run at all, and SHALL report what it achieved: `app-only` only when
+the activate script ran, `timeout` when it timed out, `error` when it did not
+run. ("Ran" means the `osascript` process ran; its exit status is not
+checked, so an AppleScript error inside a script that ran still reports
+`app-only`.) The same holds on every raise path: Terminal exact-tab, app-activate,
+the Codex exact-tab raise, and the desktop-app raise. Each attempt SHALL be
+logged on one line -- script kind (`tab-match`, `app-activate`,
+`desktop-raise`), attempt number, elapsed milliseconds and outcome -- at
+INFO, or WARNING for a timeout or failure, never including the script body.
+- **Why**: Pink-2026-10-18. Live-daemon logs showed a healthy raise takes
+  0.6-0.8 s; of 116 raises, 3 timed out (~2.6%), each the FIRST call with
+  nothing else in flight, so overlapping raises caused none of them. The
+  old 5 s cap was arbitrary, and after a timeout the code chained a second
+  script, also capped at 5 s (the app-activate fallback): in the 2026-10-12
+  incident it ran for ~5 s more, so one 5 s wait became ~10 s, ending in the
+  right app but the wrong tab. 2 s is ~2.5x a healthy call, and with one
+  retry a raise gives an answer within ~4 s. The retry is not expected to
+  rescue most stalls: after one incident no second attempt was made for
+  2.6 hours, and in the other two the next attempt that worked was made only
+  after the full 5 s had passed, so a retry 2 s in may land in the same slow
+  spell. The usual result of a stall is expected to be a fast, honest
+  `timeout`. Killing a timed-out `osascript`
+  does not recall an AppleEvent the app already received, so the window
+  may still come forward late; that is unverified. The cause of the stalls
+  is unknown: overlapping raises and "first use after a long idle" are
+  ruled out (43 of the 113 successes also followed gaps over an hour), and
+  the macOS system log for those times has rotated away.
+
+#### Scenario: Both raise attempts time out
+- **WHEN** the user double-clicks a waving Squid whose session runs in a
+  Terminal tab
+- **AND** the exact-tab script times out at 2 s, and its one retry times out
+  too
+- **THEN** `take_me_there()` returns `timeout` within ~4 s
+- **AND** no app-activate script, or any other script, is run after it
+- **AND** a hint says the window could not be reached in time
+
+#### Scenario: One timeout, then the retry succeeds
+- **WHEN** the exact-tab script times out once and its retry answers
+  `matched`
+- **THEN** `take_me_there()` returns `matched`, after exactly two attempts
+
+#### Scenario: A failure that is not a timeout
+- **WHEN** the exact-tab script fails for a reason other than a timeout
+- **THEN** it is not retried, and the app-activate fallback runs
+- **AND** `take_me_there()` returns `app-only` only if that activate script
+  ran
+
+#### Scenario: A desktop-app session times out
+- **WHEN** the user double-clicks a session recorded as the desktop surface
+- **AND** both attempts of the desktop-app raise time out
+- **THEN** `take_me_there()` returns `timeout`, the hint is shown, and no
+  Terminal script is run
 
 #### Scenario: Double-click a waving Squid
 - **WHEN** state is `approval_needed` and a session flag names session `S`

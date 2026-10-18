@@ -83,3 +83,27 @@ def test_silent_none_status_emits_no_hint():
     api = _api("concerned", focus_fn=lambda s: "none")
     api.take_me_there()
     assert api._hint_seq == 0
+
+
+def test_a_bare_new_built_api_never_raises_attribute_error():
+    """PetApi built via __new__ (skipping __init__) carries only what _api
+    sets. take_me_there must answer with a status, never an AttributeError --
+    one would escape the JS-exposed method and the frontend's .catch would
+    swallow it silently."""
+    def _boom(_state):
+        raise RuntimeError("osascript exploded")
+    assert _api("working").take_me_there() == {"status": "skipped", "state": "working"}
+    assert _api("working", focus_fn=_boom).take_me_there() == {
+        "status": "error", "state": "working"}
+
+
+def test_timeout_status_emits_a_hint():
+    """Pink-2026-10-18: focus answers "timeout" when every osascript attempt
+    timed out. Unlike the silent "none", the user hears about it -- without a
+    cause (unknown) or a promise of arrival."""
+    api = _api("approval_needed", focus_fn=lambda s: "timeout")
+    result = api.take_me_there()
+    assert result == {"status": "timeout", "state": "approval_needed"}
+    assert api._hint_seq == 1
+    assert "in time" in api._hint_text
+    assert "on my way" not in api._hint_text

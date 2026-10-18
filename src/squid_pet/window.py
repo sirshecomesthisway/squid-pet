@@ -1436,6 +1436,11 @@ class PetApi:
 
         The callable is read off self so tests building PetApi via __new__
         never raise a real window.
+
+        Pink-2026-10-18: "timeout" (focus._run_osascript gave up after its
+        retry) shows a hint. It names no cause -- the cause of those stalls is
+        unknown -- and promises nothing: the window may still come forward
+        late, or not at all.
         """
         with self._lock:
             snapshot = self._latest
@@ -1453,6 +1458,8 @@ class PetApi:
         if status == "no-window":
             self._emit_hint(
                 "no window to open — that Codex run was headless or has exited")
+        elif status == "timeout":
+            self._emit_hint("couldn't reach that window in time — try again")
         if status != "resting":
             log.info(f"take_me_there({state}) -> {status}")
         return {"status": status, "state": state}

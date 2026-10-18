@@ -1558,6 +1558,20 @@ window._pokePending = setTimeout(() => {
     });
 
     /* ─────── Double-click: LIKE (heart + wake) + ack wave + take me there ─────── */
+    // Pink-2026-10-14: each RPC in the dblclick gesture swallows its own
+    // failure so it can't take the rest of the gesture down -- but logs it
+    // first, to the console AND squid.log. The dblclick bug was diagnosed from
+    // squid.log; a silent swallow would leave a recurrence no trace. Logging
+    // is guarded too (debug_log is itself an RPC): it must never throw or
+    // leave an unhandled rejection in the gesture it is reporting on.
+    function _dblclickRpcFailed(call, err) {
+      const emsg = `[squid] dblclick ${call} failed: ${err?.message ?? err}`;
+      try { console.warn(emsg, err); } catch (_) {}
+      try {
+        Promise.resolve(window.pywebview?.api?.debug_log?.(emsg))
+          .catch(() => {});
+      } catch (_) {}
+    }
 document.addEventListener("dblclick", async (e) => {
       e.preventDefault();
 
@@ -1572,24 +1586,50 @@ document.addEventListener("dblclick", async (e) => {
       // Note: poke() ALSO sets 60s wake override, so a dblclick on drowsy
       // Squid wakes her AND shows a heart -- one gesture, both effects.
       try {
-        if (window.pywebview?.api?.poke) {
-          await window.pywebview.api.poke();
+        // Pink-2026-10-12: the heart comes FIRST, before any RPC. It is a
+        // purely local animation; when it sat at the end of this handler it
+        // waited on every await above it, and a take_me_there osascript
+        // stuck on its 5s timeout made the heart land ~5s late -- reported
+        // as "no heart" (tests/test_dblclick_gesture.py).
+        const sprite = document.getElementById('pet');
+        if (sprite) {
+          const r = sprite.getBoundingClientRect();
+          spawnHearts(r.left + r.width / 2,
+                    _currentEdge === "top" ? r.bottom : r.top);
         }
+        // Pink-2026-10-14: awaited, in its OWN try. Awaited because poke and
+        // the acks below both write pending_bubble at the same priority and
+        // an equal priority overwrites: poke's write must land first so the
+        // ack's like-line is what the next poll sees (and dedupes). Fired
+        // detached, poke could land last and that poll would replace the ack
+        // bubble just shown. Its own try so a failed poke is logged and the
+        // acks and take_me_there still run.
+        try {
+          if (window.pywebview?.api?.poke) {
+            await window.pywebview.api.poke();
+          }
+        } catch (err) { _dblclickRpcFailed("poke", err); }
         // Pink-2026-08-31: dblclick while she's waving the approval_needed
         // flag is an unambiguous "I saw you" -- calm the wave instead of
         // leaving it nagging. No-ops (backend checks state) at any other
-        // time, so this doesn't change the plain poke+heart case below.
+        // time, so this doesn't change the plain poke+heart case.
         // Bubble text comes back directly on the RPC response and is shown
         // right here, rather than left for the next ~800ms poll to pick up
         // from pending_bubble -- the watcher thread ticks independently
         // every ~1s and her natural next state (often "working") can
         // overwrite pending_bubble with its own bubble first, silently
         // swallowing this one.
+        // Pink-2026-10-14: each ack in its own try. In the one outer try, an
+        // ack that rejected (any Python exception crosses the bridge as a
+        // rejection) jumped to the outer catch and take_me_there was never
+        // called -- "it didn't take me there" on the busiest paths.
         if (currentState === "approval_needed"
             && window.pywebview?.api?.acknowledge_approval) {
-          const ack = await window.pywebview.api.acknowledge_approval();
-          if (ack?.bubble) maybeShowBubble(ack.bubble);
-          console.log("[squid] dblclick ACK (calmed approval wave)");
+          try {
+            const ack = await window.pywebview.api.acknowledge_approval();
+            if (ack?.bubble) maybeShowBubble(ack.bubble);
+            console.log("[squid] dblclick ACK (calmed approval wave)");
+          } catch (err) { _dblclickRpcFailed("acknowledge_approval", err); }
         }
         // Pink-2026-09-16: dblclick while she's showing the concerned/warning
         // face is "I saw the error" -- calm the worried face. Same shape as
@@ -1597,30 +1637,30 @@ document.addEventListener("dblclick", async (e) => {
         // session's terminal in this same gesture. No-ops at any other state.
         if (currentState === "concerned"
             && window.pywebview?.api?.acknowledge_concern) {
-          const ack = await window.pywebview.api.acknowledge_concern();
-          if (ack?.bubble) maybeShowBubble(ack.bubble);
-          console.log("[squid] dblclick ACK (calmed concern)");
+          try {
+            const ack = await window.pywebview.api.acknowledge_concern();
+            if (ack?.bubble) maybeShowBubble(ack.bubble);
+            console.log("[squid] dblclick ACK (calmed concern)");
+          } catch (err) { _dblclickRpcFailed("acknowledge_concern", err); }
         }
         // Pink-2026-09-01: dblclick also takes you to the window behind
         // whatever she's showing -- working, thinking, waving, celebrating,
         // grooving. The backend answers "resting" for idle/drowsy/sleeping,
         // where there is nothing to open, so this is safe to call always
         // and the gesture stays a plain poke+heart there.
+        // Not awaited (Pink-2026-10-12): the raise is an osascript that can
+        // take seconds, so it finishes in the background and its log line
+        // arrives when it does.
         try {
           if (window.pywebview?.api?.take_me_there) {
-            const t = await window.pywebview.api.take_me_there();
-            if (t?.status && t.status !== "resting") {
-              console.log(`[squid] take_me_there(${t.state}) -> ${t.status}`);
-            }
+            Promise.resolve(window.pywebview.api.take_me_there()).then((t) => {
+              if (t?.status && t.status !== "resting") {
+                console.log(`[squid] take_me_there(${t.state}) -> ${t.status}`);
+              }
+            }).catch((err) => { _dblclickRpcFailed("take_me_there", err); });
           }
-        } catch (_) { /* never let this break the like gesture */ }
+        } catch (err) { _dblclickRpcFailed("take_me_there", err); }
 
-        const sprite = document.getElementById('pet');
-        if (sprite) {
-          const r = sprite.getBoundingClientRect();
-          spawnHearts(r.left + r.width / 2,
-                    _currentEdge === "top" ? r.bottom : r.top);
-        }
         console.log("[squid] dblclick LIKE (heart + wake)");
       } catch (err) {
         const emsg = `[squid] dblclick handler ERROR: ${err.message}`;
