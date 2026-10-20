@@ -197,17 +197,32 @@ def _char_bounds(vx: float, vy: float, vw: float, vh: float) -> tuple[float, flo
     return min_ox, max_ox, min_oy, max_oy
 
 
+def _walkable_frame(screen) -> tuple[float, float, float, float]:
+    """(x, y, w, h) of screen.visibleFrame with its bottom pushed down to the
+    physical screen edge. visibleFrame's bottom sits on top of a visible Dock,
+    which left her feet floating ~74px above the screen bottom; her window
+    level is above the Dock, so she can stand on the true edge. The top
+    (menu bar) and sides keep visibleFrame's values."""
+    vf = screen.visibleFrame()
+    bottom = screen.frame().origin.y
+    height = vf.origin.y + vf.size.height - bottom
+    if height <= 0:
+        # Transient inconsistent geometry (display reconfiguration): stay on
+        # visibleFrame rather than hand the clamp an inverted range.
+        return (vf.origin.x, vf.origin.y, vf.size.width, vf.size.height)
+    return (vf.origin.x, bottom, vf.size.width, height)
+
+
 def clamp_origin_to_screen(ox, oy):
     """Clamp NSWindow cocoa origin so the visible character body stays fully
-    inside NSScreen.visibleFrame. Returns (clamped_ox, clamped_oy)."""
+    inside the walkable frame (visibleFrame down to the screen's bottom edge).
+    Returns (clamped_ox, clamped_oy)."""
     try:
         from AppKit import NSScreen
         main = NSScreen.mainScreen()
         if main is None:
             return ox, oy
-        f = main.visibleFrame()
-        vx, vy = f.origin.x, f.origin.y
-        vw, vh = f.size.width, f.size.height
+        vx, vy, vw, vh = _walkable_frame(main)
         min_ox, max_ox, min_oy, max_oy = _char_bounds(vx, vy, vw, vh)
         return (max(min_ox, min(max_ox, ox)),
                 max(min_oy, min(max_oy, oy)))
@@ -215,8 +230,8 @@ def clamp_origin_to_screen(ox, oy):
         return ox, oy
 
 
-def _visible_frame():
-    """Return NSScreen.mainScreen().visibleFrame as (x, y, w, h) in Cocoa coords."""
+def _main_walkable_frame():
+    """Return NSScreen.mainScreen()'s walkable frame (see _walkable_frame) as (x, y, w, h) in Cocoa coords."""
     from AppKit import NSScreen
     main = NSScreen.mainScreen()
     if main is None:
@@ -224,8 +239,7 @@ def _visible_frame():
         if not screens:
             return (0, 0, 1440, 900)
         main = screens[0]
-    f = main.visibleFrame()
-    return (f.origin.x, f.origin.y, f.size.width, f.size.height)
+    return _walkable_frame(main)
 
 
 def corner_origin(corner: str) -> tuple[float, float]:
@@ -247,7 +261,7 @@ def corner_origin(corner: str) -> tuple[float, float]:
     system is tuned to reach, so a corner-snap lands at the IDENTICAL
     position wandering there would.
     """
-    vx, vy, vw, vh = _visible_frame()
+    vx, vy, vw, vh = _main_walkable_frame()
     min_ox, max_ox, min_oy, max_oy = _char_bounds(vx, vy, vw, vh)
     if corner == "top-right":
         return (max_ox, max_oy)
@@ -489,7 +503,7 @@ def _native_drag_loop(start_cursor, start_origin, passthrough, on_end, on_swing=
                 new_y = oy0 + dy
 
                 # Restrict drag: clamp window origin so visible character bbox
-                # stays inside visibleFrame. (Pink 2026-06-11: she dragged Squid
+                # stays inside the walkable frame. (Pink 2026-06-11: she dragged Squid
                 # off-screen accidentally; clamp + snap-back is the fix.)
                 new_x, new_y = clamp_origin_to_screen(new_x, new_y)
 
@@ -514,7 +528,7 @@ def _native_drag_loop(start_cursor, start_origin, passthrough, on_end, on_swing=
                 break
 
     # Post-drag snap-back guard (in case cursor raced off-screen
-    # between drag ticks or visibleFrame changed mid-drag).
+    # between drag ticks or the walkable frame changed mid-drag).
     try:
         frame = nw.frame()
         ox, oy = frame.origin.x, frame.origin.y
@@ -523,7 +537,7 @@ def _native_drag_loop(start_cursor, start_origin, passthrough, on_end, on_swing=
             from Foundation import NSPoint
             from PyObjCTools import AppHelper
             AppHelper.callAfter(nw.setFrameOrigin_, NSPoint(cx, cy))
-            log.info(f"drag end: snap-back ({ox:.0f},{oy:.0f}) -> ({cx:.0f},{cy:.0f}) (was out of visibleFrame)")
+            log.info(f"drag end: snap-back ({ox:.0f},{oy:.0f}) -> ({cx:.0f},{cy:.0f}) (was out of walkable frame)")
     except Exception as e:
         log.warning(f"drag end snap-back error: {e}")
 
@@ -627,8 +641,8 @@ def set_window_origin(x: float, y: float) -> None:
         log.warning(f"set_window_origin failed: {e}")
 
 
-def get_visible_frame() -> tuple[float, float, float, float] | None:
-    vf = _visible_frame()
+def get_walkable_frame() -> tuple[float, float, float, float] | None:
+    vf = _main_walkable_frame()
     if vf is None:
         return None
     return tuple(vf)
@@ -1765,7 +1779,7 @@ def main() -> None:
             is_drag_active=is_drag_active,
             get_window_origin=get_window_origin,
             set_window_origin=set_window_origin,
-            get_visible_frame=get_visible_frame,
+            get_visible_frame=get_walkable_frame,
             set_sub_state=api.set_wander_sub_state,
             set_edge=api.set_wander_edge,
         )
@@ -1798,8 +1812,8 @@ def main() -> None:
         def _snap_corner():
             try:
                 ok = move_to_corner(corner)
-                vf = _visible_frame()
-                log.info(f"visibleFrame = {vf}")
+                vf = _main_walkable_frame()
+                log.info(f"walkable frame = {vf}")
                 log.info(f"snapped to '{corner}' (ok={ok})")
                 # Sync sprite rotation to the corner we just snapped to.
                 # Without this call at all, _wander_edge stays at its ""
