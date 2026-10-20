@@ -72,7 +72,7 @@ EDGE_MARGIN_PX = -51                   # walk-TARGET selection margin for the LE
                                        # window.CHAR_RIGHT_IN_WIN via _x_bounds() below instead of
                                        # maintaining a second, separately-tuned approximation of it --
                                        # see _x_bounds' docstring.
-BOTTOM_MARGIN_PX = -45                 # feet AT visible-frame bottom (auto-hide Dock). MUST match
+BOTTOM_MARGIN_PX = -45                 # feet AT walkable-frame bottom (physical screen edge). MUST match
                                        # (or exceed) window.CHAR_BOTTOM_IN_WIN, same pairing as
                                        # EDGE_MARGIN_PX/CHAR_LEFT_IN_WIN above -- was -40 against the
                                        # OLD CHAR_BOTTOM_IN_WIN=8, which meant wander's own target

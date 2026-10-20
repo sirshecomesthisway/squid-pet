@@ -150,7 +150,7 @@ def test_x_bounds_matches_windows_hard_clamp_exactly():
 
 def test_corner_origin_matches_char_bounds_exactly(monkeypatch):
     fake_frame = (100.0, 50.0, 1440.0, 875.0)
-    monkeypatch.setattr(window, "_visible_frame", lambda: fake_frame)
+    monkeypatch.setattr(window, "_main_walkable_frame", lambda: fake_frame)
     vx, vy, vw, vh = fake_frame
     min_ox, max_ox, min_oy, max_oy = window._char_bounds(vx, vy, vw, vh)
 
@@ -168,7 +168,7 @@ def test_corner_origin_recognized_by_wanderers_distance_classifier(monkeypatch):
     classification mechanisms now agree, since corner_origin() reaches
     (near enough) the exact same bounds wanderer.py's margins target."""
     fake_frame = (0.0, 0.0, 1440.0, 875.0)
-    monkeypatch.setattr(window, "_visible_frame", lambda: fake_frame)
+    monkeypatch.setattr(window, "_main_walkable_frame", lambda: fake_frame)
 
     origin_box = {}
     wc = wanderer.WanderController(
