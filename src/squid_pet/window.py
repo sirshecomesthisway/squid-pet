@@ -197,17 +197,28 @@ def _char_bounds(vx: float, vy: float, vw: float, vh: float) -> tuple[float, flo
     return min_ox, max_ox, min_oy, max_oy
 
 
+def _walkable_frame(screen) -> tuple[float, float, float, float]:
+    """(x, y, w, h) of screen.visibleFrame with its bottom pushed down to the
+    physical screen edge. visibleFrame's bottom sits on top of a visible Dock,
+    which left her feet floating ~74px above the screen bottom; her window
+    level is above the Dock, so she can stand on the true edge. The top
+    (menu bar) and sides keep visibleFrame's values."""
+    vf = screen.visibleFrame()
+    bottom = screen.frame().origin.y
+    return (vf.origin.x, bottom, vf.size.width,
+            vf.origin.y + vf.size.height - bottom)
+
+
 def clamp_origin_to_screen(ox, oy):
     """Clamp NSWindow cocoa origin so the visible character body stays fully
-    inside NSScreen.visibleFrame. Returns (clamped_ox, clamped_oy)."""
+    inside the walkable frame (visibleFrame down to the screen's bottom edge).
+    Returns (clamped_ox, clamped_oy)."""
     try:
         from AppKit import NSScreen
         main = NSScreen.mainScreen()
         if main is None:
             return ox, oy
-        f = main.visibleFrame()
-        vx, vy = f.origin.x, f.origin.y
-        vw, vh = f.size.width, f.size.height
+        vx, vy, vw, vh = _walkable_frame(main)
         min_ox, max_ox, min_oy, max_oy = _char_bounds(vx, vy, vw, vh)
         return (max(min_ox, min(max_ox, ox)),
                 max(min_oy, min(max_oy, oy)))
@@ -216,7 +227,7 @@ def clamp_origin_to_screen(ox, oy):
 
 
 def _visible_frame():
-    """Return NSScreen.mainScreen().visibleFrame as (x, y, w, h) in Cocoa coords."""
+    """Return NSScreen.mainScreen()'s walkable frame (see _walkable_frame) as (x, y, w, h) in Cocoa coords."""
     from AppKit import NSScreen
     main = NSScreen.mainScreen()
     if main is None:
@@ -224,8 +235,7 @@ def _visible_frame():
         if not screens:
             return (0, 0, 1440, 900)
         main = screens[0]
-    f = main.visibleFrame()
-    return (f.origin.x, f.origin.y, f.size.width, f.size.height)
+    return _walkable_frame(main)
 
 
 def corner_origin(corner: str) -> tuple[float, float]:
