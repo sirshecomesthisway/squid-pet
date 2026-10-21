@@ -494,8 +494,17 @@ def _desktop_bundled_cli_version(root: Path) -> Optional[str]:
     best: Optional[tuple] = None
     for name in names:
         vt = _version_tuple(name)
-        exe = Path(root) / name / "claude.app" / "Contents" / "MacOS" / "claude"
-        if vt is not None and exe.is_file() and (best is None or vt > best[0]):
+        if vt is None:
+            continue
+        # <ver>/claude.app (older layout) or <ver>/<hash>/claude.app (3.1623+).
+        tail = Path("claude.app") / "Contents" / "MacOS" / "claude"
+        ver_dir = Path(root) / name
+        try:
+            if not ((ver_dir / tail).is_file() or any(ver_dir.glob(f"*/{tail}"))):
+                continue
+        except OSError:
+            continue
+        if best is None or vt > best[0]:
             best = (vt, name)
     return best[1] if best else None
 

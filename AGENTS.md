@@ -80,6 +80,14 @@ and use temp dirs.
     CLI. It has no tty: take-me-there activates the app
     (`com.anthropic.claudefordesktop`) and cannot pick a Code tab. Its
     bundled CLI lags the terminal CLI by many versions.
+  - Desktop app Cowork sessions (`CLAUDE_CODE_IS_COWORK`, also
+    `"local-agent"`): the bundled CLI runs with its OWN `CLAUDE_CONFIG_DIR`
+    (a temp dir), so no `~/.claude` transcript, no hooks. Transcripts land in
+    `~/Library/Application Support/Claude/local-agent-mode-sessions/*/*/*/.claude/projects/`;
+    `ClaudeCodeDetector` also globs those roots (`cowork_projects_roots`), so
+    activity is seen but the surface is not recorded and take-me-there is not
+    Cowork-aware. The surface bullet above cannot tell the two apart by
+    `entrypoint` alone.
   - Desktop VM sandbox (`claude-code-vm`) and cloud / Code on the web:
     nothing local to see; out of scope, and squid makes no network calls.
   - `claude -p` writes `"sdk-cli"`. It and any unknown value take the

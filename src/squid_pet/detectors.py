@@ -95,6 +95,30 @@ def _shell_signals(procs, active_fn, cmdline_fn, owner_out=None) -> tuple[bool, 
 # ClaudeCodeDetector -- detects `claude` CLI activity
 # ----------------------------------------------------------------------
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+# The desktop app's Cowork sessions run the bundled CLI with their OWN
+# CLAUDE_CONFIG_DIR, so their transcripts never reach ~/.claude/projects:
+#   <base>/<org>/<account>/<session>/.claude/projects/<enc>/<session_id>.jsonl
+# (confirmed live, Claude desktop 3.1623.0 / bundled CLI 2.1.304).
+CLAUDE_COWORK_SESSIONS_DIR = (
+    Path.home() / "Library" / "Application Support" / "Claude"
+    / "local-agent-mode-sessions")
+
+
+def cowork_projects_roots(base: Path = CLAUDE_COWORK_SESSIONS_DIR) -> list[Path]:
+    """Every Cowork session's transcript root under ``base`` (paths only).
+
+    An unreadable directory ends the walk but keeps the roots already found,
+    so one bad session folder cannot hide the rest. Cost: a three-level
+    wildcard glob; with a handful of sessions it is well under a millisecond,
+    and it grows with the number of old session folders (flagged, not capped).
+    """
+    roots: list[Path] = []
+    try:
+        for root in base.glob("*/*/*/.claude/projects"):
+            roots.append(root)
+    except OSError:
+        pass
+    return roots
 
 
 def _default_claude_transcript_glob(root: Path):
@@ -202,6 +226,7 @@ class ClaudeCodeDetector:
 
     STREAMING_STALE_SEC = 20.0
     DISCOVERY_CACHE_SEC = 60.0
+    EXTRA_ROOTS_CHECK_SEC = 5.0     # how often to look for a new Cowork session root
     # A subagent transcript whose last conversational record is not a final
     # result (see _tail_info) counts as busy for this long after its last write:
     # a long-thinking helper can stay silent for many minutes.
@@ -229,8 +254,17 @@ class ClaudeCodeDetector:
         active_sessions_fn: Callable | None = None,
         finished_mtime_fn: Callable[[str], float | None] | None = None,
         surfaces_fn: Callable[[], dict] | None = None,
+        extra_roots_fn: Callable[[], Iterable[Path]] | None = None,
     ) -> None:
         self.enabled = enabled
+        # Extra transcript roots searched alongside projects_dir (production:
+        # the desktop app's Cowork roots, passed by build_detectors). None by
+        # default so a bare detector never reads real home directories.
+        self._extra_roots_fn = extra_roots_fn
+        # Roots seen at the last full discovery, and when the cheap new-root
+        # check last ran (see _new_extra_roots).
+        self._extra_roots_seen: frozenset = frozenset()
+        self._extra_roots_checked_at: float = 0.0
         # session id -> surface ("cli" / "local-agent" / "sdk-cli" / "unknown"),
         # default: the hook-written claude_session_surface/ dir, read-only.
         # Consulted by diagnostic() only (`squid why`), never on the tick path.
@@ -307,9 +341,31 @@ class ClaudeCodeDetector:
             # leaving it None is what routes production through the
             # merged single-walk path in _shell_signals().
 
+    def _enumerate_extra_roots(self) -> list:
+        if self._extra_roots_fn is None:
+            return []
+        try:
+            return list(self._extra_roots_fn())
+        except Exception:
+            # An extra root source must never take down the ~/.claude path.
+            return []
+
+    def _new_extra_roots(self, now: float) -> bool:
+        """True when an extra root (a new Cowork session) appeared since the
+        last full discovery. Cowork fires no hook flags, so
+        _active_session_needs_rediscovery cannot notice it; without this a new
+        session stays invisible for up to DISCOVERY_CACHE_SEC. Throttled to
+        EXTRA_ROOTS_CHECK_SEC so the root glob is not a per-tick cost."""
+        if (self._extra_roots_fn is None
+                or (now - self._extra_roots_checked_at) < self.EXTRA_ROOTS_CHECK_SEC):
+            return False
+        self._extra_roots_checked_at = now
+        return not frozenset(self._enumerate_extra_roots()) <= self._extra_roots_seen
+
     def _discover(self, now: float) -> list:
         if (self._candidates and (now - self._candidates_at) < self.DISCOVERY_CACHE_SEC
-                and not self._active_session_needs_rediscovery()):
+                and not self._active_session_needs_rediscovery()
+                and not self._new_extra_roots(now)):
             # Cheap per-tick top-up (finding 3): a subagent started AFTER this
             # discovery would otherwise stay invisible for up to
             # DISCOVERY_CACHE_SEC -- after the parent's Stop + 20s groove beat
@@ -320,16 +376,22 @@ class ClaudeCodeDetector:
             self._discover_new_subagents(now)
             return self._candidates
         found = []
-        try:
-            for f in self._glob(self._projects_dir):
-                try:
-                    mtime = self._stat(str(f)).st_mtime
-                except OSError:
-                    continue
-                if (now - mtime) <= self.CANDIDATE_MAX_AGE_SEC:
-                    found.append(f)
-        except OSError:
-            pass
+        roots = [self._projects_dir]
+        extra = self._enumerate_extra_roots()
+        self._extra_roots_seen = frozenset(extra)
+        self._extra_roots_checked_at = now
+        roots.extend(extra)
+        for root in roots:
+            try:
+                for f in self._glob(root):
+                    try:
+                        mtime = self._stat(str(f)).st_mtime
+                    except OSError:
+                        continue
+                    if (now - mtime) <= self.CANDIDATE_MAX_AGE_SEC:
+                        found.append(f)
+            except OSError:
+                pass
         self._candidates = found
         self._candidates_at = now
         # Seed the dir-mtime baseline so the first incremental tick after a full
@@ -1472,7 +1534,8 @@ def build_detectors(settings: dict | None = None) -> list:
     project_dirs = s.get("project_dirs", DEFAULT_TRIGGERS["project_dirs"])
     ide_processes = s.get("ide_processes", DEFAULT_TRIGGERS["ide_processes"])
     detectors = [
-        ClaudeCodeDetector(project_dirs=project_dirs, enabled=s.get("claude_code", True)),
+        ClaudeCodeDetector(project_dirs=project_dirs, enabled=s.get("claude_code", True),
+                           extra_roots_fn=cowork_projects_roots),
         CodexDetector(project_dirs=project_dirs, enabled=s.get("codex", True)),
         GitDetector(project_dirs=project_dirs, enabled=s.get("git", True)),
         TerminalDetector(enabled=s.get("terminal", False)),
