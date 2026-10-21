@@ -153,3 +153,10 @@ def test_run_doctor_survives_a_broken_surface_report(monkeypatch, capsys):
     monkeypatch.setattr(doctor, "claude_surface_report", boom)
     assert doctor.run_doctor() == 0
     assert "1/1 checks passed" in capsys.readouterr().out
+
+
+def test_bundled_cli_found_under_hash_dir(tmp_path):
+    exe = tmp_path / "2.1.304" / "6bbba6adc37f" / "claude.app" / "Contents" / "MacOS" / "claude"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("")
+    assert doctor._desktop_bundled_cli_version(tmp_path) == "2.1.304"

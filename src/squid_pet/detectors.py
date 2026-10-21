@@ -95,6 +95,21 @@ def _shell_signals(procs, active_fn, cmdline_fn, owner_out=None) -> tuple[bool, 
 # ClaudeCodeDetector -- detects `claude` CLI activity
 # ----------------------------------------------------------------------
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+# The desktop app's Cowork sessions run the bundled CLI with their OWN
+# CLAUDE_CONFIG_DIR, so their transcripts never reach ~/.claude/projects:
+#   <base>/<org>/<account>/<session>/.claude/projects/<enc>/<session_id>.jsonl
+# (confirmed live, Claude desktop 3.1623.0 / bundled CLI 2.1.304).
+CLAUDE_COWORK_SESSIONS_DIR = (
+    Path.home() / "Library" / "Application Support" / "Claude"
+    / "local-agent-mode-sessions")
+
+
+def cowork_projects_roots(base: Path = CLAUDE_COWORK_SESSIONS_DIR) -> list[Path]:
+    """Every Cowork session's transcript root under ``base`` (paths only)."""
+    try:
+        return list(base.glob("*/*/*/.claude/projects"))
+    except OSError:
+        return []
 
 
 def _default_claude_transcript_glob(root: Path):
@@ -229,8 +244,16 @@ class ClaudeCodeDetector:
         active_sessions_fn: Callable | None = None,
         finished_mtime_fn: Callable[[str], float | None] | None = None,
         surfaces_fn: Callable[[], dict] | None = None,
+        extra_roots_fn: Callable[[], Iterable[Path]] | None = None,
     ) -> None:
         self.enabled = enabled
+        # Extra transcript roots searched alongside projects_dir. Production
+        # (no projects_dir given) adds the desktop app's Cowork roots; an
+        # injected projects_dir means a hermetic test, which must not see the
+        # real ones unless it passes extra_roots_fn itself.
+        if extra_roots_fn is None and projects_dir is None:
+            extra_roots_fn = cowork_projects_roots
+        self._extra_roots_fn = extra_roots_fn
         # session id -> surface ("cli" / "local-agent" / "sdk-cli" / "unknown"),
         # default: the hook-written claude_session_surface/ dir, read-only.
         # Consulted by diagnostic() only (`squid why`), never on the tick path.
@@ -320,16 +343,20 @@ class ClaudeCodeDetector:
             self._discover_new_subagents(now)
             return self._candidates
         found = []
-        try:
-            for f in self._glob(self._projects_dir):
-                try:
-                    mtime = self._stat(str(f)).st_mtime
-                except OSError:
-                    continue
-                if (now - mtime) <= self.CANDIDATE_MAX_AGE_SEC:
-                    found.append(f)
-        except OSError:
-            pass
+        roots = [self._projects_dir]
+        if self._extra_roots_fn is not None:
+            roots.extend(self._extra_roots_fn())
+        for root in roots:
+            try:
+                for f in self._glob(root):
+                    try:
+                        mtime = self._stat(str(f)).st_mtime
+                    except OSError:
+                        continue
+                    if (now - mtime) <= self.CANDIDATE_MAX_AGE_SEC:
+                        found.append(f)
+            except OSError:
+                pass
         self._candidates = found
         self._candidates_at = now
         # Seed the dir-mtime baseline so the first incremental tick after a full
