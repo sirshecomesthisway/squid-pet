@@ -499,7 +499,10 @@ def _desktop_bundled_cli_version(root: Path) -> Optional[str]:
         # <ver>/claude.app (older layout) or <ver>/<hash>/claude.app (3.1623+).
         tail = Path("claude.app") / "Contents" / "MacOS" / "claude"
         ver_dir = Path(root) / name
-        if not ((ver_dir / tail).is_file() or any(ver_dir.glob(f"*/{tail}"))):
+        try:
+            if not ((ver_dir / tail).is_file() or any(ver_dir.glob(f"*/{tail}"))):
+                continue
+        except OSError:
             continue
         if best is None or vt > best[0]:
             best = (vt, name)
