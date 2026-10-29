@@ -17,7 +17,10 @@ doesn't accidentally toggle off mid-drag.
 """
 from __future__ import annotations
 
+import functools
 import logging
+import math
+import re
 import threading
 import time
 from pathlib import Path
@@ -265,28 +268,181 @@ class NudgeApproachTracker:
         return True
 
 
+# ── Hit mask: her silhouette, not a box ──
+# Pink-2026-10-29: the hit test was one worst-case bounding box covering
+# every pose (6..175 x 0..187 of the 180px sprite) -- nearly the whole
+# sprite square, so clicks on the empty corners around her landed on her.
+# It replaced a per-sprite dilated alpha mask (2026-06-11) that left gaps:
+# the mask was of ONE static PNG while the frontend cycles frames and runs
+# CSS motion (tilt, bounce, jump, stretch), so the visible body drifted off
+# the mask. Each state's mask is now the union of everything that state can
+# show -- every frame, swept through its CSS motion -- with gaps between
+# tentacles closed and a small halo added. Roughly a third of the old box.
+MASK_PAD = 40          # canvas margin: celebrating jumps and the attention
+                       # stretch carry her past the 180px sprite box
+CLICK_HALO_PX = 8      # reach beyond the visible outline
+GAP_CLOSE_PX = 6       # fill notches up to ~2x this wide (between tentacles)
+
+# Frames each backend state can put on screen (filename stems, any `_N`
+# frame suffix dropped). idle also covers the frontend's lasting mood and
+# expression swaps, which the backend never hears about as a state; the
+# 1.5s wake-up stretch is left out (arms flung wide, gone in a moment).
+STATE_SPRITE_FAMILIES: dict[str, tuple[str, ...]] = {
+    "idle": ("idle", "blink", "look-left", "look-right", "drowsy"),
+    "working": ("working", "pancake_flip"),
+}
+
+# CSS motion per state from frontend/index.html, as samples of
+# (scale_x, scale_y, origin, dx, dy, deg); origin "center" or "bottom"
+# (transform-origin: bottom center). Sub-halo jitter (working-shake,
+# concerned-tremble, walk-bob) is covered by CLICK_HALO_PX and not listed.
+# Brief one-shot moves (look-around, squish) are sampled only halfway:
+# the halo covers the rest of the swing, and sweeping their full extent
+# would make the idle mask -- the one she wears most -- much fatter.
+_REST = (1.0, 1.0, "center", 0.0, 0.0, 0.0)
+STATE_MOTION: dict[str, tuple[tuple[float, float, str, float, float, float], ...]] = {
+    "idle": (
+        _REST,
+        (1.04, 1.04, "center", 0, 0, 0),                     # breathe
+        (0.95, 1.10, "bottom", 0, 0, 0),                     # idle-squish (half)
+        (1.06, 0.94, "bottom", 0, 0, 0),
+        (1.0, 1.0, "center", 0, 0, -7),                      # look-around (half of 14deg)
+        (1.0, 1.0, "center", 0, 0, 7),
+    ),
+    "thinking": (_REST, (1, 1, "center", 0, 0, -3), (1, 1, "center", 0, 0, 3)),
+    "grooving": (
+        _REST,
+        (1, 1, "center", 0, 0, -5), (1, 1, "center", 0, -5, 5),
+        (1, 1, "center", 0, -10, 5), (1, 1, "center", 0, -10, -5),
+    ),
+    "celebrating": (
+        _REST,
+        (1.04, 1.04, "center", 0, -9, 0), (1.08, 1.08, "center", 0, -18, 0),
+    ),
+    "sleeping": (_REST, (1.02, 1.02, "center", 0, 0, 0)),
+    "attention_needed": (
+        _REST,
+        (1.0, 1.11, "bottom", 0, 0, 0), (1.0, 1.22, "bottom", 0, 0, 0),
+    ),
+}
+
+
+PROP_JOIN_PX = 2   # props this close to her body count as attached
+
+
+@functools.lru_cache(maxsize=1)
+def _pixels_by_centre_distance() -> list[tuple[int, int]]:
+    cx, cy = SPRITE_WIDTH // 2, SPRITE_HEIGHT // 2
+    return sorted(((x, y) for x in range(SPRITE_WIDTH) for y in range(SPRITE_HEIGHT)),
+                  key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+
+
+def _body_alpha(png: Path) -> "Image.Image":
+    """The sprite's alpha at display size, thresholded to 0/255 and cut
+    down to her body plus anything touching it (laptop, headphones,
+    flag). Floating decorations -- sparkles, music notes, zzz, a pancake
+    in mid-air -- are not her and should not catch clicks."""
+    from PIL import ImageChops, ImageDraw, ImageFilter
+    alpha = Image.open(png).convert("RGBA").split()[3]
+    alpha = alpha.resize((SPRITE_WIDTH, SPRITE_HEIGHT), Image.NEAREST)  # type: ignore[attr-defined]
+    alpha = alpha.point(lambda v: 255 if v > ALPHA_THRESHOLD else 0)
+    # Seed: the opaque pixel nearest the sprite centre, which is always her.
+    data = alpha.tobytes()
+    seed = next(((x, y) for x, y in _pixels_by_centre_distance()
+                 if data[y * SPRITE_WIDTH + x]), None)
+    if seed is None:
+        return alpha
+    # Flood-fill a slightly grown copy so near-touching props join her,
+    # then keep only the original pixels inside that region.
+    grown = alpha.filter(ImageFilter.MaxFilter(2 * PROP_JOIN_PX + 1))
+    ImageDraw.floodfill(grown, seed, 128)
+    body = grown.point(lambda v: 255 if v == 128 else 0)
+    return ImageChops.darker(alpha, body)
+
+
+def _apply_motion(canvas: "Image.Image", sample) -> "Image.Image":
+    """Render a padded mask the way CSS would draw it under one motion
+    sample: scale/rotate about the origin, then translate. CSS rotate() is
+    clockwise for positive degrees in y-down coords."""
+    scale_x, scale_y, origin, dx, dy, deg = sample
+    ox = MASK_PAD + SPRITE_WIDTH / 2
+    oy = MASK_PAD + (SPRITE_HEIGHT if origin == "bottom" else SPRITE_HEIGHT / 2)
+    # PIL's AFFINE maps OUTPUT -> INPUT, so build the inverse:
+    # q = o + S^-1 R(-deg) (p - o - t)
+    rad = math.radians(-deg)
+    cos, sin = math.cos(rad), math.sin(rad)
+    a, b = cos / scale_x, -sin / scale_x
+    d, e = sin / scale_y, cos / scale_y
+    px, py = ox + dx, oy + dy
+    return canvas.transform(
+        canvas.size, Image.AFFINE,  # type: ignore[attr-defined]
+        (a, b, ox - a * px - b * py, d, e, oy - d * px - e * py),
+        resample=Image.NEAREST,  # type: ignore[attr-defined]
+    )
+
+
 def load_alpha_masks() -> dict[str, "Image.Image"]:
-    """Pre-load alpha channels for all sprites, resized to display size."""
-    masks: dict[str, "Image.Image"] = {}
+    """Build one hit mask per state, padded by MASK_PAD on every side.
+
+    Keys are sprite family names (filename stems without the `_N` frame
+    suffix), so set_state()'s lookup by state name is unchanged.
+    """
+    from PIL import ImageChops, ImageFilter
+
+    families: dict[str, list[Image.Image]] = {}
     for png in sorted(SPRITES_DIR.glob("*.png")):
         if png.name.startswith("_"):
             continue
+        family = re.sub(r"_\d+$", "", png.stem)
         try:
-            img = Image.open(png).convert("RGBA")
-            alpha = img.split()[3]  # alpha channel
-            alpha = alpha.resize((SPRITE_WIDTH, SPRITE_HEIGHT), Image.NEAREST)  # type: ignore[attr-defined]
-            # Dilate the alpha mask by ~6 pixels using MaxFilter so the hit-target
-            # extends a few pixels beyond the visible silhouette. Without this,
-            # clicks on the very edge of an irregular sprite (e.g. tip of head,
-            # outstretched arm) fall in the transparent halo between the character
-            # and its bounding box, and the click passes through. 13 = 6-pixel
-            # radius cross-shaped max filter, applied twice for ~9px effective halo.
-            from PIL import ImageFilter
-            alpha = alpha.filter(ImageFilter.MaxFilter(25))   # 12px halo (was 6px - too tight, Pink missed too often)
-            masks[png.stem] = alpha
+            families.setdefault(family, []).append(_body_alpha(png))
         except Exception as e:
             log.warning("failed loading alpha for %s: %s", png.name, e)
+
+    side = (SPRITE_WIDTH + 2 * MASK_PAD, SPRITE_HEIGHT + 2 * MASK_PAD)
+    masks: dict[str, Image.Image] = {}
+    for state in families:
+        frames = [f for fam in STATE_SPRITE_FAMILIES.get(state, (state,))
+                  for f in families.get(fam, [])]
+        canvas = Image.new("L", side, 0)
+        for frame in frames:
+            canvas.paste(ImageChops.lighter(
+                canvas.crop((MASK_PAD, MASK_PAD,
+                             MASK_PAD + SPRITE_WIDTH, MASK_PAD + SPRITE_HEIGHT)),
+                frame), (MASK_PAD, MASK_PAD))
+        swept = Image.new("L", side, 0)
+        for sample in STATE_MOTION.get(state, (_REST,)):
+            swept = ImageChops.lighter(swept, _apply_motion(canvas, sample))
+        # Close (dilate by GAP+HALO, erode by GAP) = gaps filled + halo.
+        # n passes of a 3x3 max/min filter = a square of radius n, far
+        # cheaper than one big filter.
+        for _ in range(GAP_CLOSE_PX + CLICK_HALO_PX):
+            swept = swept.filter(ImageFilter.MaxFilter(3))
+        for _ in range(GAP_CLOSE_PX):
+            swept = swept.filter(ImageFilter.MinFilter(3))
+        masks[state] = swept
     return masks
+
+
+# Edge rotation (frontend applyEdge): the wrapper rotates about the sprite
+# centre so her feet hug the edge, and the top pose also shifts up 80px.
+EDGE_ROTATION_DEG = {"left": 90, "right": -90, "top": 180}
+TOP_EDGE_Y_SHIFT_PX = 80   # must match index.html's TOP_EDGE_Y_SHIFT_PX
+
+
+def _window_to_sprite(local_x: float, local_y: float, edge: str) -> tuple[int, int]:
+    """Map a window-local point (top-left origin) to unrotated sprite
+    coords by undoing the edge rotation. The old bbox test only undid the
+    top pose's shift -- a near-square box barely cared about rotation, but
+    a silhouette does."""
+    pivot_x = SPRITE_LEFT + SPRITE_WIDTH / 2
+    pivot_y = SPRITE_TOP + SPRITE_HEIGHT / 2
+    shown_y = pivot_y - (TOP_EDGE_Y_SHIFT_PX if edge == "top" else 0)
+    rad = math.radians(-EDGE_ROTATION_DEG.get(edge, 0))
+    vx, vy = local_x - pivot_x, local_y - shown_y
+    qx = math.cos(rad) * vx - math.sin(rad) * vy + pivot_x
+    qy = math.sin(rad) * vx + math.cos(rad) * vy + pivot_y
+    return int(round(qx - SPRITE_LEFT)), int(round(qy - SPRITE_TOP))
 
 
 def _heartbeat_line(*, tick, cursor, win, inside, sprite, state, opaque,
@@ -676,32 +832,22 @@ class PassthroughController:
                     local_x = cx - win_x
                     local_y = win_h - (cy - win_y)   # flip Y (Cocoa→image)
 
-                    # Map to sprite-local coords
-                    # When edge=="top", CSS applies translateY(-80px) which
-                    # shifts the visual sprite up 80px. Adjust hit-test to match.
+                    # Map to sprite-local coords, undoing the edge rotation.
                     with self._lock:
                         edge = self._current_edge
-                    top_offset = 80 if edge == "top" else 0
-                    sprite_x = int(local_x - SPRITE_LEFT)
-                    sprite_y = int(local_y - (SPRITE_TOP - top_offset))
+                    sprite_x, sprite_y = _window_to_sprite(local_x, local_y, edge)
 
-                    # Hit test: simple BOUNDING BOX around the character (with generous
-                    # halo). Was: dilated alpha mask, but irregular silhouette left
-                    # gaps where Pink's clicks fell through (2026-06-11). Bbox is
-                    # predictable and matches user intent ("anywhere ON the character").
-                    #
-                    # Character art bbox in sprite coords: (38,35)-(138,138).
-                    # With CLICK_HALO_PX padding on all sides:
-                    # Worst-case sprite envelope (was idle-only, missed wider states).
-                    CLICK_HALO_PX = 15
-                    CHAR_BBOX_MIN_X = 21 - CLICK_HALO_PX     # 6   [celebrating]
-                    CHAR_BBOX_MAX_X = 160 + CLICK_HALO_PX    # 175 [thinking]
-                    CHAR_BBOX_MIN_Y = 15 - CLICK_HALO_PX     # 0   [thinking]
-                    CHAR_BBOX_MAX_Y = 172 + CLICK_HALO_PX    # 187 [DROWSY — was missed in prior analysis]
-                    in_char_bbox = (CHAR_BBOX_MIN_X <= sprite_x <= CHAR_BBOX_MAX_X and
-                                    CHAR_BBOX_MIN_Y <= sprite_y <= CHAR_BBOX_MAX_Y)
-                    # Use alpha_val to keep the rest of the logic compatible.
-                    alpha_val = 255 if in_char_bbox else 0
+                    # Hit test against this state's silhouette envelope --
+                    # see load_alpha_masks() for why it is not a box. With no
+                    # mask (sprites failed to load) fall back to the sprite
+                    # square: too grabby beats ungrabbable.
+                    mask = self._masks.get(state)
+                    if mask is None:
+                        alpha_val = 255 if (0 <= sprite_x < SPRITE_WIDTH and
+                                            0 <= sprite_y < SPRITE_HEIGHT) else 0
+                    else:
+                        alpha_val = self._alpha_at(
+                            mask, sprite_x + MASK_PAD, sprite_y + MASK_PAD)
 
                     # Hysteresis to prevent flip-flop near body edges:
                     #   was passthrough? → need alpha > 30 to become interactive
