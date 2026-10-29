@@ -9,12 +9,17 @@ motion, floating decorations dropped, plus a small halo.
 from __future__ import annotations
 
 import pytest
+from PIL import Image, ImageChops, ImageFilter
 
 from squid_pet.passthrough import (
     ALPHA_THRESHOLD,
+    CLICK_HALO_PX,
+    GAP_CLOSE_PX,
     MASK_PAD,
     SPRITE_HEIGHT,
     SPRITE_WIDTH,
+    SPRITES_DIR,
+    _body_alpha,
     _window_to_sprite,
     load_alpha_masks,
 )
@@ -60,11 +65,26 @@ def test_empty_bottom_corners_click_through(masks, state):
     assert not _hit(mask, SPRITE_WIDTH - 10, SPRITE_HEIGHT - 5)
 
 
-def test_idle_mask_covers_its_frames_with_a_halo(masks):
-    # Just outside idle's art bbox (38..139 x 35..139) is still her.
+def test_idle_mask_covers_every_pixel_of_her(masks):
+    body = _body_alpha(SPRITES_DIR / "idle.png")
     idle = masks["idle"]
-    assert _hit(idle, 35, 90)
-    assert _hit(idle, 142, 110)
+    missed = [(x, y) for x in range(SPRITE_WIDTH) for y in range(SPRITE_HEIGHT)
+              if body.getpixel((x, y)) and not _hit(idle, x, y)]
+    assert missed == []
+
+
+def test_margin_stays_thin(masks):
+    # concerned has no swept motion, so its mask is her outline grown by
+    # at most the gap fill plus the halo -- nothing reaches further out.
+    body = _body_alpha(SPRITES_DIR / "concerned.png")
+    for path in sorted(SPRITES_DIR.glob("concerned_*.png")):
+        body = ImageChops.lighter(body, _body_alpha(path))
+    reach = Image.new("L", masks["concerned"].size, 0)
+    reach.paste(body, (MASK_PAD, MASK_PAD))
+    for _ in range(GAP_CLOSE_PX + CLICK_HALO_PX):
+        reach = reach.filter(ImageFilter.MaxFilter(3))
+    beyond = ImageChops.subtract(masks["concerned"], reach)
+    assert beyond.getbbox() is None
 
 
 def test_window_to_sprite_upright_is_a_plain_offset():

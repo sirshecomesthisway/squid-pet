@@ -280,7 +280,8 @@ class NudgeApproachTracker:
 # tentacles closed and a small halo added. Roughly a third of the old box.
 MASK_PAD = 40          # canvas margin: celebrating jumps and the attention
                        # stretch carry her past the 180px sprite box
-CLICK_HALO_PX = 8      # reach beyond the visible outline
+CLICK_HALO_PX = 3      # reach beyond the visible outline (Pink-2026-10-29:
+                       # 8, plus a 3px lookup cross, still felt too wide)
 GAP_CLOSE_PX = 6       # fill notches up to ~2x this wide (between tentacles)
 
 # Frames each backend state can put on screen (filename stems, any `_N`
@@ -296,19 +297,13 @@ STATE_SPRITE_FAMILIES: dict[str, tuple[str, ...]] = {
 # (scale_x, scale_y, origin, dx, dy, deg); origin "center" or "bottom"
 # (transform-origin: bottom center). Sub-halo jitter (working-shake,
 # concerned-tremble, walk-bob) is covered by CLICK_HALO_PX and not listed.
-# Brief one-shot moves (look-around, squish) are sampled only halfway:
-# the halo covers the rest of the swing, and sweeping their full extent
-# would make the idle mask -- the one she wears most -- much fatter.
+# Brief one-shot idle moves (look-around's 14deg tilt, the squish) are
+# left out: sweeping them made the idle mask -- the one she wears most --
+# visibly fatter, and missing her edge for a second mid-wiggle is the
+# cheaper mistake.
 _REST = (1.0, 1.0, "center", 0.0, 0.0, 0.0)
 STATE_MOTION: dict[str, tuple[tuple[float, float, str, float, float, float], ...]] = {
-    "idle": (
-        _REST,
-        (1.04, 1.04, "center", 0, 0, 0),                     # breathe
-        (0.95, 1.10, "bottom", 0, 0, 0),                     # idle-squish (half)
-        (1.06, 0.94, "bottom", 0, 0, 0),
-        (1.0, 1.0, "center", 0, 0, -7),                      # look-around (half of 14deg)
-        (1.0, 1.0, "center", 0, 0, 7),
-    ),
+    "idle": (_REST, (1.04, 1.04, "center", 0, 0, 0)),         # breathe
     "thinking": (_REST, (1, 1, "center", 0, 0, -3), (1, 1, "center", 0, 0, 3)),
     "grooving": (
         _REST,
@@ -646,18 +641,15 @@ class PassthroughController:
                 log.warning("corner-flee callback failed: %s", e)
 
     def _alpha_at(self, mask, sx: int, sy: int) -> int:
-        """MAX alpha in a 5-pixel cross neighborhood (robust to CSS animation jitter)."""
+        """Mask alpha at one pixel, 0 off the mask. Used to take the max
+        over a +-3px cross for CSS jitter; the masks now sweep her motion
+        themselves, and the cross only widened the margin."""
         if mask is None:
             return 0
         w, h = mask.size
-        best = 0
-        for dx, dy in [(0, 0), (-3, 0), (3, 0), (0, -3), (0, 3)]:
-            x, y = sx + dx, sy + dy
-            if 0 <= x < w and 0 <= y < h:
-                a = int(mask.getpixel((x, y)))
-                if a > best:
-                    best = a
-        return best
+        if 0 <= sx < w and 0 <= sy < h:
+            return int(mask.getpixel((sx, sy)))
+        return 0
 
     def _apply_ignore(self, ignore: bool) -> None:
         """
