@@ -3,6 +3,14 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def isolate_claude_hook_settings(tmp_path, monkeypatch):
+    from squid_pet import claude_hooks
+
+    monkeypatch.setattr(claude_hooks, "settings_paths",
+                        lambda: [tmp_path / ".claude" / "settings.json"])
+
+
+@pytest.fixture(autouse=True)
 def isolate_codex_wait_markers(tmp_path, monkeypatch):
     from squid_pet import watcher
 

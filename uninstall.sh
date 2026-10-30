@@ -12,6 +12,7 @@
 #   - ~/Library/LaunchAgents/com.pink.squid-pet.plist
 #   - ~/.local/bin/squid launcher
 #   - /tmp/squid-pet.{out,err}.log
+#   - Squid's Claude user hooks (other hooks/settings are preserved)
 #
 # What gets prompted (default NO):
 #   - ~/.squid-pet/  (settings, state, logs)
@@ -160,6 +161,16 @@ remove_project() {
     fi
 }
 
+remove_claude_hooks() {
+    step "remove Squid Claude hooks"
+    if [ -x "$PROJECT/.venv/bin/python" ] && [ -f "$PROJECT/scripts/install_claude_hooks.py" ]; then
+        "$PROJECT/.venv/bin/python" "$PROJECT/scripts/install_claude_hooks.py" --remove || \
+            warn "Could not remove Claude hooks; remove only claude_pet_hook.py handlers from Claude settings manually"
+    else
+        warn "Setup tool unavailable; remove only claude_pet_hook.py handlers from Claude settings manually"
+    fi
+}
+
 # ─── 7. summary ───────────────────────────────────────────────────────
 summary() {
     echo ""
@@ -181,6 +192,7 @@ stop_squid
 remove_plist
 remove_launcher
 remove_logs
+remove_claude_hooks
 remove_settings
 remove_project
 summary

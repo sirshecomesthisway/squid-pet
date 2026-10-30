@@ -16,6 +16,12 @@ def test_cmd_update_skips_on_no_op_pull(tmp_path):
     # Set up a fake project dir (we use the real one's git history)
     fake_proj = tmp_path / "squid-pet"
     fake_proj.mkdir()
+    (fake_proj / "bin").mkdir()
+    (fake_proj / "bin" / "squid").write_text("#!/bin/bash\n# new launcher\n")
+    fake_home = tmp_path / "home"
+    launcher = fake_home / ".local" / "bin" / "squid"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("old launcher\n")
 
     # Init a tiny git repo with no remote (so 'git pull' will fail quickly,
     # which is fine because we test the HEAD-comparison branch, not the pull)
@@ -52,6 +58,7 @@ eval "$SQUID_SRC"
 # Override AFTER sourcing
 project_dir() {{ echo "{fake_proj}"; }}
 cmd_restart() {{ echo "RESTART_CALLED"; }}
+cmd_setup_claude() {{ echo "CLAUDE_SETUP_CALLED"; }}
 cmd_update 2>&1
 """)
     driver.chmod(0o755)
@@ -79,6 +86,7 @@ exec /usr/bin/git "$@"
 
     env = os.environ.copy()
     env["PATH"] = f"{bin_shim}:{env['PATH']}"
+    env["HOME"] = str(fake_home)
 
     result = subprocess.run(
         ["bash", str(driver)], capture_output=True, text=True, env=env, timeout=10
@@ -95,6 +103,8 @@ exec /usr/bin/git "$@"
     assert "RESTART_CALLED" not in out, (
         f"restart should be skipped; got:\n{out}"
     )
+    assert "CLAUDE_SETUP_CALLED" in out, "A no-op update must still repair missing hooks"
+    assert launcher.read_text() == (fake_proj / "bin" / "squid").read_text()
 
 
 def test_cmd_update_skip_requires_healthy_venv(tmp_path):
@@ -132,6 +142,7 @@ exec /usr/bin/git "$@"
     git_shim.chmod(0o755)
     env = os.environ.copy()
     env["PATH"] = f"{bin_shim}:{env['PATH']}"
+    env["HOME"] = str(tmp_path / "home")
 
     result = subprocess.run(
         ["bash", str(driver)], capture_output=True, text=True, env=env, timeout=10

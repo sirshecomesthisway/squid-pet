@@ -17,6 +17,7 @@
 #   7.  render_plist           substitute __PROJECT__ in template
 #   8.  install_launcher       bin/squid -> ~/.local/bin/squid
 #   9.  first_run_wizard       prompt corner/stroll if no settings.json
+#       setup_claude_hooks     merge Claude user hooks, preserving other settings
 #   10. boot_launchd           bootout + bootstrap (idempotent)
 #   11. verify_alive           poll state.json mtime <=10s
 #   12. permission_walkthrough open Accessibility settings pane
@@ -24,6 +25,7 @@
 #
 # Re-runnable (idempotent): existing repo gets git pull, existing plist gets
 # replaced, existing settings.json is honored as-is.
+# Claude user settings are merged separately to register Squid's hooks.
 
 set -euo pipefail
 
@@ -397,6 +399,16 @@ PERMS
     fi
 }
 
+# Claude integration setup is explicit install-time work, never a watcher task.
+setup_claude_hooks() {
+    step "setup Claude hooks"
+    if "$PROJECT/.venv/bin/python" "$PROJECT/scripts/install_claude_hooks.py"; then
+        ok "Claude hooks registered (CLI + local Desktop Code)"
+    else
+        warn "Claude hooks need attention. Run: squid setup-claude"
+    fi
+}
+
 # ─── 13. print_summary ────────────────────────────────────────────────
 print_summary() {
     step "summary"
@@ -408,6 +420,7 @@ ${C_GRN}${C_BLD}Squid is installed.${C_RST}
     squid status        is she alive? is the watcher ticking?
     squid why           why is she in this state? which detector fired?
     squid doctor        6-check self-diagnostic
+    squid setup-claude   repair Claude question/approval hooks (--check to inspect)
     squid restart       atomic bounce
     squid update        git pull + reinstall + restart
     squid uninstall     get rid of her cleanly
@@ -540,6 +553,7 @@ main() {
     time_stage render_plist
     time_stage install_launcher
     time_stage first_run_wizard
+    time_stage setup_claude_hooks
     time_stage boot_launchd
     time_stage verify_alive || true   # don't fail install if first tick is slow
     time_stage permission_walkthrough

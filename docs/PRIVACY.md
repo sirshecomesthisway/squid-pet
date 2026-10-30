@@ -39,6 +39,23 @@ registered event (`Notification`, `PermissionRequest`, `PermissionDenied`,
 block registered in `~/.claude/settings.json` (your own user-level
 config, outside this repo).
 
+`install.sh`, `squid update`, and the explicit `squid setup-claude` command
+merge these handlers into `~/.claude/settings.json` (plus a custom
+`CLAUDE_CONFIG_DIR/settings.json` when set). Setup reads the settings JSON,
+preserves unrelated settings/hooks, writes a one-time adjacent
+`settings.json.squid-backup`, then atomically replaces the settings file.
+The generated command uses the checkout's Python and receiver paths.
+`squid setup-claude --remove` and uninstall remove only Squid's handlers.
+The runtime watcher never installs hooks or edits Claude settings.
+
+On-demand `squid why`, `squid doctor`, and `squid setup-claude --check` read
+these user settings to check registration, matchers, `disableAllHooks`, and
+whether the registered executable/script files exist. Reports contain
+settings paths, event names, status, and coverage limitations; they do not
+include other settings values or command text. These checks do not inspect
+managed/project/session settings or prove that a hook fired, and do not run
+on the 1 Hz tick. They make no network calls.
+
 | Reads (via stdin, from Claude Code itself) | What for |
 |-------|----------|
 | `session_id` | names the flag file; the only identifier Claude Code's hook payload provides (no PID) |
@@ -109,7 +126,7 @@ the right app to the front on click instead of a generic/unhelpful target.
 |-------|----------|
 | `psutil.process_iter()` cmdline (basename `claude`) | finds the Claude Code CLI process — `Process.name()` was found unreliable for this binary on macOS, so matching goes through cmdline instead |
 | CPU% of that process | diagnostic only (`squid why`) — not used to decide state |
-| Non-shell descendant processes of `claude` (shared tool-name allowlist, also used by CodexDetector) | detects a live tool call (e.g. a Bash-tool command) → "working" |
+| Descendant process names/argv (shared tool-name allowlist, also used by CodexDetector) | detects a live tool call → "working". Known persistent app `cua_node` support hosts and Squid's own module/control processes are excluded by executable/script/module names; real tool descendants of support hosts remain eligible. No command bodies are parsed for this exclusion; no extra process-tree walk is added |
 | File mtimes under `project_dirs` (default `~/Projects`), same scan as IDEDetector | detects a very recent write (in-process tools like Edit/Write don't spawn a subprocess, so this catches what shell-child detection misses) → "working" |
 | `~/.claude/projects/*/*.jsonl` and `~/.claude/projects/*/*/subagents/agent-*.jsonl` mtime plus up to 64 KiB of tail record types/timestamps | detects a recent transcript write → "thinking" (proxy for the LLM generating or a tool call resolving). The subagent pattern lets a Task-tool helper's own transcript keep her out of idle while it works; same content-blind tail read, never the `.meta.json` sidecar. For subagent transcripts the same tail read also reads each record's `type`, `message.stop_reason` and the *type* of its last content block only (never any text): a helper whose last record is a tool result, a tool call or a thinking block (not a final text block) is treated as still working for up to 25 minutes of silence, but only while its parent session's turn is in flight (the `claude_turn_active` flag) or the helper wrote after the parent's last Stop (the `claude_finished` flag's mtime, one stat); a last record too large for the 64 KiB tail counts as still working under the same limits |
 | `~/Library/Application Support/Claude/local-agent-mode-sessions/*/*/*/.claude/projects/*/*.jsonl` (and the same `*/*/subagents/agent-*.jsonl` pattern) mtime plus the same bounded tail read | the Claude desktop app's Cowork sessions run the bundled CLI with their own config dir, so their transcripts are not under `~/.claude`. Same metadata-only treatment as the row above; only transcript paths and record types/timestamps are read, never message text, and only files in this app-owned tree |
@@ -131,6 +148,11 @@ tail consisting entirely of ledger records contributes no activity.
 
 Does NOT read: `~/.claude/` settings or credentials, or the contents of
 any file under `project_dirs`.
+
+`squid why` reads the HID idle number from the daemon's existing `state.json`
+snapshot (0 if unavailable) instead of calling CoreGraphics from the diagnostic
+CLI, where WindowServer access can block. Agent signals are still computed
+fresh. The daemon continues using its normal live HID source.
 
 Caching: the list of transcript files is cached for 60 seconds (same
 pattern as GitDetector's repo-discovery cache); files untouched for

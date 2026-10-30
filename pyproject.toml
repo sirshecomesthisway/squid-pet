@@ -67,6 +67,7 @@ files = [
     "src/squid_pet/doctor.py",
     "src/squid_pet/codex_approvals.py",
     "src/squid_pet/codex_turns.py",
+    "src/squid_pet/claude_hooks.py",
     "tools/verify_sprites.py",
     "tools/native_smoke.py",
 ]

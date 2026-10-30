@@ -172,13 +172,32 @@ don't have installed just means that detector quietly reports nothing (no
 process found), it doesn't error. See the README's "Detectors & triggers"
 section for what each one watches.
 
-(Support for a third-party CLI coding agent was removed entirely
-2026-08-27 -- it was never actually installed/run in this environment,
-so it never fired anything in practice. The approval-needed "flag wave"
-is now 100% Claude-Code-
-driven, via an official hook rather than any `triggers` setting -- see
-the README's "Approval-needed flag wave" section for how to wire it up
-on a machine that doesn't have it yet.)
+### 9a. Register Claude hooks
+
+The normal installer does this automatically. For this manual install:
+
+```bash
+.venv/bin/python scripts/install_claude_hooks.py
+.venv/bin/python scripts/install_claude_hooks.py --check
+```
+
+This merges Squid's handlers into Claude's user settings, preserving other
+hooks/preferences and backing up the original to `settings.json.squid-backup`.
+It covers the local CLI and local Desktop Code tab. A custom
+`CLAUDE_CONFIG_DIR` is also configured when present; the Desktop default
+`~/.claude/settings.json` remains included. Invalid settings are preserved,
+and disabled hooks remain disabled. Inspect `/hooks` in Claude and test a new
+question; reopen the Claude session if needed. Already-open prompts do not
+generate a new event just because settings changed.
+
+After installation, `squid setup-claude` repairs registration, and
+`squid setup-claude --remove` removes only Squid's hooks. `squid update`
+repairs hooks even when the source is already up to date. `squid why` and
+`squid doctor` report registration problems separately from pet health.
+Older installed launchers need a one-time `./install.sh` run to gain these
+commands; the direct Python setup command works from the updated checkout.
+Cowork, remote, VM, and cloud sessions require separate integration; see
+the README's [Claude setup](../README.md#claude-setup) coverage table.
 
 ### 10. Boot the LaunchAgent
 
