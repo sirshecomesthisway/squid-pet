@@ -4,7 +4,7 @@
 # Installed to ~/.local/bin/squid by install.sh. Pure bash, no python deps.
 # Subcommands:
 #   start | stop | restart | status | logs
-#   why  | doctor
+#   why  | doctor | setup-claude
 #   update     git pull + reinstall + restart
 #   uninstall  shells into the project uninstall.sh
 #   help
@@ -112,6 +112,23 @@ cmd_doctor() {
     cd "$pdir" && "$pdir/.venv/bin/python" -m squid_pet --doctor "$@"
 }
 
+cmd_setup_claude() {
+    local pdir; pdir=$(project_dir)
+    "$pdir/.venv/bin/python" "$pdir/scripts/install_claude_hooks.py" "$@"
+}
+
+refresh_launcher() {
+    local pdir="$1" launcher="$HOME/.local/bin/squid" replacement
+    # install.sh copies this file. Keep that installed copy current on updates.
+    if [ -f "$launcher" ] && [ -f "$pdir/bin/squid" ] && [ "$launcher" != "$pdir/bin/squid" ]; then
+        # Replace atomically: this may be the very script bash is still reading.
+        replacement=$(mktemp "$launcher.squid.XXXXXX")
+        cp "$pdir/bin/squid" "$replacement"
+        chmod +x "$replacement"
+        mv -f "$replacement" "$launcher"
+    fi
+}
+
 cmd_update() {
     local pdir; pdir=$(project_dir)
     echo "squid: updating from $pdir"
@@ -127,10 +144,12 @@ cmd_update() {
     git pull --ff-only || { echo "squid: git pull failed -- resolve manually"; exit 1; }
 
     local_head_after=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+    refresh_launcher "$pdir"
 
     # If HEAD didn't move AND the venv is healthy (entry point exists), skip
     # both reinstall and restart. Sub-3-second 'squid update' for no-op pulls.
     if [ "$local_head_before" = "$local_head_after" ] && [ -x "$pdir/.venv/bin/squid-pet" ]; then
+        cmd_setup_claude || echo "squid: Claude hooks need attention; run 'squid setup-claude'"
         echo "squid: already up to date (HEAD=$local_head_before); skipping reinstall + restart"
         return 0
     fi
@@ -141,6 +160,7 @@ cmd_update() {
     else
         "$pdir/.venv/bin/pip" install -e .
     fi
+    cmd_setup_claude || echo "squid: Claude hooks need attention; run 'squid setup-claude'"
     echo "-- restarting daemon"
     cmd_restart
     echo "squid: update complete"
@@ -176,6 +196,8 @@ Lifecycle:
 Introspection:
   why               explain current state and which detectors fired
   doctor            run 6-check self-diagnostic
+  setup-claude      register/repair Claude CLI + local Desktop Code hooks
+                    --check: read-only; --remove: unregister Squid hooks
 
 Files:
   plist:    $PLIST
@@ -194,6 +216,7 @@ case "${1:-help}" in
     logs)      shift; cmd_logs "$@" ;;
     why)       shift; cmd_why "$@" ;;
     doctor)    shift; cmd_doctor "$@" ;;
+    setup-claude) shift; cmd_setup_claude "$@" ;;
     update)    shift; cmd_update "$@" ;;
     uninstall) shift; cmd_uninstall "$@" ;;
     help|-h|--help) cmd_help ;;

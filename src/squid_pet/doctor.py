@@ -33,6 +33,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
+from .claude_hooks import integration_report, report_lines
+
 # ----------------------------------------------------------------------
 # Filesystem paths (single source of truth -- mirrors window.py / watcher.py)
 # ----------------------------------------------------------------------
@@ -577,15 +579,17 @@ def _safe_surface_report() -> Optional[SurfaceReport]:
 def run_doctor(json_output: bool = False) -> int:
     """Run all 6 checks. Print results. Return exit code (0 = healthy).
 
-    The Claude Code surface report is informational: printed after the
-    checks, never counted, never part of the exit code."""
+    Claude surfaces and hook registration are reported separately from daemon
+    health; neither changes the six-check exit code."""
     results = run_all_checks()
     surfaces = _safe_surface_report()
+    hooks = integration_report()
     if json_output:
         payload = {
             "healthy": all(r.passed for r in results),
             "checks": [asdict(r) for r in results],
             "claude_surfaces": asdict(surfaces) if surfaces else None,
+            "claude_hooks": hooks,
         }
         print(json.dumps(payload, indent=2))
     else:
@@ -596,6 +600,10 @@ def run_doctor(json_output: bool = False) -> int:
         print("-" * 70)
         passed = sum(1 for r in results if r.passed)
         print(f"{passed}/{len(results)} checks passed")
+        print()
+        print("Claude hooks (registration only; separate from daemon health):")
+        for line in report_lines(hooks):
+            print(f"  {line}")
         if surfaces is not None:
             print()
             print("Claude Code surfaces (info only -- never fails doctor):")

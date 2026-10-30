@@ -28,14 +28,9 @@ def _run(*flags) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["HOME"] = _ISOLATED_HOME
     env["SQUID_PET_HOME"] = str(Path(_ISOLATED_HOME) / ".squid-pet")
+    env.pop("CLAUDE_CONFIG_DIR", None)
     return subprocess.run(
-        # Exercise the real module entry point, isolating only the OS idle
-        # call: Quartz can block indefinitely without WindowServer access.
-        [sys.executable, "-c",
-         "from squid_pet import watcher; "
-         "watcher.macos_idle_seconds = lambda: 0.0; "
-         "import runpy; runpy.run_module('squid_pet', run_name='__main__')",
-         *flags],
+        [sys.executable, "-m", "squid_pet", *flags],
         capture_output=True, text=True, timeout=15,
         cwd=str(PROJECT), env=env,
     )
@@ -110,6 +105,15 @@ def test_why_json_includes_approval_alert_fields():
     assert isinstance(aa["enabled"], bool)
     assert isinstance(aa["claude_sessions_awaiting"], list)
     assert isinstance(aa["claude_sessions_eligible"], list)
+    assert aa["claude_hooks"]["registered"] is False
+    assert aa["claude_hooks"]["configs"][0]["status"] == "missing"
+
+
+def test_why_explains_missing_hooks_and_repair():
+    result = _run("--why")
+    assert result.returncode == 0
+    assert "squid setup-claude" in result.stdout
+    assert "Cowork" in result.stdout
 
 
 def test_why_help_advertises_both_flags():
@@ -117,6 +121,22 @@ def test_why_help_advertises_both_flags():
     assert result.returncode == 0
     assert "--why" in result.stdout
     assert "--why-json" in result.stdout
+
+
+def test_why_uses_cached_hid_idle_without_calling_quartz(tmp_path, monkeypatch, capsys):
+    from squid_pet import watcher
+    from squid_pet.__main__ import _run_why
+
+    monkeypatch.setattr(watcher, "STATE_DIR", tmp_path)
+    (tmp_path / "state.json").write_text('{"idle_seconds": 17.5}')
+
+    def forbidden():
+        raise AssertionError("why must not call Quartz/WindowServer")
+
+    monkeypatch.setattr(watcher, "macos_idle_seconds", forbidden)
+    _run_why(json_output=True)
+    report = json.loads(capsys.readouterr().out)
+    assert report["state"]["idle_seconds"] == 17.5
 
 
 # ── Pink-2026-08-26: --why must be side-effect-free ────────────────────

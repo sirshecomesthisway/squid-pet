@@ -87,13 +87,9 @@ IDLE_THRESHOLD_SEC = 315           # 5m15s with no agent activity → sleeping
 # idle. At 300 the backend would report sleeping first and the slump
 # would be unreachable. 15s of dozing, then out -- Pink-2026-09-04.
 # tests/test_window_constants_agree.py pins both halves.
-# Names of transient CLI tools that indicate ACTIVE tool use. Shared by
-# has_active_shell_children() for Claude Code / Codex's shell_active signal.
-# Excludes shells (bash/sh/zsh) because shells are always the wrapper —
-# we want to detect the actual TOOL inside the shell (grep, git, etc).
-# Excludes runtime hosts (python/node/npm/pip) because agentic CLIs
-# themselves are often python/node and playwright keeps a long-lived
-# node process.
+# Names of CLI tools that can indicate active tool use. Shared by both agents.
+# Runtime hosts/wrappers also match, but known persistent agent support and
+# Squid's own processes are filtered by _is_support_command below.
 # post-e2e-polish 2026-06-27 Fix 8: widened from a narrow CLI whitelist
 # (which missed bash/python/node etc.) to ALSO include the bash/sh wrapper
 # and common language interpreters used in agentic tool calls. Without
@@ -1749,6 +1745,35 @@ def count_currently_waving_sessions() -> int:
 # Live tool-activity detection
 # ────────────────────────────────────────────────────────────────────────
 
+def _is_support_command(cmd: list[str]) -> bool:
+    """Known support runtimes are not proof of an in-flight tool call.
+
+    Inspect only executable/script/module names, never embedded command bodies.
+    Descendants remain eligible: a persistent REPL can launch a real tool.
+    """
+    if not cmd:
+        return False
+    executable = Path(cmd[0])
+    if executable.name == "node" and executable.parts[-5:] == (
+            "Contents", "Resources", "cua_node", "bin", "node"):
+        # The app uses this runtime for its persistent MCP/REPL services.
+        return True
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable.name):
+        # Our daemon/diagnostics may themselves have been started by an agent.
+        for i, arg in enumerate(cmd[1:], 1):
+            if arg == "-m":
+                return i + 1 < len(cmd) and cmd[i + 1] == "squid_pet"
+            if arg == "-c" or not arg.startswith("-"):
+                break
+        return False
+    if executable.name == "squid":
+        return True
+    if executable.name in SHELL_WRAPPER_NAMES and len(cmd) > 1:
+        script = Path(cmd[1])
+        return script.name == "squid" and script.parent.name == "bin"
+    return False
+
+
 def shell_child_activity(procs, *, owner_out: dict | None = None) -> tuple[bool, list[str] | None]:
     """One descendant-tree walk yielding BOTH tool-activity signals:
     ``(shell_active, cmdline)``.
@@ -1763,8 +1788,7 @@ def shell_child_activity(procs, *, owner_out: dict | None = None) -> tuple[bool,
     keeps two accumulators:
 
     * ``active`` latches on ANY SHELL_CHILD_NAMES match, wrappers
-      included -- a live bash/zsh under the agent IS evidence a tool is
-      running underneath (often the tool has not spawned yet).
+      included, after filtering known support runtimes and Squid itself.
     * ``cmdline`` prefers a NON-wrapper match with a non-empty cmdline (the
       real tool caught alive as a grandchild). When only wrappers match, it
       falls back to the WRAPPER's own cmdline rather than None -- see
@@ -1812,18 +1836,19 @@ def shell_child_activity(procs, *, owner_out: dict | None = None) -> tuple[bool,
                         if status is not None and status() == psutil.STATUS_ZOMBIE:
                             continue
                         # Do not latch work if argv proves the child has exited.
+                        cmdline = ch.cmdline()
+                        if _is_support_command(cmdline):
+                            continue
                         if name in SHELL_WRAPPER_NAMES:
                             # Remember the wrapper's cmdline as a fallback,
                             # but keep walking in case the real tool child
                             # is also alive (a cleaner, bare cmdline).
-                            cmd = ch.cmdline()
                             active = True
                             any_owner = p
-                            if cmd:
-                                wrapper_cmdline = cmd
+                            if cmdline:
+                                wrapper_cmdline = cmdline
                                 wrapper_owner = p
                             continue
-                        cmdline = ch.cmdline()
                         active = True
                         any_owner = p
                         if cmdline:
@@ -2018,7 +2043,9 @@ class StateMachine:
     # Settings file path (centralised so tests can monkey-patch).
     _SETTINGS_FILE = STATE_DIR / "settings.json"
 
-    def __init__(self, detectors: list | None = None) -> None:
+    def __init__(self, detectors: list | None = None, *,
+                 idle_seconds_fn: Callable[[], float] | None = None) -> None:
+        self._idle_seconds_fn = idle_seconds_fn
         # Track whether caller explicitly supplied detectors. If they did,
         # we never hot-reload (caller controls the list). If they didn't,
         # we own the list and pick up settings.json changes at runtime.
@@ -2782,7 +2809,7 @@ class StateMachine:
                 return "claude streaming"
             return "codex streaming"
 
-        idle = macos_idle_seconds()
+        idle = (self._idle_seconds_fn or macos_idle_seconds)()
 
         # Other-detector signals (computed lazily to avoid wasted scans
         # when we exit the cascade early).

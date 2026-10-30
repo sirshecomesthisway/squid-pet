@@ -39,7 +39,8 @@ cd squid-pet
 ./install.sh
 ```
 
-The installer sets up the Python environment, installs dependencies, configures the macOS LaunchAgent, and starts Squid.
+The installer sets up the Python environment, installs dependencies, registers
+Claude's user hooks, configures the macOS LaunchAgent, and starts Squid.
 
 A cold install typically takes about 3 minutes; subsequent updates are around 30 seconds.
 
@@ -85,7 +86,7 @@ A cold install typically takes about 3 minutes; subsequent updates are around 30
 `./install.sh` sets up `uv venv`, installs the package from the committed
 `uv.lock` against public PyPI (no dependency resolution — fast), renders the
 LaunchAgent plist, drops `~/.local/bin/squid` on your PATH, writes sensible
-default settings, and boots Squid. See [Quick start](#quick-start) above to
+default settings, registers Claude's user hooks, and boots Squid. See [Quick start](#quick-start) above to
 get running.
 
 > **Want the corner/stroll prompts back?** Run `./install.sh --wizard`.
@@ -126,6 +127,7 @@ investigating.
 squid status         # is she alive? is the watcher ticking?
 squid why            # which detector fired? what state and why?
 squid doctor         # 6-check self-diagnostic
+squid setup-claude   # register/repair Claude hooks; --check to inspect, --remove to remove
 squid restart        # atomic bounce
 squid update         # git pull + reinstall + restart
 squid logs -f        # tail stdout+stderr live
@@ -191,6 +193,52 @@ Run `squid why` / `--why-json` to see exactly what's waving and why —
 it reports `claude_sessions_awaiting` / `claude_sessions_eligible`
 independently.
 
+### Claude setup
+
+`./install.sh` and `squid update` register the Claude hooks automatically.
+For an existing or manual installation, run:
+
+```sh
+squid setup-claude
+squid setup-claude --check
+# Or directly from the checkout:
+.venv/bin/python scripts/install_claude_hooks.py
+```
+
+If an older installed launcher does not recognize `setup-claude`, rerun
+`./install.sh` once to refresh it, or use the direct Python command above.
+The updated launcher refreshes its installed copy during future updates.
+
+Setup merges only Squid's handlers into `~/.claude/settings.json`, preserving
+other hooks and settings. It backs up the original once to
+`settings.json.squid-backup`, uses absolute, quoted Python/script paths, and
+repairs handlers pointing at an old checkout. If `CLAUDE_CONFIG_DIR` is set,
+it also configures that CLI directory; Desktop's default is always included.
+Malformed files are preserved and reported. `disableAllHooks` is respected,
+not changed. Uninstall removes only Squid's handlers; to remove them manually:
+
+```sh
+squid setup-claude --remove
+```
+
+`squid why` and `squid doctor` report registration separately from pet health:
+missing, partial, disabled, invalid, broken, or registered. These checks run
+only on demand, not on the 1 Hz watcher path. Registration cannot establish
+that a session loaded the hooks or that project/session/managed settings allow
+them. Inspect `/hooks` in Claude, then test a **fresh** question. A question
+already on screen is not replayed; reopen the session if hooks have not loaded.
+
+| Claude surface | Coverage |
+| --- | --- |
+| Local CLI and local Desktop **Code** | User hooks supply questions/approvals; existing detectors supply activity |
+| Legacy local Cowork session | Local transcript activity where available; this setup does not register its separate configuration |
+| VM, SSH/remote, cloud/web, or cloud Cowork | No local question/approval signal; requires a separate supported bridge |
+
+Desktop Code and CLI share user hooks ([Claude documentation](https://code.claude.com/docs/en/desktop#shared-configuration)).
+Cowork is a different execution environment: plugin hooks being available there
+does not mean they write to the Mac's `~/.squid-pet`. See the
+[investigation and remaining integration requirements](docs/audits/2026-10-30-claude-desktop-input-detection.md).
+
 ### Codex setup
 
 From this repository, run:
@@ -238,7 +286,7 @@ To unregister only Squid's Codex hooks:
 ```
 
 <details>
-<summary>Manual hook setup (if a machine doesn't have it wired up yet)</summary>
+<summary>Advanced: equivalent manual Claude hook setup</summary>
 
 `~/.claude/settings.json` is personal/user-level (not tracked by this
 repo), so add this `hooks` block yourself, pointing `command` at this

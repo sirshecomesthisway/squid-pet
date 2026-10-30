@@ -134,7 +134,14 @@ def _run_why(json_output: bool = False) -> None:
 
     from . import watcher
 
-    sm = watcher.StateMachine()
+    # HID idle is diagnostic-only here. Querying CoreGraphics from a headless
+    # CLI can hang inside WindowServer indefinitely; use the daemon's snapshot.
+    try:
+        cached = _j.loads((watcher.STATE_DIR / "state.json").read_text())
+        idle_seconds = max(0.0, float(cached.get("idle_seconds", 0.0)))
+    except (OSError, ValueError, TypeError, AttributeError):
+        idle_seconds = 0.0
+    sm = watcher.StateMachine(idle_seconds_fn=lambda: idle_seconds)
     # Pink-2026-08-26: --why is read-only diagnostics -- it must never
     # cause side effects. Without this, a genuinely-active approval_needed
     # would re-fire a REAL macOS notification AND print noise into stdout
@@ -177,6 +184,7 @@ def _run_why(json_output: bool = False) -> None:
     # and the user has no way to discover this without grepping
     # config.json. So plumb it through here.
     from . import config as _cfg
+    from .claude_hooks import integration_report
     # Pink-2026-08-26: surface the Claude Code side of the direct signal
     # (scripts/claude_pet_hook.py's Notification-hook flag files) -- same
     # "don't make the user grep for why it's not waving" rationale.
@@ -190,6 +198,7 @@ def _run_why(json_output: bool = False) -> None:
         "claude_sessions_awaiting": claude_sessions_raw,
         "codex_requests_awaiting": watcher.codex_requests_awaiting_input(),
         "claude_sessions_eligible": claude_sessions_eligible,
+        "claude_hooks": integration_report(),
     }
 
     report = {
@@ -296,6 +305,10 @@ def _print_why_human(report: dict) -> None:
         claude_awaiting = aa.get("claude_sessions_awaiting") or []
         claude_eligible = aa.get("claude_sessions_eligible") or []
         print(f"  Claude Code sessions awaiting: {claude_awaiting or 'none'}")
+        if aa.get("claude_hooks"):
+            from .claude_hooks import report_lines
+            for line in report_lines(aa["claude_hooks"]):
+                print(f"  {line}")
         if claude_awaiting and not claude_eligible:
             print(f"  {YEL}(all snoozed -- seen and deferred, "
                   f"waiting for a reply or a fresh wait){RST}")

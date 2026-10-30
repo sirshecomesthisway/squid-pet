@@ -142,6 +142,18 @@ def test_run_doctor_json_carries_the_surface_report(tmp_path, monkeypatch, capsy
     assert surf["desktop_cli_version"] == "2.1.92"
     assert surf["terminal_cli_version"] == "2.1.296"
     assert len(surf["warnings"]) == 1
+    assert payload["claude_hooks"]["registered"] is False
+    assert payload["claude_hooks"]["configs"][0]["status"] == "missing"
+
+
+def test_doctor_calls_out_missing_hooks_separately_from_daemon_health(monkeypatch, capsys):
+    _passing_checks(monkeypatch)
+    monkeypatch.setattr(doctor, "claude_surface_report", lambda: None)
+    assert doctor.run_doctor() == 0
+    out = capsys.readouterr().out
+    assert "Claude hooks (registration only; separate from daemon health)" in out
+    assert "squid setup-claude" in out
+    assert "question/approval signals may be unavailable" in out
 
 
 def test_run_doctor_survives_a_broken_surface_report(monkeypatch, capsys):

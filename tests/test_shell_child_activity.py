@@ -115,3 +115,41 @@ def test_walks_each_process_tree_once():
     proc = _FakeProc(children=[_FakeChild("pytest", ["pytest"])])
     shell_child_activity([proc])
     assert proc.walks == 1
+
+
+def test_persistent_app_helpers_do_not_count_as_work():
+    node = "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
+    proc = _FakeProc(children=[
+        _FakeChild("node", [node, "./server.mjs"]),
+        _FakeChild("node", [node, "/app/cua-repl.mjs"]),
+    ])
+    owner = {"pid": 123}
+    assert shell_child_activity([proc], owner_out=owner) == (False, None)
+    assert owner == {}
+
+
+def test_real_command_under_a_persistent_host_still_counts():
+    host = _FakeChild("node", [
+        "/Applications/Codex.app/Contents/Resources/cua_node/bin/node", "./server.mjs"])
+    proc = _FakeProc(children=[host, _FakeChild("pytest", ["pytest", "-q"])])
+    assert shell_child_activity([proc]) == (True, ["pytest", "-q"])
+
+
+def test_ordinary_node_and_python_work_still_counts():
+    for name, args in (("node", ["/usr/local/bin/node", "build.mjs"]),
+                       ("python3.13", ["/venv/bin/python3.13", "-m", "pytest"])):
+        assert shell_child_activity([_FakeProc(children=[_FakeChild(name, args)])]) == (True, args)
+
+
+def test_squid_diagnostic_and_wrapper_do_not_count_as_agent_work():
+    proc = _FakeProc(children=[
+        _FakeChild("bash", ["bash", "/repo/bin/squid", "why"]),
+        _FakeChild("python3.13", ["/venv/bin/python", "-m", "squid_pet", "--why"]),
+    ])
+    assert shell_child_activity([proc]) == (False, None)
+
+
+def test_squid_filter_does_not_parse_embedded_command_text():
+    for args in (["python", "-c", "print('-m squid_pet')"],
+                 ["python", "tool.py", "-m", "squid_pet"]):
+        assert shell_child_activity([_FakeProc(children=[_FakeChild("python", args)])]) == (True, args)
